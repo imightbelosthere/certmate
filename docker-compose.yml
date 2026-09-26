@@ -19,7 +19,7 @@ services:
     # platform: linux/amd64  # Optional: force specific platform (linux/amd64, linux/arm64)
     container_name: certmate
     ports:
-      - "127.0.0.1:8000:8000"  # Bind to localhost only; use nginx profile for external access
+      - "0.0.0.0:8000:8000"  # Bind to localhost only; use nginx profile for external access
     environment:
       - FLASK_ENV=production
       - SECRET_KEY=${SECRET_KEY:-}  # Auto-generated if empty; set a strong value for production
