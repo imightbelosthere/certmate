@@ -3,8 +3,10 @@ Settings management module for CertMate
 Handles loading/saving settings, migrations, and configuration management
 """
 
+import copy
 import os
 import re
+import secrets
 import threading
 import logging
 from collections import deque
@@ -20,6 +22,13 @@ from .utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+# (settings file, backups offered) pairs already reported as "no users" in
+# this process. The check runs inside load_settings, i.e. at every read of the
+# file, and a report per read is not a report: five CRITICAL lines at every
+# first boot, and one per load for ever on an instance run only through an API
+# token. Once per situation keeps the one line that is news.
+_NO_USERS_REPORTED = set()
 
 
 # --- POST /api/settings input validation -----------------------------------
@@ -374,29 +383,62 @@ def _restore_masked_list_secrets(old_list, new_list):
     def _identity(d):
         return (d.get('type'), d.get('name'))
 
+    def _stable_id(d):
+        value = d.get('id')
+        return value.strip() if isinstance(value, str) and value.strip() else None
+
     def _field_is_secret(key):
         return _is_secret_key(key) or key in _WEBHOOK_LIST_SECRET_FIELDS
 
-    by_identity = {}
-    for old in old_list:
-        if isinstance(old, dict):
-            by_identity.setdefault(_identity(old), deque()).append(old)
-    # An identity shared by more than one prior entry is AMBIGUOUS: with no
-    # stable per-webhook id, list order is the only thing left to match on, and
-    # a reorder or a deletion would then restore the wrong entry's secret — the
-    # same cross-endpoint credential leak (type,name) was chosen to avoid. So a
-    # masked secret whose identity is ambiguous is dropped (the operator
-    # re-enters it), never guessed by position.
-    ambiguous = {ident for ident, q in by_identity.items() if len(q) > 1}
+    priors = [old for old in old_list if isinstance(old, dict)]
+    spent = [False] * len(priors)
+    # Two indexes over the same entries. `id` is the one an operator cannot
+    # edit; (type, name) is the fallback for entries written before ids
+    # existed, and for a client that sends back a shape it did not receive.
+    by_id, by_name = {}, {}
+    for position, old in enumerate(priors):
+        stable = _stable_id(old)
+        if stable is not None:
+            by_id.setdefault(stable, deque()).append(position)
+        by_name.setdefault(_identity(old), deque()).append(position)
+    # An identity shared by more than one prior entry is AMBIGUOUS: list order
+    # is the only thing left to match on, and a reorder or a deletion would then
+    # restore the wrong entry's secret — the cross-endpoint credential leak
+    # (type,name) was itself chosen to avoid. So a masked secret whose identity
+    # is ambiguous is dropped (the operator re-enters it), never guessed by
+    # position. Duplicate ids should not occur, and are treated the same way.
+    ambiguous_ids = {key for key, q in by_id.items() if len(q) > 1}
+    ambiguous_names = {key for key, q in by_name.items() if len(q) > 1}
+
+    def _claim(index, key):
+        """The first prior under `key` that no other entry has taken."""
+        queue = index.get(key)
+        while queue:
+            position = queue.popleft()
+            if not spent[position]:
+                spent[position] = True
+                return priors[position]
+        return {}
+
+    def _prior_for(item):
+        """An `id` is a positive claim about WHICH entry this is.
+
+        When the submission carries one, it is matched on that alone: an id
+        naming no stored entry means the entry is new or was deleted, and
+        falling back to the name would then hand it whatever secret happens to
+        share that name. Without an id we are in the pre-migration world and
+        (type, name) is all there is.
+        """
+        stable = _stable_id(item)
+        if stable is not None:
+            return {} if stable in ambiguous_ids else _claim(by_id, stable)
+        name = _identity(item)
+        return {} if name in ambiguous_names else _claim(by_name, name)
 
     for item in new_list:
         if not isinstance(item, dict):
             continue
-        ident = _identity(item)
-        queue = by_identity.get(ident)
-        # Unique identity match, or nothing — never a positional guess, and
-        # never an ambiguous duplicate (see above and the docstring).
-        prior = queue.popleft() if (queue and ident not in ambiguous) else {}
+        prior = _prior_for(item)
         for key in list(item.keys()):
             if _field_is_secret(key) and item.get(key) == SECRET_MASK_SENTINEL:
                 if key in prior:
@@ -418,6 +460,63 @@ def _restore_masked_list_secrets(old_list, new_list):
                         else:
                             nested.pop(sub, None)
     return new_list
+
+
+#: Where a list entry's identity is editable AND its secrets are masked on the
+#: way out, so the save has to find the entry again to put them back.
+#:
+#: Only webhooks qualify today. `deploy_hooks.targets` has the same shape — a
+#: list of dicts keyed by (type, name), holding ssh_key and api_token inside
+#: `config` — and the same hazard when `_restore_masked_list_secrets` is handed
+#: one, which is easy to demonstrate by calling the function directly. It is
+#: nevertheless NOT listed here, because neither route that writes targets can
+#: reach that path: `/api/deploy/config` returns them unmasked and saves what it
+#: is given, and the generic settings POST refuses `deploy_hooks` outright —
+#: it is in SETTINGS_REJECT_KEYS, with tests naming it
+#: (tests/test_sprint1_security.py). Adding ids there would be a field written
+#: against a hazard a tested gate already prevents. If that gate ever opens,
+#: this tuple is where targets belong.
+_STABLE_ID_LISTS = (
+    ('notifications', 'channels', 'webhooks'),
+)
+
+
+def assign_stable_entry_ids(settings):
+    """Give every entry in _STABLE_ID_LISTS an `id` it keeps for life.
+
+    `_restore_masked_list_secrets` matched a submission to its stored entry by
+    `(type, name)` — the two fields the operator edits. Renaming a webhook, or
+    changing its type, therefore meant the save could not find the entry the
+    masked secrets belonged to, so it dropped them: the webhook stayed
+    `enabled`, lost its URL and every custom header, the save answered 200, and
+    nothing on screen said so, because the URL is never displayed (#950).
+
+    The id is random rather than derived: anything derived from a field is a
+    field, and a field can be edited. It is assigned here, at load, rather than
+    at save, so the entries already on disk have ids BEFORE anyone can rename
+    one — assigning at save would leave exactly one unprotected save, the first
+    after upgrading, and that is the save an operator makes to fix a name.
+
+    Returns True when it changed something, so the caller writes it back.
+    """
+    changed = False
+    for path in _STABLE_ID_LISTS:
+        node = settings
+        for key in path:
+            node = node.get(key) if isinstance(node, dict) else None
+            if node is None:
+                break
+        if not isinstance(node, list):
+            continue
+        for entry in node:
+            if not isinstance(entry, dict):
+                continue
+            existing = entry.get('id')
+            if isinstance(existing, str) and existing.strip():
+                continue
+            entry['id'] = secrets.token_hex(8)
+            changed = True
+    return changed
 
 
 def _restore_masked_list_secrets_deep(old_subtree, new_subtree):
@@ -492,6 +591,65 @@ def _deep_merge_dict(base, overlay):
         else:
             merged[k] = v
     return merged
+
+
+# A CA provider entry has two shapes: the legacy flat one ({email, eab_kid,
+# eab_hmac, ...}) and the multi-account one ({accounts: {id: {...}}}). Once
+# `accounts` exists, get_ca_config reads ONLY the accounts, so any flat key
+# left beside it is a credential copy nothing reads and nothing updates:
+# rotating the EAB secret in the account leaves the old one on disk for good,
+# and deleting the account leaves its secret behind. These two helpers keep
+# `accounts` the single home of an account's data.
+def _default_ca_account_id(accounts, default_ca_accounts, provider):
+    """The account get_ca_config uses when no account is named."""
+    chosen = (default_ca_accounts or {}).get(provider, 'default')
+    if chosen in accounts:
+        return chosen
+    return next(iter(accounts), 'default')
+
+
+def _drop_shadowed_ca_credentials(ca_providers):
+    """Remove the flat keys sitting beside `accounts`; return the providers
+    that had any. Behaviour-preserving: get_ca_config never reads them."""
+    cleaned = []
+    if not isinstance(ca_providers, dict):
+        return cleaned
+    for provider, config in ca_providers.items():
+        if isinstance(config, dict) and isinstance(config.get('accounts'), dict):
+            shadowed = [key for key in config if key != 'accounts']
+            for key in shadowed:
+                del config[key]
+            if shadowed:
+                cleaned.append(provider)
+    return cleaned
+
+
+def _fold_legacy_ca_write(existing_ca, incoming_ca, default_ca_accounts):
+    """Move flat keys of a settings write into the account they address.
+
+    A client that still writes the flat shape (an API script, a pre-accounts
+    settings tab) onto a provider that has accounts means "the account used
+    by default", which is what get_ca_config would pick. Merged beside
+    `accounts` instead, the write would be accepted and then never read.
+    """
+    if not isinstance(incoming_ca, dict):
+        return
+    for provider, config in incoming_ca.items():
+        if not isinstance(config, dict):
+            continue
+        legacy = {key: value for key, value in config.items() if key != 'accounts'}
+        current = (existing_ca or {}).get(provider)
+        known = current.get('accounts') if isinstance(current, dict) else None
+        if not legacy or not (isinstance(known, dict) or isinstance(config.get('accounts'), dict)):
+            continue
+        accounts = {**(known or {}), **(config.get('accounts') or {})}
+        target = _default_ca_account_id(accounts, default_ca_accounts, provider)
+        logger.info("Settings write for CA provider %s used the flat shape; "
+                    "applying it to account %s", provider, target)
+        folded = config.setdefault('accounts', {}).setdefault(target, {})
+        for key, value in legacy.items():
+            folded[key] = value
+            del config[key]
 
 
 def validate_settings_post(payload, current=None):
@@ -678,6 +836,50 @@ def backup_can_restore(zf, names, settings):
     return SECRET_MASK_SENTINEL not in json.dumps(settings)
 
 
+#: Akamai Edge DNS: the certbot plugin's own default is 180 and its docs
+#: suggest 240. CertMate passed 90 until #974, and a reporter on Akamai saw
+#: nearly every order fail before the record reached all of Edge DNS's
+#: authoritative nameservers.
+DEFAULT_EDGEDNS_PROPAGATION_SECONDS = 180
+
+#: Propagation defaults CertMate used to write, per provider: (retired value,
+#: current value, last version that wrote the retired one). Every install that
+#: ever saved its settings has the default of its day stored in settings.json,
+#: so the retired value in a file LAST WRITTEN by such a version is read as
+#: "the operator never chose" and moved. The version gate makes it run once:
+#: after the first save by a newer version, a 90 is the operator's choice and
+#: stays. The settings schema is not bumped for this, because that would
+#: refuse a rollback over a default.
+RETIRED_PROPAGATION_DEFAULTS = {
+    'edgedns': (90, DEFAULT_EDGEDNS_PROPAGATION_SECONDS, (2, 40, 0)),
+}
+
+
+def _written_by(settings):
+    """The version that last wrote *settings*, as a tuple; (0,) when unknown."""
+    raw = str(settings.get('certmate_version') or '')
+    try:
+        return tuple(int(part) for part in raw.split('.')[:3])
+    except ValueError:
+        return (0,)
+
+
+def _move_retired_propagation_defaults(settings):
+    """Replace stored retired propagation defaults; True when one was moved."""
+    stored = settings.get('dns_propagation_seconds')
+    if not isinstance(stored, dict):
+        return False
+    moved = False
+    written_by = _written_by(settings)
+    for provider, (retired, current, last) in RETIRED_PROPAGATION_DEFAULTS.items():
+        if written_by <= last and stored.get(provider) == retired:
+            stored[provider] = current
+            logger.info("dns_propagation_seconds[%s]: %s was the old default, "
+                        "now %s (#974)", provider, retired, current)
+            moved = True
+    return moved
+
+
 class SettingsManager:
     """Class to handle settings management and migrations"""
 
@@ -781,6 +983,11 @@ class SettingsManager:
             # so a cached `existing` made the protection restore a stale copy:
             # it protected the snapshot, not the file.
             existing = self.load_settings(use_cache=False)
+            if isinstance(incoming.get('ca_providers'), dict):
+                incoming = {**incoming, 'ca_providers': copy.deepcopy(incoming['ca_providers'])}
+                _fold_legacy_ca_write(
+                    existing.get('ca_providers'), incoming['ca_providers'],
+                    incoming.get('default_ca_accounts', existing.get('default_ca_accounts')))
             merged = {**existing, **incoming}
             for key, value in incoming.items():
                 if (key in _DEEP_MERGE_SETTINGS_KEYS
@@ -877,6 +1084,48 @@ class SettingsManager:
                 "(POST /api/backups/create).",
                 len(masked_only), ", ".join(masked_only))
         return None
+
+    def _report_missing_users(self):
+        """Say, once per situation, that settings.json has no users.
+
+        Defensive logging for a settings file whose users vanished: a
+        destructive downgrade or partial corruption. It gives the operator a
+        concrete next step before the wizard overwrites state. Extracted from
+        load_settings, which runs it at every read of the file; the
+        `_NO_USERS_REPORTED` guard is what stops that being a report per read.
+        """
+        backups = []
+        try:
+            unified = self.file_ops.backup_dir / 'unified'
+            if unified.exists():
+                backups = sorted(
+                    [b.name for b in unified.iterdir() if b.suffix == '.zip'],
+                    reverse=True
+                )[:3]
+                # Exclude migration-created backups: they were
+                # produced seconds ago by this boot and don't help
+                # the operator recover from pre-existing data loss.
+                backups = [b for b in backups if '_migration' not in b]
+        except OSError as e:
+            # A failure here makes the message say "no backups
+            # found", which is what an operator reads as "there is
+            # nothing to restore from".
+            logger.warning("Could not list unified backups: %s", e)
+        situation = (str(self.settings_file), tuple(backups))
+        if situation not in _NO_USERS_REPORTED:
+            _NO_USERS_REPORTED.add(situation)
+            if backups:
+                logger.error(
+                    "CRITICAL: settings.json has no users. If this is "
+                    "unexpected, restore a backup before using the UI: %s",
+                    backups
+                )
+            else:
+                logger.error(
+                    "CRITICAL: settings.json has no users and no backups "
+                    "were found. If this is unexpected, check that the "
+                    "data volume is mounted correctly."
+                )
 
     def load_settings(self, use_cache=True):
         """Load settings from file with improved error handling.
@@ -1189,6 +1438,12 @@ class SettingsManager:
                 if settings.get('dns_providers', {}) != dns_providers_before:
                     was_migrated = True
 
+                # Before anyone can rename a webhook or a deploy target, give
+                # every one of them an id it keeps for life (#950). Written
+                # without a branch of its own: load_settings sits at a
+                # complexity ceiling that only comes down.
+                was_migrated = assign_stable_entry_ids(settings) or was_migrated
+
                 # Ensure certificate_storage exists with default configuration
                 if 'certificate_storage' not in settings:
                     settings['certificate_storage'] = default_settings['certificate_storage']
@@ -1260,35 +1515,7 @@ class SettingsManager:
                 # operators a concrete next step before the wizard overwrites
                 # state.
                 if not settings.get('users'):
-                    backups = []
-                    try:
-                        unified = self.file_ops.backup_dir / 'unified'
-                        if unified.exists():
-                            backups = sorted(
-                                [b.name for b in unified.iterdir() if b.suffix == '.zip'],
-                                reverse=True
-                            )[:3]
-                            # Exclude migration-created backups: they were
-                            # produced seconds ago by this boot and don't help
-                            # the operator recover from pre-existing data loss.
-                            backups = [b for b in backups if '_migration' not in b]
-                    except OSError as e:
-                        # A failure here makes the message say "no backups
-                        # found", which is what an operator reads as "there is
-                        # nothing to restore from".
-                        logger.warning("Could not list unified backups: %s", e)
-                    if backups:
-                        logger.error(
-                            "CRITICAL: settings.json has no users. If this is "
-                            "unexpected, restore a backup before using the UI: %s",
-                            backups
-                        )
-                    else:
-                        logger.error(
-                            "CRITICAL: settings.json has no users and no backups "
-                            "were found. If this is unexpected, check that the "
-                            "data volume is mounted correctly."
-                        )
+                    self._report_missing_users()
 
                 if not settings.get('domains'):
                     cert_dir = getattr(self.file_ops, 'cert_dir', None)
@@ -1546,7 +1773,7 @@ class SettingsManager:
                     'infomaniak': 300,
                     'acme-dns': 30,
                     'duckdns': 60,
-                    'edgedns': 90,
+                    'edgedns': DEFAULT_EDGEDNS_PROPAGATION_SECONDS,
                     'hetzner-cloud': 120,
                     'desec': 80,
                     'scaleway': 60,
@@ -1750,6 +1977,9 @@ class SettingsManager:
         """Migrate settings to handle format changes and ensure backward compatibility"""
         migrated = False
 
+        # Migration 0: a propagation default this project retired (#974).
+        migrated = _move_retired_propagation_defaults(settings) or migrated
+
         # Migration 1: Handle backup format wrapping
         if 'settings' in settings and 'metadata' in settings:
             logger.info("Migrating settings from backup format")
@@ -1804,6 +2034,16 @@ class SettingsManager:
                     for account in accounts.values():
                         if isinstance(account, dict) and account.pop('environment', None) is not None:
                             migrated = True
+
+        # Migration 5: a CA provider with `accounts` keeps its data only there.
+        # Flat credential keys beside it are copies get_ca_config never reads
+        # (see _drop_shadowed_ca_credentials); left in place, a rotated or
+        # deleted secret survives on disk.
+        cleaned = _drop_shadowed_ca_credentials(settings.get('ca_providers'))
+        if cleaned:
+            logger.info("Migrating settings: dropping credential copies shadowed by "
+                        "accounts for CA provider(s) %s", ', '.join(sorted(cleaned)))
+            migrated = True
 
         # Migration 3: Ensure metadata exists for existing certificates
         if migrated:

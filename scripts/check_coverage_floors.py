@@ -69,6 +69,7 @@ FLOORS = {
     # create, renew and reissue, and a 500 where a 422 belongs sends an
     # operator looking inside CertMate for a problem in their DNS provider.
     'modules/api/resources_lifecycle.py': 77,
+    'modules/api/resources_reissue_keyless.py': 90,
     'modules/api/resources_settings.py': 60,
     'modules/api/resources_storage.py': 70,
     'modules/api/tls_probe.py': 50,
@@ -126,6 +127,7 @@ FLOORS = {
     'modules/core/cert_discovery.py': 95,
     'modules/core/cert_inventory.py': 95,
     'modules/core/cert_jobs.py': 90,
+    'modules/core/cert_labels.py': 95,
     'modules/core/cert_probe.py': 80,
     'modules/core/cert_service.py': 90,
     'modules/core/certificates.py': 85,
@@ -135,10 +137,12 @@ FLOORS = {
     'modules/core/csr_handler.py': 80,
     'modules/core/csr_issuance.py': 95,
     'modules/core/ct_monitor.py': 90,
+    'modules/core/deploy_target_webhook.py': 90,
     'modules/core/deploy_targets.py': 90,
     'modules/core/deploy_window.py': 90,
     'modules/core/deployer.py': 85,
     'modules/core/digest.py': 85,
+    'modules/core/azure_dns_hook.py': 90,
     'modules/core/dns_alias_hook.py': 65,
     # The one home for what a settings['domains'] entry is. High on
     # purpose: it is four small pure functions with no I/O, and every
@@ -177,6 +181,7 @@ FLOORS = {
     'modules/core/expiry_watch.py': 90,
     'modules/core/http_errors.py': 95,
     'modules/core/file_operations.py': 80,
+    'modules/core/key_formats.py': 95,
     'modules/core/inventory_sources.py': 95,
     'modules/core/inventory_view.py': 95,
     'modules/core/issuance_readiness.py': 95,
@@ -185,7 +190,9 @@ FLOORS = {
     'modules/core/ocsp_crl.py': 85,
     'modules/core/oidc.py': 75,
     'modules/core/private_ca.py': 80,
+    'modules/core/pinned_https.py': 90,
     'modules/core/rate_limit.py': 70,
+    'modules/core/redirect_guard.py': 95,
     # 100% when it arrived: 32 statements of pure parsing, plus the decorator,
     # with no I/O. A boolean this refuses is one a caller sent by mistake, so
     # there is no honest reason for a branch of it to go unreached.
@@ -197,6 +204,7 @@ FLOORS = {
     'modules/core/settings.py': 80,
     'modules/core/shell.py': 75,
     'modules/core/storage_backends.py': 70,
+    'modules/core/secret_scrub.py': 95,
     'modules/core/structured_logging.py': 70,
     'modules/core/utils.py': 80,
     'modules/core/zombie.py': 80,

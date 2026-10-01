@@ -2,7 +2,7 @@
 
 <!-- CERTMATE-TRANSLATED-FROM 4a4fcc10de4a1e4b -->
 <!-- CERTMATE-STALE-TRANSLATION -->
-> **Esta traducción no está actualizada.** La versión en inglés ([`docs/ca-providers.md`](../ca-providers.md)) es la de referencia. También describe el nuevo proveedor Sectigo ACME, las URL de directorio HTTPS por cuenta y las credenciales EAB.
+> **Esta traducción no está actualizada.** La versión en inglés ([`docs/ca-providers.md`](../ca-providers.md)) es la de referencia. También describe Sectigo ACME, las URL HTTPS y credenciales EAB por cuenta, y el modo para nombres ya autorizados en SCM sin desafío DNS o HTTP.
 
 CertMate soporta múltiples proveedores de autoridad de certificación, permitiéndote elegir la CA más adecuada a tus necesidades.
 
@@ -95,10 +95,11 @@ La entrada CA privada es también la vía de escape genérica para cualquier CA 
 
 1. Ve a **Ajustes**
 2. Desplázate hasta **Proveedores de autoridad de certificación (CA)**
-3. Selecciona tu proveedor CA predeterminado
+3. Haz clic en **Add CA Account**, elige la CA y ponle nombre a la cuenta
+   (letras, dígitos, puntos, guiones y guiones bajos)
 4. Configura los campos requeridos
 5. Haz clic en **Probar conexión CA** para verificar
-6. Guarda los ajustes
+6. Haz clic en **Save Account**
 
 ### CA predeterminada vs. CA por certificado
 

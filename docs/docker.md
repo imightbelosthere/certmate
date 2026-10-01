@@ -4,9 +4,56 @@ This guide covers building, deploying, and running CertMate in Docker — includ
 
 ---
 
+## Production with Docker Compose
+
+The shortest way to run CertMate in production: one file, the published image, nothing to build and no repository to clone.
+
+```bash
+mkdir certmate && cd certmate
+curl -fsSLO https://raw.githubusercontent.com/fabriziosalmi/certmate/main/deploy/docker-compose.yml
+printf 'API_BEARER_TOKEN=%s\nSECRET_KEY=%s\nCERTMATE_BACKUP_PASSPHRASE=%s\n' \
+  "$(openssl rand -hex 32)" "$(openssl rand -hex 32)" "$(openssl rand -hex 32)" > .env
+chmod 600 .env
+docker compose up -d
+```
+
+Open `http://127.0.0.1:8000`. The first page creates the administrator account and asks for the `API_BEARER_TOKEN` from `.env` to authorize it. Keep `.env`: it holds the token API clients use, the key that signs sessions, and the passphrase without which a backup cannot restore this instance.
+
+What the file does:
+
+- **Pins the image** of the latest release. The copy on `main` is updated with every release. To stay on a version, set `CERTMATE_VERSION=X.Y.Z` in `.env`.
+- **Keeps everything in named volumes** (`certificates`, `data`, `logs`, `backups`). Docker creates them with the ownership CertMate needs, so there is nothing to `chown`. `docker compose down` keeps them; `down -v` deletes them.
+- **Listens on 127.0.0.1 only.** For remote access, put a reverse proxy in front and set `BEHIND_PROXY=true`. Setting `CERTMATE_BIND=0.0.0.0` publishes it on every interface. `CERTMATE_PORT` changes the host port.
+- **Refuses to start without `API_BEARER_TOKEN` and `SECRET_KEY`**, instead of generating values that would change every time the container is recreated.
+
+Optional variables for `.env`: `CLOUDFLARE_TOKEN` (bootstraps a Cloudflare DNS account on first start), `LETSENCRYPT_EMAIL`, `BEHIND_PROXY`.
+
+**Upgrade:** download the file again (or change `CERTMATE_VERSION`), then run `docker compose pull && docker compose up -d`.
+
+The `docker-compose.yml` at the root of the repository builds the image from source and is meant for development.
+
+---
+
+## Portainer
+
+In Portainer, deploy the [production compose bundle](#production-with-docker-compose) as a stack straight from this repository:
+
+1. **Stacks → Add stack**, name it `certmate`, and choose **Repository**.
+2. Repository URL `https://github.com/fabriziosalmi/certmate`, reference `refs/heads/main`, compose path `deploy/docker-compose.yml`.
+3. Under **Environment variables**, add `API_BEARER_TOKEN`, `SECRET_KEY` and `CERTMATE_BACKUP_PASSPHRASE`, each a long random value such as the output of `openssl rand -hex 32`. Optionally add `CERTMATE_PORT`, `CERTMATE_BIND` or `CLOUDFLARE_TOKEN`.
+4. **Deploy the stack.**
+
+Without the two required variables the deployment fails and says which one is missing (`required variable API_BEARER_TOKEN is missing a value`), rather than starting with keys that change on every redeploy. To upgrade, use **Pull and redeploy** on the stack: the named volumes, and so the certificates and settings, are kept.
+
+Checked on Portainer CE 2.45: a stack without the variables is refused with that message; with them it comes up healthy, the token authorises the API, and a pull-and-redeploy recreates the container with its data intact.
+
+---
+
 ## Quick Start
 
 ### Pull and Run
+
+Images are published to Docker Hub as `fabriziosalmi/certmate`. Releases after v2.42.0 are also published, with the same tags, to GHCR as `ghcr.io/fabriziosalmi/certmate`, which avoids Docker Hub's anonymous pull limits: use either name below.
 
 ```bash
 # Docker automatically selects the right architecture
@@ -169,7 +216,37 @@ docker-compose --env-file /path/to/.env up -d
 
 ---
 
-## Rootless podman / OpenShift (arbitrary UID)
+## Podman (Quadlet, rootless) and OpenShift
+
+### Quadlet: CertMate as a systemd service
+
+[`deploy/podman/certmate.container`](../deploy/podman/certmate.container) is a Quadlet unit: Podman turns it into a systemd service. It runs the published image with named volumes, the port on loopback only, the secrets as Podman secrets, a healthcheck, and `podman auto-update` support.
+
+Rootless, as your own user:
+
+```bash
+# The three secrets, created once. They never appear in a file.
+for s in certmate-api-token certmate-secret-key certmate-backup-passphrase; do
+  openssl rand -hex 32 | tr -d '\n' | podman secret create "$s" -
+done
+
+mkdir -p ~/.config/containers/systemd
+curl -fsSL -o ~/.config/containers/systemd/certmate.container \
+  https://raw.githubusercontent.com/fabriziosalmi/certmate/main/deploy/podman/certmate.container
+systemctl --user daemon-reload
+systemctl --user start certmate
+
+# Keep it running without a login session, and start it at boot.
+sudo loginctl enable-linger "$USER"
+```
+
+Rootful instead: put the file in `/etc/containers/systemd/`, create the secrets as root, then run `sudo systemctl daemon-reload && sudo systemctl start certmate`.
+
+Open `http://127.0.0.1:8000`. The first page creates the administrator account and asks for the API token: `podman secret inspect --showsecret certmate-api-token --format '{{.SecretData}}'`.
+
+Checked on Fedora 44 with Podman 5.8, rootful and rootless: the service starts healthy, the token authorises the API, and it comes back after a reboot (rootless through lingering).
+
+### Arbitrary UIDs (rootless Podman, OpenShift)
 
 The image runs as the non-root user `1000` by default, but it also follows the
 OpenShift **arbitrary-UID** pattern: the runtime-writable directories
@@ -182,18 +259,22 @@ private key, the audit-signing key, DNS credential files, `.secret_key`) are
 always created `0600` owner-only, so the group-writable directories never expose
 a key. (Issue [#380](https://github.com/fabriziosalmi/certmate/issues/380).)
 
-### Named volumes — works out of the box
+### Named volumes
 
-A fresh **named volume** inherits the image's group-0 permissions, so no host
-preparation is needed regardless of the UID podman assigns:
+A fresh **named volume** inherits the image's group-0 permissions under rootful
+Podman and Docker. Under **rootless** Podman it does not always: measured on
+Podman 5.8, the root of the `backups` volume, whose image directory is not
+empty, stayed owned by root, and CertMate refused to start with *"Required
+directories are not writable"*. Add `:U`, which gives each volume to the
+container's user:
 
 ```bash
 podman run -d --name certmate \
-  -p 8000:8000 \
-  -v certmate_data:/app/data \
-  -v certmate_certificates:/app/certificates \
-  -v certmate_logs:/app/logs \
-  -v certmate_backups:/app/backups \
+  -p 127.0.0.1:8000:8000 \
+  -v certmate_data:/app/data:U \
+  -v certmate_certificates:/app/certificates:U \
+  -v certmate_logs:/app/logs:U \
+  -v certmate_backups:/app/backups:U \
   docker.io/fabriziosalmi/certmate:latest
 ```
 
@@ -239,10 +320,10 @@ services:
     ports:
       - "8000:8000"
     volumes:
-      - certmate_data:/app/data
-      - certmate_certificates:/app/certificates
-      - certmate_logs:/app/logs
-      - certmate_backups:/app/backups
+      - certmate_data:/app/data:U
+      - certmate_certificates:/app/certificates:U
+      - certmate_logs:/app/logs:U
+      - certmate_backups:/app/backups:U
     restart: unless-stopped
 
 volumes:
@@ -253,8 +334,8 @@ volumes:
 ```
 
 If startup aborts with *"Required directories are not writable by the CertMate
-process"*, the mount is not group-0 writable — apply the `chgrp 0 … && chmod
-g+rwX …` above, switch to a named volume, or add `:U` to the bind mounts.
+process"*, the mount is not writable by the container's user — add `:U` to
+the volume, or for a bind mount apply the `chgrp 0 … && chmod g+rwX …` above.
 
 > **Kubernetes / OpenShift:** no changes needed. Set
 > `spec.securityContext.fsGroup: 0` (or rely on the default restricted SCC,

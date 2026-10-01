@@ -181,6 +181,14 @@
         return cert.expired === true;
     }
 
+    // No private key anywhere (#966): what restoring a share-safe backup
+    // leaves. It cannot serve TLS and renewal cannot repair it, only a reissue
+    // can, so it is never "Valid", whatever its expiry date says.
+    function lostItsKey(cert) {
+        return cert.reissue_required === true;
+    }
+    var LOST_KEY_TITLE = 'No private key anywhere: this certificate cannot be renewed, only reissued.';
+
     // Seconds where the API sends them, days elsewhere: ordering a 23-hour
     // certificate against one that lapsed an hour ago needs finer grain than
     // a day, and both of those are 0 or -1 in days.
@@ -197,7 +205,8 @@
         }
 
         var total = certificates.length;
-        var valid = certificates.filter(function (cert) { return cert.exists && lifeKnown(cert) && !hasExpired(cert) && cert.days_until_expiry > 30; }).length;
+        var valid = certificates.filter(function (cert) { return cert.exists && !lostItsKey(cert) && lifeKnown(cert) && !hasExpired(cert) && cert.days_until_expiry > 30; }).length;
+        var keyless = certificates.filter(lostItsKey).length;
         var expiring = certificates.filter(function (cert) { return cert.exists && lifeKnown(cert) && !hasExpired(cert) && cert.days_until_expiry <= 30; }).length;
         var expired = certificates.filter(function (cert) { return cert.exists && hasExpired(cert); }).length;
 
@@ -235,6 +244,8 @@
         if (expired > 0) {
             attn = ['Expired', expired, 'danger', 'fa-circle-xmark text-danger-fg',
                     expiring > 0 ? ('renew now · ' + expiring + ' expiring') : 'renew now'];
+        } else if (keyless > 0) {
+            attn = ['No key', keyless, 'warn', 'fa-key text-warning-fg', 'reissue needed'];
         } else if (expiring > 0) {
             attn = ['Expiring', expiring, 'warn', 'fa-triangle-exclamation text-warning-fg', 'within 30 days'];
         } else {
@@ -350,6 +361,9 @@
     // Active status filter (redesign phase 5). The status chips replaced the old
     // #statusFilter <select>; this is the single source of truth they drive.
     var currentStatusFilter = 'all';
+    // Active tag filter (#1043): one tag, or '' for none. Combined with the status
+    // chips, so "expiring" + "loadbalancer" is a question the page can answer.
+    var currentTagFilter = '';
 
     // Filter and search certificates
     function filterCertificates() {
@@ -366,7 +380,7 @@
             if (statusFilter !== 'all') {
                 var isExpired = cert.exists && hasExpired(cert);
                 var isExpiringSoon = cert.exists && lifeKnown(cert) && !hasExpired(cert) && cert.days_until_expiry <= 30;
-                var isValid = cert.exists && lifeKnown(cert) && !hasExpired(cert) && cert.days_until_expiry > 30;
+                var isValid = cert.exists && !lostItsKey(cert) && lifeKnown(cert) && !hasExpired(cert) && cert.days_until_expiry > 30;
 
                 switch (statusFilter) {
                     case 'valid':
@@ -381,10 +395,63 @@
                 }
             }
 
-            return matchesStatus;
+            var matchesTag = !currentTagFilter ||
+                (Array.isArray(cert.tags) && cert.tags.indexOf(currentTagFilter) !== -1);
+
+            return matchesStatus && matchesTag;
         });
 
         displayCertificates(filteredCerts);
+    }
+
+    // ---- Tags (#1043) ------------------------------------------------------
+    // A tag is 1-32 characters from a small charset the server enforces, so the
+    // chip text is escaped anyway but never needs quoting in an attribute.
+    function tagChipsHtml(tags) {
+        return tags.map(function (tag) {
+            var t = escapeHtml(tag);
+            return '<button type="button" data-tag-chip="' + t + '" title="Show only certificates tagged ' + t + '" ' +
+                'class="inline-flex items-center px-1.5 py-0.5 rounded text-[11px] font-medium bg-surface-2 text-muted ring-1 ring-inset ring-border hover:text-foreground">#' + t + '</button>';
+        }).join('');
+    }
+
+    // The row above the table that lists every tag in use. Hidden when nothing
+    // is tagged, so an instance that does not use the feature sees no new chrome.
+    function renderTagFilterBar() {
+        var bar = document.getElementById('tagFilterBar');
+        if (!bar) return;
+        var seen = {};
+        (Array.isArray(allCertificates) ? allCertificates : []).forEach(function (cert) {
+            (Array.isArray(cert.tags) ? cert.tags : []).forEach(function (tag) { seen[tag] = (seen[tag] || 0) + 1; });
+        });
+        var tags = Object.keys(seen).sort();
+        // A filter on a tag nobody carries any more would leave an empty table
+        // and no way to see why; drop it.
+        if (currentTagFilter && !seen[currentTagFilter]) currentTagFilter = '';
+        if (!tags.length) {
+            bar.classList.add('hidden');
+            bar.classList.remove('flex');
+            bar.innerHTML = '';
+            return;
+        }
+        bar.innerHTML = '<span class="text-xs font-medium text-muted mr-1">Tags</span>' + tags.map(function (tag) {
+            var t = escapeHtml(tag);
+            return '<button type="button" data-tag-filter="' + t + '" aria-pressed="' + (tag === currentTagFilter ? 'true' : 'false') + '" ' +
+                'class="inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-xs font-medium text-muted ring-1 ring-inset ring-border hover:text-foreground aria-pressed:bg-primary/15 aria-pressed:text-foreground aria-pressed:ring-primary/40">' +
+                '#' + t + ' <span class="text-[10px] tabular-nums opacity-70">' + seen[tag] + '</span></button>';
+        }).join('');
+        bar.classList.remove('hidden');
+        bar.classList.add('flex');
+        bar.querySelectorAll('[data-tag-filter]').forEach(function (btn) {
+            btn.addEventListener('click', function () { setTagFilter(btn.getAttribute('data-tag-filter')); });
+        });
+    }
+
+    // Choosing the tag already chosen clears it, like pressing a pressed chip.
+    function setTagFilter(tag) {
+        currentTagFilter = (currentTagFilter === tag) ? '' : (tag || '');
+        renderTagFilterBar();
+        filterCertificates();
     }
 
     // Sorting state
@@ -649,6 +716,43 @@
         '<span class="text-muted" title="Not recorded \u2014 this certificate was ' +
         'issued before CertMate stored the CA, or by an older version">\u2014</span>';
 
+    // When the CA would like this certificate replaced (ARI, RFC 9773), from
+    // the record the renewal sweep keeps (#962) — the dashboard never asks the
+    // CA itself. Every state renders as a sentence: "not checked yet" is an
+    // answer, and an absent row would read as "nothing to know".
+    function renewalWindowHtml(info) {
+        if (!info) {
+            return '<span class="text-muted" title="The renewal sweep has not asked the CA about this certificate yet">Not checked yet</span>';
+        }
+        var checked = info.checked_at
+            ? ' title="Checked ' + escapeHtml(CertMate.formatDateTime(info.checked_at)) + '"'
+            : '';
+        switch (info.status) {
+            case 'window':
+                var html = '<span' + checked + '>' +
+                    escapeHtml(CertMate.formatDate(info.window_start)) + ' \u2013 ' +
+                    escapeHtml(CertMate.formatDate(info.window_end)) + '</span>' +
+                    '<div class="text-xs text-muted">Renews at ' +
+                    escapeHtml(CertMate.formatDateTime(info.renew_at)) + '</div>';
+                // The server keeps only https; checked again here because this
+                // string becomes an href.
+                if (typeof info.explanation_url === 'string' && /^https:\/\//.test(info.explanation_url)) {
+                    html += '<a href="' + escapeHtml(info.explanation_url) + '" target="_blank" rel="noopener noreferrer" ' +
+                        'class="text-xs text-info-fg hover:underline">Why the CA set this window</a>';
+                }
+                return '<div class="text-right">' + html + '</div>';
+            case 'unsupported':
+                return '<span class="text-muted"' + checked + '>The CA does not publish one</span>';
+            case 'unavailable':
+                return '<span class="text-warning-fg"' + checked + '>The CA did not answer at the last check</span>';
+            case 'no_identifier':
+                return '<span class="text-muted"' + checked + '>Cannot be asked: no Authority Key Identifier</span>';
+            case 'disabled':
+                return '<span class="text-muted">Off (ari_enabled is false)</span>';
+        }
+        return '<span class="text-muted">\u2014</span>';
+    }
+
     function displayCertificates(certificates) {
         var container = document.getElementById('certificatesList');
         var thead = document.querySelector('#certificatesTable thead');
@@ -750,7 +854,14 @@
             var isExpired = hasExpired(cert);
             var isExpiringSoon = lifeKnown(cert) && !isExpired && cert.days_until_expiry <= 30;
             var statusClass, statusIcon, statusText, healthClass;
-            if (isExpired) {
+            var keylessRow = lostItsKey(cert);
+            if (keylessRow) {
+                statusClass = isExpired
+                    ? 'bg-red-500/10 text-danger-fg ring-1 ring-inset ring-red-500/20'
+                    : 'bg-yellow-500/10 text-warning-fg ring-1 ring-inset ring-yellow-500/20';
+                statusIcon = 'fa-key'; statusText = 'Needs reissue';
+                healthClass = isExpired ? 'health-expired' : 'health-warning';
+            } else if (isExpired) {
                 statusClass = 'bg-red-500/10 text-danger-fg ring-1 ring-inset ring-red-500/20'; statusIcon = 'fa-times-circle'; statusText = 'Expired'; healthClass = 'health-expired';
             } else if (isExpiringSoon) {
                 statusClass = 'bg-yellow-500/10 text-warning-fg ring-1 ring-inset ring-yellow-500/20'; statusIcon = 'fa-exclamation-triangle'; statusText = 'Expiring'; healthClass = 'health-warning';
@@ -785,6 +896,10 @@
             // Domain alias indicator (#122): when cert.domain_alias is set,
             // render a small "Alias: …" hint under the domain name so users
             // can spot rows that go through the CNAME-delegation flow.
+            var rowTags = Array.isArray(cert.tags) ? cert.tags : [];
+            var tagHint = rowTags.length
+                ? rowRaw('<div class="mt-1 flex flex-wrap gap-1">' + tagChipsHtml(rowTags) + '</div>')
+                : false;
             var aliasHint = domainAlias
                 ? rowRaw(rowHtml`<div class="mt-1 flex items-center text-xs text-info-fg min-w-0"><i class="fas fa-link mr-1 text-blue-500 shrink-0" aria-hidden="true"></i><span class="truncate" title="${domainAlias}">DNS-01 Alias: ${domainAlias}</span></div>`)
                 : false;
@@ -811,11 +926,13 @@
                 : false;
             var mobileDeploymentLine = rowRaw(rowHtml`<div class="flex items-start text-xs text-muted"><i class="fas fa-rocket mr-1.5 mt-0.5 w-3 shrink-0" aria-hidden="true"></i><div class="flex-1 min-w-0">${rowRaw(deploymentBadgesHtml(cert))}</div></div>`);
             var mobileMeta = rowRaw(rowHtml`<div class="lg:hidden mt-2 pt-2 border-t border-gray-100 dark:border-gray-700/50 space-y-1">${mobileExpiryLine}${mobileProviderLine}${mobileCaLine}${mobileDeploymentLine}</div>`);
-            var lockColor = isExpired ? 'text-red-400' : isExpiringSoon ? 'text-yellow-400' : 'text-green-500';
+            var lockColor = isExpired ? 'text-red-400' : (isExpiringSoon || keylessRow) ? 'text-yellow-400' : 'text-green-500';
             // An expired cert is no longer trusted; a closed padlock (the
             // "secure connection" glyph) is a visual paradox there. Show an
             // open padlock for expired so the icon matches the state.
-            var lockIcon = isExpired ? 'fa-lock-open' : 'fa-lock';
+            // A certificate with no key gets a key glyph, not a padlock: it
+            // secures nothing until it is reissued.
+            var lockIcon = keylessRow ? 'fa-key' : isExpired ? 'fa-lock-open' : 'fa-lock';
             return rowHtml`<tr data-row-domain="${cert.domain}" class="${rowRaw(healthClass)} row-enter hover:bg-blue-50/40 dark:hover:bg-blue-900/10 transition-colors duration-150 cursor-pointer" style="animation-delay:${rowRaw(String(i * 30))}ms" tabindex="0" role="button" aria-label="View details for ${cert.domain}" onclick="openCertDetail('${cert.domain}')" onkeydown="certRowKey(event, '${cert.domain}')">
                 <td class="px-6 py-4 md:max-w-0">
                     <div class="flex items-center min-w-0">
@@ -823,11 +940,12 @@
                         <div class="min-w-0">
                             <div class="text-sm font-medium text-foreground break-words md:truncate cm-mono">${cert.domain}</div>
                             ${aliasHint}
+                            ${tagHint}
                             ${mobileMeta}
                         </div>
                     </div>
                 </td>
-                <td class="px-4 py-4 whitespace-nowrap"><span class="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium ${rowRaw(statusClass)}"><i class="fas ${rowRaw(statusIcon)} mr-1"></i>${statusText}</span></td>
+                <td class="px-4 py-4 whitespace-nowrap"><span class="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium ${rowRaw(statusClass)}" title="${keylessRow ? LOST_KEY_TITLE : ''}"><i class="fas ${rowRaw(statusIcon)} mr-1"></i>${statusText}</span></td>
                 <td class="px-4 py-4 whitespace-nowrap hidden md:table-cell"><div class="text-sm font-semibold ${rowRaw(daysClass)}">${daysText}</div><div class="text-xs text-muted mt-0.5">${expiryStr}</div></td>
                 <td class="px-4 py-4 whitespace-nowrap hidden lg:table-cell text-sm text-muted">${providerLabel ? rowRaw(providerCellHtml(cert.dns_provider, providerLabel)) : '—'}</td>
                 <td class="px-4 py-4 whitespace-nowrap hidden lg:table-cell text-sm text-muted">${rowRaw(caCell)}</td>
@@ -841,6 +959,14 @@
                 </td>
             </tr>`;
         }).join('');
+
+        // A tag on a row filters the list; it must not also open the detail panel.
+        container.querySelectorAll('[data-tag-chip]').forEach(function (chip) {
+            chip.addEventListener('click', function (event) {
+                event.stopPropagation();
+                setTagFilter(chip.getAttribute('data-tag-chip'));
+            });
+        });
 
         // Attach event listeners for cert action buttons
         container.querySelectorAll('button[data-action]').forEach(function (btn) {
@@ -963,6 +1089,9 @@
     // opens the detail panel, matching the row's onclick. Space is prevented
     // from scrolling the page.
     function certRowKey(event, domain) {
+        // Only the row itself: a keypress that bubbles up from a control inside it
+        // (a tag chip, an action button) belongs to that control.
+        if (event.target !== event.currentTarget) return;
         if (event.key === 'Enter' || event.key === ' ' || event.key === 'Spacebar') {
             event.preventDefault();
             openCertDetail(domain);
@@ -993,6 +1122,96 @@
             if (CertMate.toast) CertMate.toast('Domain copied to clipboard', 'info');
         });
     };
+
+    // ---- Notes and tags in the detail panel (#1043) -----------------------
+    // Read-only for a viewer; an operator gets an Edit control, because the
+    // PATCH behind it needs that role. The note is text, not HTML: it goes in
+    // through textContent-safe escaping and keeps its line breaks with CSS.
+    function labelsSectionHtml(cert) {
+        var tags = Array.isArray(cert.tags) ? cert.tags : [];
+        var notes = cert.notes || '';
+        var canEdit = roleAtLeast('operator');
+        var empty = '<span class="text-sm text-muted">' + (canEdit ? 'Nothing recorded yet.' : 'Nothing recorded.') + '</span>';
+        var body = (tags.length || notes)
+            ? (tags.length ? '<div class="flex flex-wrap gap-1 mb-2">' + tagChipsHtml(tags) + '</div>' : '') +
+              (notes ? '<p class="text-sm text-foreground whitespace-pre-wrap break-words">' + escapeHtml(notes) + '</p>' : '')
+            : empty;
+        return '<div class="flex items-center justify-between mb-3">' +
+            '<h4 class="text-xs font-semibold text-muted uppercase tracking-wider">Notes &amp; tags</h4>' +
+            (canEdit ? '<button type="button" data-labels-edit="' + escapeHtml(cert.domain) + '" class="text-xs text-info-fg hover:underline">Edit</button>' : '') +
+            '</div>' + body;
+    }
+
+    function wireLabelsSection(domain) {
+        var section = document.getElementById('certLabelsSection');
+        if (!section) return;
+        var edit = section.querySelector('[data-labels-edit]');
+        if (edit) edit.addEventListener('click', function () { startEditLabels(domain); });
+        section.querySelectorAll('[data-tag-chip]').forEach(function (chip) {
+            chip.addEventListener('click', function () {
+                closeCertDetail();
+                setTagFilter(chip.getAttribute('data-tag-chip'));
+            });
+        });
+    }
+
+    function startEditLabels(domain) {
+        var cert = allCertificates.find(function (c) { return c.domain === domain; });
+        var section = document.getElementById('certLabelsSection');
+        if (!cert || !section) return;
+        section.innerHTML = '<h4 class="text-xs font-semibold text-muted uppercase tracking-wider mb-3">Notes &amp; tags</h4>' +
+            '<label for="certLabelTags" class="block text-xs font-medium text-muted mb-1">Tags</label>' +
+            '<input id="certLabelTags" type="text" maxlength="700" autocomplete="off" class="w-full px-3 py-2 border border-border rounded-md bg-input text-foreground text-sm" ' +
+            'placeholder="production, customer-x, load-balancer" value="' + escapeHtml((cert.tags || []).join(', ')) + '">' +
+            '<p class="mt-1 text-xs text-muted">Comma-separated. Up to 20 tags of letters, digits, . _ - : / (max 32 characters each).</p>' +
+            '<label for="certLabelNotes" class="block text-xs font-medium text-muted mt-3 mb-1">Notes</label>' +
+            '<textarea id="certLabelNotes" rows="3" maxlength="2000" class="w-full px-3 py-2 border border-border rounded-md bg-input text-foreground text-sm" ' +
+            'placeholder="Where it is installed, which ticket it was issued for, who owns it">' + escapeHtml(cert.notes || '') + '</textarea>' +
+            '<div class="mt-3 flex items-center gap-2">' +
+            '<button type="button" data-labels-save class="px-3 py-1.5 bg-primary text-white rounded text-sm">Save</button>' +
+            '<button type="button" data-labels-cancel class="px-3 py-1.5 rounded border border-border text-sm text-muted hover:text-foreground">Cancel</button>' +
+            '</div>';
+        section.querySelector('[data-labels-save]').addEventListener('click', function () { saveLabels(domain); });
+        section.querySelector('[data-labels-cancel]').addEventListener('click', function () {
+            section.innerHTML = labelsSectionHtml(cert);
+            wireLabelsSection(domain);
+        });
+        document.getElementById('certLabelTags').focus();
+    }
+
+    function saveLabels(domain) {
+        var cert = allCertificates.find(function (c) { return c.domain === domain; });
+        if (!cert) return;
+        var tags = document.getElementById('certLabelTags').value.split(',')
+            .map(function (t) { return t.trim(); })
+            .filter(function (t) { return t; });
+        var notes = document.getElementById('certLabelNotes').value;
+        fetch('/api/certificates/' + encodeURIComponent(domain), {
+            method: 'PATCH',
+            headers: API_HEADERS,
+            credentials: 'same-origin',
+            body: JSON.stringify({ tags: tags, notes: notes })
+        }).then(function (r) {
+            return r.json().then(function (body) { return { ok: r.ok, body: body }; });
+        }).then(function (res) {
+            if (!res.ok) {
+                showMessage((res.body && res.body.error) || 'Could not save notes and tags', 'error');
+                return;
+            }
+            cert.tags = res.body.tags || [];
+            cert.notes = res.body.notes || null;
+            var section = document.getElementById('certLabelsSection');
+            if (section) {
+                section.innerHTML = labelsSectionHtml(cert);
+                wireLabelsSection(domain);
+            }
+            renderTagFilterBar();
+            filterCertificates();
+            showMessage('Notes and tags saved', 'success');
+        }).catch(function (error) {
+            showMessage('Could not save notes and tags: ' + error.message, 'error');
+        });
+    }
 
     function openCertDetail(domain) {
         var cert = allCertificates.find(function (c) { return c.domain === domain; });
@@ -1038,7 +1257,9 @@
             var isExpiringSoon = lifeKnown(cert) && !isExpired && cert.days_until_expiry <= 30;
             var expiryDate = new Date(cert.expiry_date);
             var statusClass, statusText;
-            if (isExpired) { statusClass = 'text-danger-fg'; statusText = 'Expired'; }
+            var keylessDetail = lostItsKey(cert);
+            if (keylessDetail) { statusClass = isExpired ? 'text-danger-fg' : 'text-warning-fg'; statusText = 'Needs reissue'; }
+            else if (isExpired) { statusClass = 'text-danger-fg'; statusText = 'Expired'; }
             else if (isExpiringSoon) { statusClass = 'text-warning-fg'; statusText = 'Expiring Soon'; }
             else { statusClass = 'text-success-fg'; statusText = 'Valid'; }
 
@@ -1048,8 +1269,8 @@
             // expired within 24 hours, never 0.
             var daysText = CertMate.lifetimePhrase(cert);
             var expiryStr = CertMate.formatDate(expiryDate);
-            var bannerBg = isExpired ? 'bg-danger-surface' : isExpiringSoon ? 'bg-warning-surface' : 'bg-success-surface';
-            var bannerIcon = isExpired ? 'fa-circle-xmark' : isExpiringSoon ? 'fa-triangle-exclamation' : 'fa-circle-check';
+            var bannerBg = isExpired ? 'bg-danger-surface' : (isExpiringSoon || keylessDetail) ? 'bg-warning-surface' : 'bg-success-surface';
+            var bannerIcon = keylessDetail ? 'fa-key' : isExpired ? 'fa-circle-xmark' : isExpiringSoon ? 'fa-triangle-exclamation' : 'fa-circle-check';
             var autoOn = cert.auto_renew !== false;
 
             // Quick-action icon button — same glyphs as the dashboard table row
@@ -1087,6 +1308,7 @@
                 '<div class="min-w-0 flex-1">' +
                 '<div class="text-lg font-semibold ' + statusClass + '">' + statusText + (daysKnown2 ? ' · ' + daysText : '') + '</div>' +
                 (cert.expiry_date ? '<div class="text-sm ' + statusClass + ' opacity-80">' + (isExpired ? 'Expired ' : 'Expires ') + expiryStr + '</div>' : '') +
+                (keylessDetail ? '<div class="text-sm ' + statusClass + ' mt-1">' + LOST_KEY_TITLE + ' Use Edit &amp; Reissue, or Reissue all on the dashboard.</div>' : '') +
                 '</div>' +
                 // Auto-Renew moved into the banner's empty right side (point 1).
                 '<div class="flex-shrink-0 flex items-center gap-2">' +
@@ -1104,10 +1326,13 @@
                 // "not recorded" is an answer; silence would read as "public,
                 // like everything else".
                 detailRow('Issuing CA', caDetailLabel || CA_NOT_RECORDED) +
+                detailRow('CA renewal window', renewalWindowHtml(cert.renewal_info)) +
                 (sanDomains.length ? detailRow('SANs', '<div class="text-right">' + sanDomainsHtml + '</div>') : '') +
                 (safeDomainAlias ? detailRow('DNS-01 Alias', '<span class="break-all text-info-fg">' + safeDomainAlias + '</span>') : '') +
                 (safeDomainAlias && aliasProviderLabel ? detailRow('Alias Provider', aliasProviderCell) : '') +
                 '</dl>' +
+                // Notes and tags (#1043): what CertMate cannot know by itself.
+                '<div id="certLabelsSection" class="pt-4 border-t border-border">' + labelsSectionHtml(cert) + '</div>' +
                 // Deployment + Actions side by side — two sections, one column
                 // each, every control a quick-action button (points 2 & 3).
                 '<div class="grid grid-cols-1 sm:grid-cols-2 gap-x-6 gap-y-4 pt-4 border-t border-border">' +
@@ -1140,6 +1365,8 @@
                 '</div>' +
                 '</div>';
         }
+
+        if (cert.exists) wireLabelsSection(cert.domain);
 
         // Reveal the backdrop and modal, then animate the card in (scale +
         // fade) on the next frame so the transition actually plays. Focus moves
@@ -1612,6 +1839,66 @@
         });
     }
 
+    // --- Certificates that lost their private key (#966) -------------------
+    // Restoring a share-safe backup brings certificates back without a key.
+    // Renewal refuses them (REISSUE_REQUIRED), and the list reports them as
+    // `reissue_required`. The server paces the reissue (a few per call, two at
+    // a time), so the banner says what was queued and what is left rather
+    // than promising all of them at once.
+    function renderKeylessBanner(certificates) {
+        var banner = document.getElementById('keylessBanner');
+        if (!banner) return;
+        var keyless = certificates.filter(function (cert) { return cert.reissue_required === true; });
+        if (keyless.length === 0) {
+            banner.classList.add('hidden');
+            banner.innerHTML = '';
+            return;
+        }
+        var names = keyless.slice(0, 5).map(function (cert) { return escapeHtml(cert.domain); }).join(', ') +
+            (keyless.length > 5 ? ' and ' + (keyless.length - 5) + ' more' : '');
+        var action = roleAtLeast('operator')
+            ? '<button type="button" id="reissueKeylessBtn" onclick="reissueKeyless()" class="shrink-0 px-3 py-1 border border-warning-line rounded-md text-xs font-medium hover:bg-amber-100 dark:hover:bg-amber-900/40 disabled:opacity-50">Reissue all</button>'
+            : '<span class="shrink-0 text-xs">An operator can reissue them.</span>';
+        banner.innerHTML =
+            '<div class="flex items-center justify-between gap-4 p-3 rounded-md bg-warning-surface border border-warning-line text-sm text-warning-fg">' +
+            '<span><i class="fas fa-key mr-2"></i><strong>' + keyless.length + ' certificate' + (keyless.length === 1 ? '' : 's') +
+            ' ha' + (keyless.length === 1 ? 's' : 've') + ' no private key</strong> (' + names + '), ' +
+            'as a share-safe backup restores them. They cannot be renewed, only reissued, and a reissue creates a new key that deploy hooks will ship.</span>' +
+            action + '</div>';
+        banner.classList.remove('hidden');
+    }
+
+    function reissueKeyless() {
+        var btn = document.getElementById('reissueKeylessBtn');
+        if (btn) btn.disabled = true;
+        fetch('/api/certificates/reissue-keyless', {
+            method: 'POST',
+            headers: API_HEADERS,
+            credentials: 'same-origin',
+            body: JSON.stringify({})
+        }).then(function (response) {
+            return response.json().then(function (body) { return { status: response.status, body: body }; });
+        }).then(function (res) {
+            var body = res.body || {};
+            if (res.status !== 200 && res.status !== 202) {
+                showMessage(body.error || body.message || ('Reissue failed (HTTP ' + res.status + ')'), 'error');
+                return;
+            }
+            var queued = (body.queued || []).length;
+            var remaining = (body.remaining || []).length;
+            var refused = (body.refused || []).length;
+            var parts = [queued + ' reissue' + (queued === 1 ? '' : 's') + ' queued'];
+            if (remaining) parts.push(remaining + ' still to do: run it again once these finish');
+            if (refused) parts.push(refused + ' cannot be reissued from their recorded configuration');
+            showMessage(parts.join('; ') + '.', refused ? 'warning' : 'success');
+        }).catch(function (error) {
+            showMessage('Reissue failed: ' + error.message, 'error');
+        }).finally(function () {
+            if (btn) btn.disabled = false;
+            loadCertificates();
+        });
+    }
+
     // Load certificates with deployment status
     function loadCertificates() {
         addDebugLog('Loading certificates from API...', 'info');
@@ -1639,7 +1926,9 @@
 
             allCertificates = certificates;
             updateStats(certificates);
-            displayCertificates(certificates);
+            renderTagFilterBar();
+            filterCertificates();
+            renderKeylessBanner(certificates);
 
             // Check deployment status for all certificates after a short delay.
             // Single source of automatic checks — batched/deduped via
@@ -1725,6 +2014,80 @@
     // Multi-account support functions
     var providerAccounts = {};
     var accountSelectProvider = '';  // provider the account list was built for
+    var caAccounts = {};
+    var caAccountSelectProvider = '';
+    var configuredCAs = [];
+    var defaultCAProvider = 'letsencrypt';
+    var defaultCAAccounts = {};
+    var globalCAEmail = '';
+    var CA_NAMES = {
+        letsencrypt: "Let's Encrypt", letsencrypt_staging: "Let's Encrypt (Staging)",
+        zerossl: 'ZeroSSL', google: 'Google Trust Services', actalis: 'Actalis',
+        digicert: 'DigiCert', sectigo: 'Sectigo', sslcom: 'SSL.com', private_ca: 'Private CA'
+    };
+
+    function caAccountLabel(provider, id, config) {
+        var accounts = config.accounts || {};
+        var account = accounts[id] || (id === 'default' ? config : {});
+        return provider === 'sectigo' ? (account.name || id) :
+            (account.email || account.name || (provider === 'letsencrypt' ? globalCAEmail : '') || id);
+    }
+
+    function loadCAProviders() {
+        return fetch('/api/web/settings', { headers: API_HEADERS })
+            .then(function (response) { if (!response.ok) throw new Error('CA settings unavailable'); return response.json(); })
+            .then(function (settings) {
+                configuredCAs = CertMate.configuredCAProviders(settings, true);
+                caAccounts = settings.ca_providers || {};
+                defaultCAAccounts = settings.default_ca_accounts || {};
+                globalCAEmail = settings.email || '';
+                var select = document.getElementById('ca_provider_select');
+                var previous = select.value;
+                select.replaceChildren();
+                var defaultCA = settings.default_ca || 'letsencrypt';
+                defaultCAProvider = defaultCA;
+                if (configuredCAs.indexOf(defaultCA) !== -1) {
+                    var config = caAccounts[defaultCA] || {};
+                    var ids = Object.keys(config.accounts || {});
+                    var id = defaultCAAccounts[defaultCA] ||
+                        (ids.indexOf('default') !== -1 ? 'default' : (ids[0] || 'default'));
+                    select.add(new Option('Global default: ' + (CA_NAMES[defaultCA] || defaultCA) + ' — ' +
+                        caAccountLabel(defaultCA, id, config), ''));
+                }
+                configuredCAs.forEach(function (id) {
+                    select.add(new Option(CA_NAMES[id] || id, id));
+                });
+                if (!configuredCAs.length) select.add(new Option('Configure a CA in Settings', ''));
+                select.value = configuredCAs.indexOf(previous) !== -1 ? previous : '';
+                updateCAProviderInfo();
+            })
+            .catch(function () { showMessage('Could not load configured certificate authorities', 'error'); });
+    }
+
+    function updateCAAccountSelection() {
+        var provider = document.getElementById('ca_provider_select').value || defaultCAProvider;
+        var select = document.getElementById('ca_account_id');
+        var container = document.getElementById('ca-account-container');
+        var previous = provider === caAccountSelectProvider ? select.value : '';
+        caAccountSelectProvider = provider;
+        select.replaceChildren();
+        var config = caAccounts[provider] || {};
+        var accounts = config.accounts || {};
+        var ids = Object.keys(accounts);
+        var defaultId = defaultCAAccounts[provider] ||
+            (ids.indexOf('default') !== -1 ? 'default' : (ids[0] || 'default'));
+        select.add(new Option('Default for ' + (CA_NAMES[provider] || provider) + ': ' +
+            caAccountLabel(provider, defaultId, config), ''));
+        Object.keys(config.accounts || {}).forEach(function (id) {
+            select.add(new Option(caAccountLabel(provider, id, config) +
+                (id === defaultId ? ' (default for this CA)' : ''), id));
+        });
+        if (!config.accounts && (config.email || config.eab_kid || config.acme_url)) {
+            select.add(new Option(caAccountLabel(provider, 'default', config), 'default'));
+        }
+        container.classList.toggle('hidden', !configuredCAs.length);
+        if (previous) select.value = previous;
+    }
 
     // One request for every provider: /api/dns/accounts answers with a plain
     // list of {provider, account_id, name, ...}, grouped by provider here.
@@ -1811,7 +2174,7 @@
                     infoText = '<i class="fas fa-shield-alt mr-1 text-blue-500"></i> Enterprise certificates (requires EAB credentials configured in Settings)';
                     break;
                 case 'sectigo':
-                    infoText = '<i class="fas fa-shield-alt mr-1 text-blue-500"></i> Sectigo SCM ACME (requires account directory URL and EAB credentials)';
+                    infoText = '<i class="fas fa-shield-alt mr-1 text-blue-500"></i> Sectigo SCM ACME (requires account directory URL and EAB credentials; prevalidated mode is available for already-authorized names)';
                     break;
                 case 'sslcom':
                     infoText = '<i class="fas fa-shield-alt mr-1 text-indigo-500"></i> Enterprise certificates from SSL.com (requires EAB)';
@@ -1831,13 +2194,23 @@
         } else {
             infoDiv.classList.add('hidden');
         }
+        toggleDnsProviderVisibility();
+        updateCAAccountSelection();
     }
 
     function toggleDnsProviderVisibility() {
         var select = document.getElementById('challenge_type_select');
         var container = document.getElementById('dns-provider-container');
         if (!container) return;
-        if (select && select.value === 'http-01') {
+        var ca = document.getElementById('ca_provider_select');
+        var prevalidated = select && select.querySelector('option[value="prevalidated"]');
+        if (prevalidated) {
+            var allowed = ca && ca.value === 'sectigo';
+            prevalidated.hidden = !allowed;
+            prevalidated.disabled = !allowed;
+            if (!allowed && select.value === 'prevalidated') select.value = '';
+        }
+        if (select && (select.value === 'http-01' || select.value === 'prevalidated')) {
             container.style.display = 'none';
         } else {
             container.style.display = '';
@@ -2381,6 +2754,7 @@
         // are rebuilt by updateAccountSelection).
         toggleDnsProviderVisibility();
         updateCAProviderInfo();
+        if (cert.ca_account_id) document.getElementById('ca_account_id').value = cert.ca_account_id;
         updateDnsAliasHelp();
         if (typeof updateAccountSelection === 'function') updateAccountSelection();
         if (cert.account_id) {
@@ -2496,6 +2870,11 @@
         var dnsAliasDomain = (document.getElementById('dns_alias_domain') || {}).value;
         dnsAliasDomain = dnsAliasDomain ? normalizeDnsAliasName(dnsAliasDomain) : '';
 
+        if (!configuredCAs.length) {
+            showMessage('Configure a certificate authority in Settings before issuing', 'error');
+            return;
+        }
+
         // Parse SAN domains from comma-separated input
         var sanDomains = parseSanDomainsInput(sanDomainsInput);
         if (wildcardEnabled) {
@@ -2590,16 +2969,16 @@
         if (challengeType) {
             requestBody.challenge_type = challengeType;
         }
-        if (dnsProvider) {
+        if (dnsProvider && challengeType !== 'prevalidated') {
             requestBody.dns_provider = dnsProvider;
         }
-        if (accountId) {
+        if (accountId && challengeType !== 'prevalidated') {
             requestBody.account_id = accountId;
         }
         if (caProvider) {
             requestBody.ca_provider = caProvider;
         }
-        var caAccountId = document.getElementById('ca_account_id').value.trim();
+        var caAccountId = document.getElementById('ca_account_id').value;
         if (caAccountId) requestBody.ca_account_id = caAccountId;
 
         // A CSR generated on the device that will serve the certificate
@@ -3405,6 +3784,7 @@
             });
         });
         loadProviderAccounts();
+        loadCAProviders();
 
         // Status filtering is driven by the chips (onclick -> setStatusFilter);
         // free-text search moved to the ⌘K palette. No select listener needed.
@@ -3491,6 +3871,7 @@
 
     // Expose functions needed by HTML onclick handlers and SSE
     window.loadCertificates = loadCertificates;
+    window.reissueKeyless = reissueKeyless;
     window.exportAllCertificates = exportAllCertificates;
     window.openCertDetail = openCertDetail;
     window.certRowKey = certRowKey;
@@ -3508,6 +3889,7 @@
     window.copyFromModal = copyFromModal;
     window.clearFilters = clearFilters;
     window.setStatusFilter = setStatusFilter;
+    window.setTagFilter = setTagFilter;
     window.sortCertificates = sortCertificates;
     window.filterCertificates = filterCertificates;
     window.toggleDebugConsole = toggleDebugConsole;
@@ -3520,6 +3902,7 @@
     window.toggleDnsProviderVisibility = toggleDnsProviderVisibility;
     window.updateAccountSelection = updateAccountSelection;
     window.updateCAProviderInfo = updateCAProviderInfo;
+    window.loadCAProviders = loadCAProviders;
     window.updateDnsAliasHelp = updateDnsAliasHelp;
     window.checkDnsAliasForCertificate = checkDnsAliasForCertificate;
     window.copyAliasValueToClipboard = copyAliasValueToClipboard;

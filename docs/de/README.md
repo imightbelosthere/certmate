@@ -1,6 +1,6 @@
 # CertMate Dokumentation
 
-<!-- CERTMATE-TRANSLATED-FROM 5d329368f9d77176 -->
+<!-- CERTMATE-TRANSLATED-FROM c4146ec562570ee8 -->
 
 Willkommen in der CertMate-Dokumentation. Dieser Ordner enthält umfassende Anleitungen zu allen Funktionen.
 
@@ -15,6 +15,7 @@ Willkommen in der CertMate-Dokumentation. Dieser Ordner enthält umfassende Anle
 
 ### Kernfunktionen
 - **[DNS-Provider](./dns-providers.md)** — Unterstützte Provider, Multi-Account, Domain-Alias
+- **[Eigenes DNS-Skript](../custom-dns-script.md)** — jeder Provider ohne Plugin, über Ihre eigenen Hooks *(auf Englisch)*
 - **[CA-Provider](./ca-providers.md)** — Let's Encrypt, DigiCert, Private CA
 - **[Client-Zertifikate](./guide.md)** — Lebenszyklus von Client-Zertifikaten, Web-Dashboard, Batch-Operationen
 - **[Model Context Protocol (MCP) Server](./mcp.md)** — Eigenständiger Node.js-Server für KI-Agenten-Integrationen
@@ -58,7 +59,7 @@ Willkommen in der CertMate-Dokumentation. Dieser Ordner enthält umfassende Anle
 ## Funktionsübersicht
 
 ### Server-Zertifikate
-- **Über zwei Dutzend DNS-Provider** für Let's Encrypt DNS-01-Challenges (vollständige Liste unter [DNS-Provider](./dns-providers.md))
+- **Alle unterstützten DNS-Provider** für Let's Encrypt DNS-01-Challenges (vollständige Liste unter [DNS-Provider](./dns-providers.md))
 - **Mehrere CA-Provider**: Let's Encrypt, DigiCert, Private CA
 - **Multi-Account-Unterstützung** pro DNS-Provider
 - **Austauschbare Storage-Backends**: Lokal, Azure Key Vault, AWS Secrets Manager, HashiCorp Vault, Infisical, S3-compatible
@@ -245,7 +246,7 @@ CertMate steht unter der MIT-Lizenz. Siehe die LICENSE-Datei im Repository.
 
 ---
 
-**Aktuelle Version**: 2.37.0
+**Aktuelle Version**: 2.45.2
 
 <div align="center">
 

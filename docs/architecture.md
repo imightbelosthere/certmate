@@ -20,13 +20,13 @@ This document covers the complete CertMate architecture — both the main server
 
 ## Main System Architecture
 
-CertMate is a modular, pluggable SSL/TLS certificate management system built with Python/Flask. It supports multiple CA providers, two dozen+ DNS providers, and pluggable storage backends.
+CertMate is a modular, pluggable SSL/TLS certificate management system built with Python/Flask. It supports multiple CA providers, the DNS providers listed in [DNS Providers](./dns-providers.md), and pluggable storage backends.
 
 **Key Facts:**
 - **Language**: Python 3.12 (Flask, Flask-RESTX)
 - **Storage**: Local filesystem default + 5 remote backends (Azure Key Vault, AWS Secrets Manager, HashiCorp Vault, Infisical, S3-compatible)
 - **CA Providers**: Let's Encrypt, DigiCert ACME, Private CA
-- **DNS Providers**: two dozen+ supported (Cloudflare, AWS Route53, Azure, Google, and more — see [DNS Providers](./dns-providers.md) for the full list)
+- **DNS Providers**: Cloudflare, AWS Route53, Azure, Google and more — see [DNS Providers](./dns-providers.md) for the full list
 - **API**: REST with Swagger/OpenAPI via Flask-RESTX
 - **Current Certificate Types**: Server-side TLS (DV, OV, EV)
 
@@ -218,6 +218,18 @@ All backends implement `CertificateStorageBackend`:
 | **HashiCorp Vault** | Vault KV v1/v2 |
 | **Infisical** | Infisical secrets |
 | **S3-compatible** | Any S3 API: MinIO/Ceph self-hosted, or Hetzner, Contabo, OVHcloud, Scaleway, Exoscale, Wasabi |
+
+#### HashiCorp Vault — redirects
+
+The request to Vault carries the private key and the Vault token. CertMate
+follows a redirect only within the address it was configured with (same scheme,
+host and port) and **refuses** one to another host, or from https to http,
+before anything is sent there. It says so in the error, naming the host.
+
+A standby node that is not forwarding requests answers with exactly such a
+redirect to the active node. With request forwarding on (the default) that never
+happens. If your Vault runs without it, set `vault_url` to the active node, or to
+a load balancer that routes to it.
 
 #### Azure Key Vault — storage modes
 

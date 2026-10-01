@@ -1,14 +1,61 @@
 # Construcción y despliegue con Docker
 
-<!-- CERTMATE-TRANSLATED-FROM 38dc004104e2e9da -->
+<!-- CERTMATE-TRANSLATED-FROM 875370d723412467 -->
 
 Esta guía cubre la construcción, el despliegue y la ejecución de CertMate en Docker — incluyendo soporte multiplataforma para ARM y AMD64.
+
+---
+
+## En producción con Docker Compose
+
+La forma más corta de ejecutar CertMate en producción: un solo archivo, la imagen publicada, nada que compilar y ningún repositorio que clonar.
+
+```bash
+mkdir certmate && cd certmate
+curl -fsSLO https://raw.githubusercontent.com/fabriziosalmi/certmate/main/deploy/docker-compose.yml
+printf 'API_BEARER_TOKEN=%s\nSECRET_KEY=%s\nCERTMATE_BACKUP_PASSPHRASE=%s\n' \
+  "$(openssl rand -hex 32)" "$(openssl rand -hex 32)" "$(openssl rand -hex 32)" > .env
+chmod 600 .env
+docker compose up -d
+```
+
+Abre `http://127.0.0.1:8000`. La primera página crea la cuenta de administrador y pide el `API_BEARER_TOKEN` del archivo `.env` para autorizarla. Conserva `.env`: contiene el token que usan los clientes de la API, la clave que firma las sesiones y la frase de contraseña sin la cual una copia de seguridad no puede restaurar esta instancia.
+
+Qué hace el archivo:
+
+- **Fija la imagen** de la última versión. La copia en `main` se actualiza con cada versión. Para quedarte en una versión, define `CERTMATE_VERSION=X.Y.Z` en `.env`.
+- **Guarda todo en volúmenes con nombre** (`certificates`, `data`, `logs`, `backups`). Docker los crea con la propiedad que CertMate necesita, así que no hay que hacer ningún `chown`. `docker compose down` los conserva; `down -v` los elimina.
+- **Escucha solo en 127.0.0.1.** Para el acceso remoto, pon un proxy inverso delante y define `BEHIND_PROXY=true`. `CERTMATE_BIND=0.0.0.0` lo publica en todas las interfaces. `CERTMATE_PORT` cambia el puerto del host.
+- **Se niega a arrancar sin `API_BEARER_TOKEN` y `SECRET_KEY`**, en lugar de generar valores que cambiarían cada vez que se recrea el contenedor.
+
+Variables opcionales para `.env`: `CLOUDFLARE_TOKEN` (crea una cuenta DNS de Cloudflare en el primer arranque), `LETSENCRYPT_EMAIL`, `BEHIND_PROXY`.
+
+**Actualización:** descarga de nuevo el archivo (o cambia `CERTMATE_VERSION`) y luego ejecuta `docker compose pull && docker compose up -d`.
+
+El `docker-compose.yml` en la raíz del repositorio construye la imagen desde el código fuente y está pensado para el desarrollo.
+
+---
+
+## Portainer
+
+En Portainer, despliega el [paquete compose de producción](#en-producción-con-docker-compose) como stack directamente desde este repositorio:
+
+1. **Stacks → Add stack**, llámalo `certmate` y elige **Repository**.
+2. URL del repositorio `https://github.com/fabriziosalmi/certmate`, referencia `refs/heads/main`, ruta del compose `deploy/docker-compose.yml`.
+3. En **Environment variables** añade `API_BEARER_TOKEN`, `SECRET_KEY` y `CERTMATE_BACKUP_PASSPHRASE`, cada uno con un valor aleatorio largo, como la salida de `openssl rand -hex 32`. Opcionales: `CERTMATE_PORT`, `CERTMATE_BIND` o `CLOUDFLARE_TOKEN`.
+4. **Deploy the stack.**
+
+Sin las dos variables obligatorias el despliegue falla e indica cuál falta (`required variable API_BEARER_TOKEN is missing a value`), en lugar de arrancar con claves que cambiarían en cada redespliegue. Para actualizar, usa **Pull and redeploy** en el stack: los volúmenes con nombre, y con ellos los certificados y los ajustes, se conservan.
+
+Verificado en Portainer CE 2.45: un stack sin las variables se rechaza con ese mensaje; con ellas arranca sano, el token autoriza la API, y un pull and redeploy recrea el contenedor con los datos intactos.
 
 ---
 
 ## Inicio rápido
 
 ### Pull y ejecución
+
+Las imágenes se publican en Docker Hub como `fabriziosalmi/certmate`. Las versiones posteriores a v2.42.0 también se publican, con las mismas etiquetas, en GHCR como `ghcr.io/fabriziosalmi/certmate`, lo que evita los límites de descarga anónima de Docker Hub: usa cualquiera de los dos nombres a continuación.
 
 ```bash
 # Docker selecciona automáticamente la arquitectura correcta
@@ -165,6 +212,34 @@ docker-compose up -d
 # O especificar un archivo de entorno diferente
 docker-compose --env-file /path/to/.env up -d
 ```
+
+---
+
+## Podman (Quadlet, rootless) y OpenShift
+
+[`deploy/podman/certmate.container`](../../deploy/podman/certmate.container) es una unidad Quadlet: Podman la convierte en un servicio systemd. Ejecuta la imagen publicada con volúmenes con nombre, el puerto solo en loopback, los secretos como secretos de Podman, un healthcheck y soporte para `podman auto-update`.
+
+En rootless, con tu propio usuario (los tres secretos se crean una vez y no aparecen en ningún archivo; `enable-linger` lo mantiene activo sin sesión y lo inicia al arrancar):
+
+```bash
+for s in certmate-api-token certmate-secret-key certmate-backup-passphrase; do
+  openssl rand -hex 32 | tr -d '\n' | podman secret create "$s" -
+done
+
+mkdir -p ~/.config/containers/systemd
+curl -fsSL -o ~/.config/containers/systemd/certmate.container \
+  https://raw.githubusercontent.com/fabriziosalmi/certmate/main/deploy/podman/certmate.container
+systemctl --user daemon-reload
+systemctl --user start certmate
+
+sudo loginctl enable-linger "$USER"
+```
+
+En rootful: coloca el archivo en `/etc/containers/systemd/`, crea los secretos como root y luego `sudo systemctl daemon-reload && sudo systemctl start certmate`.
+
+Abre `http://127.0.0.1:8000`. La primera página crea la cuenta de administrador y pide el token de la API: `podman secret inspect --showsecret certmate-api-token --format '{{.SecretData}}'`.
+
+Verificado en Fedora 44 con Podman 5.8, rootful y rootless: el servicio arranca sano, el token autoriza la API y vuelve tras un reinicio (en rootless mediante lingering). Los volúmenes usan `:U`: en rootless, Podman dejaba la raíz del volumen `backups` a root y CertMate no arrancaba. Los UID arbitrarios, los bind mounts y podman-compose se describen en la [página en inglés](../docker.md#podman-quadlet-rootless-and-openshift).
 
 ---
 

@@ -1,6 +1,6 @@
 # CertMate Client-Zertifikate - Benutzerhandbuch
 
-<!-- CERTMATE-TRANSLATED-FROM c9f680a52f9eca05 -->
+<!-- CERTMATE-TRANSLATED-FROM f31f91fe8af58072 -->
 
 ## Übersicht
 
@@ -390,8 +390,11 @@ Der 30-Tage-Schwellenwert ist CertMates Meinung, und es ist dieselbe Meinung
 fur jedes Zertifikat und jede CA. Seit [RFC 9773](https://www.rfc-editor.org/rfc/rfc9773.html)
 kann eine CA ihre eigene veroffentlichen, pro Zertifikat: ein
 `renewalInfo`-Endpunkt, der ein Zeitfenster nennt, in dem sie dieses
-Zertifikat ersetzt sehen mochte. Let's Encrypt bietet eines in Produktion;
-step-ca ebenfalls, fur eine private CA.
+Zertifikat ersetzt sehen mochte. Let's Encrypt bietet eines, in Produktion und
+im Staging. step-ca noch nicht (0.30.2, gemessen; siehe
+smallstep/certificates#2162), daher entscheidet bei einer privaten step-ca
+allein der Schwellenwert, und das Zertifikatsfenster sagt, dass die CA kein
+Zeitfenster veroffentlicht.
 
 Der TLS-Erneuerungsdurchlauf fragt danach. Fur jedes Zertifikat, das der
 Schwellenwert **nicht** bereits als fallig eingestuft hat, holt CertMate das
@@ -416,6 +419,17 @@ Fenster da: eine CA will nicht, dass alle ihre Clients gleichzeitig erneuern.
 Die Zusammenfassung des Durchlaufs zahlt diese als `ari_advanced`, damit eine
 Erneuerung, die Ihre Konfiguration nicht erklart, zuordenbar bleibt.
 
+Das Detailfenster des Zertifikats zeigt unter **CA renewal window**, was die CA
+beim letzten Durchlauf gesagt hat: das Fenster, den Zeitpunkt darin, zu dem
+CertMate erneuert, und den Erklarungslink der CA, wenn sie einen angibt. Gibt
+es kein Fenster, nennt es den Grund: die CA veroffentlicht keines, die CA hat
+bei der letzten Prufung nicht geantwortet, oder das Zertifikat kann in ARI
+nicht benannt werden. Derselbe Eintrag wird von
+`GET /api/certificates/<domain>` als `renewal_info` zuruckgegeben. Er wird aus
+dem gelesen, was der Durchlauf gespeichert hat, daher sendet das Offnen des
+Dashboards nie eine Anfrage an die CA. Direkt nach einer Erneuerung steht dort
+"Not checked yet", bis der nachste Durchlauf nach dem neuen Zertifikat fragt.
+
 Setzen Sie `"ari_enabled": false` in `settings.json`, um es abzuschalten; es
 ist standardmassig aktiv und kostet eine unauthentifizierte GET pro Zertifikat
 pro Durchlauf, plus eine pro CA und Stunde fur das Directory.
@@ -425,6 +439,34 @@ Schwellenwert hinaus **verschieben** zu lassen. Das ist die Halfte, die fur
 kurzlebige Zertifikate zahlt, wo eine feste 30-Tage-Regel gegenuber einem
 6-Tage-Zertifikat sinnlos ist — sie kommt mit der Profilunterstutzung, die
 solche Zertifikate brauchen.
+
+### Ein Schwellenwert ueber 30 Tagen
+
+certbot hat eine eigene Schranke fuer die Erneuerung: ohne Erzwingen erneuert
+es nur innerhalb der letzten 30 Tage vor Ablauf. Vor 2.40 hat CertMate es ohne
+Erzwingen aufgerufen, daher verhielt sich ein `renewal_threshold_days` von 45
+wie 30, und der Durchlauf zaehlte die Luecke jede Nacht als
+`skipped_not_due`.
+
+Wenn der Schwellenwert, und nur der Schwellenwert, ein Zertifikat faellig
+nennt, waehrend certbot ablehnen wuerde, erzwingt CertMate die Erneuerung jetzt,
+wie schon bei einem von der CA veroeffentlichten Fenster. Innerhalb der letzten
+30 Tage aendert sich nichts. Zwei Schutzmechanismen gehoeren dazu:
+
+- **Hoechstens `early_renewals_per_sweep` pro Durchlauf** (Standard 10,
+  zwischen 1 und 50). Wer den Schwellenwert bei vielen Zertifikaten anhebt,
+  verteilt die vorgezogenen Erneuerungen auf mehrere Naechte, statt alle
+  Bestellungen in einer Nacht an die CA zu schicken. Die Zusammenfassung des
+  Durchlaufs zaehlt sie als `early_forced`, die auf den naechsten Durchlauf
+  verschobenen als `early_deferred`.
+- **Ein Zertifikat, das vor weniger als 7 Tagen ausgestellt wurde, wird nie
+  erzwungen.** Ein Schwellenwert in Hoehe der Laufzeit oder darueber wuerde es
+  sonst dauerhaft faellig nennen. Mit diesem Schutz kostet das hoechstens eine
+  Erneuerung pro Woche, nicht eine pro Nacht.
+
+Ein Zertifikat, das aus einem anderen Grund Aufmerksamkeit braucht, ein
+ausgelieferter Schluessel, der fehlt oder nicht passt, wird nicht erzwungen:
+es wird ohne neuen Schluessel aus seiner Lineage repariert.
 
 ### Automatische Erneuerung aktivieren
 

@@ -1,6 +1,6 @@
 # DNS-Anbieter
 
-<!-- CERTMATE-TRANSLATED-FROM 9b103696fbd47ac1 -->
+<!-- CERTMATE-TRANSLATED-FROM 4dcc9496784670bc -->
 
 CertMate unterstützt eine breite Palette von DNS-Anbietern für Let's Encrypt DNS-01-Challenges über individuelle certbot-Plugins. Die vollständige Liste befindet sich in der nachstehenden Tabelle.
 
@@ -12,7 +12,7 @@ CertMate unterstützt eine breite Palette von DNS-Anbietern für Let's Encrypt D
 |---|---|---|---|
 | **Cloudflare** | `certbot-dns-cloudflare` | API-Token | Großer Cloud-Anbieter |
 | **AWS Route53** | `certbot-dns-route53` | Access Key, Secret Key | Großer Cloud-Anbieter |
-| **Azure DNS** | `certbot-dns-azure` | Service Principal | Großer Cloud-Anbieter |
+| **Azure DNS** | Eigener CertMate-Hook (`azure-mgmt-dns`) | Service Principal | Großer Cloud-Anbieter |
 | **Google Cloud DNS** | `certbot-dns-google` | Service Account JSON | Großer Cloud-Anbieter |
 | **PowerDNS** | `certbot-dns-powerdns` | API-URL, API-Schlüssel | Enterprise |
 | **DNS Made Easy** | `certbot-dns-dnsmadeeasy` | API-Schlüssel, Secret Key | Enterprise |
@@ -114,6 +114,8 @@ curl -X POST http://localhost:8000/api/settings \
   }
 }
 ```
+
+Azure DNS wird nicht über ein certbot-Plugin beantwortet: CertMate schreibt den Challenge-Eintrag selbst mit dem Azure SDK, mit demselben Service Principal. Der Principal braucht Lese- und Schreibrechte für TXT-Einträge in der Zone (die Rolle `DNS Zone Contributor` auf der Ressourcengruppe genügt). Zertifikate, die zuvor über `certbot-dns-azure` ausgestellt wurden, wechseln bei der nächsten Erneuerung zu diesem Verfahren; es ist nichts zu ändern. Die Wartezeit vor der Validierung ist die Propagierungs-Einstellung des Anbieters (standardmäßig 180 Sekunden).
 
 ### Google Cloud DNS
 
@@ -374,7 +376,9 @@ Wildcards wie `*.mybox.duckdns.org` werden mit demselben Token unterstützt. Da 
 
 ### Custom Script (eigene Lösung)
 
-Für DNS-Anbieter ohne certbot-Plugin — Oracle Cloud (OCI), unternehmensinternes DNS, Appliance-APIs — verweisen Sie CertMate auf Ihre eigenen Skripte; CertMate steuert diese dann über certbots `--manual`-Modus. Eine Plugin-Installation ist nicht erforderlich.
+Für DNS-Anbieter ohne certbot-Plugin — Oracle Cloud (OCI), Total Uptime, Netriplex, unternehmensinternes DNS, Appliance-APIs — verweisen Sie CertMate auf Ihre eigenen Skripte; CertMate steuert diese dann über certbots `--manual`-Modus. Eine Plugin-Installation ist nicht erforderlich.
+
+**[Eigenes DNS-Skript](../custom-dns-script.md)** ist die vollständige Anleitung: die Pfadregeln und warum sie streng sind, die genaue Umgebung, mit der Ihr Skript aufgerufen wird, der Fall Wildcard plus Apex, was die Erneuerung verwendet, und ein durchgearbeitetes Beispiel. *(auf Englisch)*
 
 ```json
 {
@@ -432,7 +436,7 @@ Voraussetzungen und Vertrauensmodell:
 - Pfade müssen **absolut** sein, die Dateien müssen vorhanden und **ausführbar** sein, dürfen weder world- **noch gruppenschreibbar** sein (`chmod 755` oder strenger) und dürfen keine Leerzeichen oder Shell-Metazeichen enthalten (certbot führt Hooks über die Shell aus). Ein Hook mit `chmod 775` — ein üblicher Modus für ein Skript, das einer Deploy-Gruppe gehört — wird abgelehnt: jedes Mitglied dieser Gruppe könnte umschreiben, was CertMate gleich ausführt. Die Prüfung erfolgt bei der Ausstellung und über den Test-Provider-API-Endpoint (`POST /api/web/certificates/test-provider`)
 - Skripte laufen mit den Berechtigungen von CertMate — dasselbe Vertrauensmodell wie bei deploy hooks: nur Administratoren können sie konfigurieren; behandeln Sie sie als Teil Ihres Deployments
 - Die anbieterspezifische Einstellung `dns_propagation_seconds` wird den Skripten als `CERTMATE_DNS_PROPAGATION_SECONDS` exportiert (ein `propagation_seconds`-Feld auf Kontoebene überschreibt diesen Wert)
-- Verlängerungen spielen die Hook-Pfade aus der certbot-Verlängerungskonfiguration erneut ab: halten Sie die Skripte unter einem stabilen Pfad (wenn Sie sie verschieben, stellen Sie das Zertifikat neu aus)
+- Verlängerungen verwenden die aktuell konfigurierten Hook-Pfade, genau wie die Ausstellung: Verschieben Sie ein Skript, aktualisieren Sie den Pfad in den Einstellungen, und die nächste Verlängerung verwendet ihn
 - Wildcard-Zertifikate funktionieren (der Hook erhält jeden Validierungseintrag)
 
 ---

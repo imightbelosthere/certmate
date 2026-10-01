@@ -4,6 +4,46 @@ One file per release, in [docs/releases/](docs/releases/). This page is
 generated from them by `scripts/build_release_index.py`; edit the release file,
 not this list.
 
+## v2.45.2 (Azure DNS issues and renews again)
+
+[Read the notes](docs/releases/v2.45.2.md)
+
+## v2.45.1 (random tokens are no longer refused for repeating by chance)
+
+[Read the notes](docs/releases/v2.45.1.md)
+
+## v2.45.0 (webhook deploy targets, tags and notes on certificates, and an Infisical backend that runs)
+
+[Read the notes](docs/releases/v2.45.0.md)
+
+## v2.44.0 (CA accounts you can manage, and the email the CA is told)
+
+[Read the notes](docs/releases/v2.44.0.md)
+
+## v2.43.0 (install it where you already are)
+
+[Read the notes](docs/releases/v2.43.0.md)
+
+## v2.42.0 (a renewal that uses today's settings)
+
+[Read the notes](docs/releases/v2.42.0.md)
+
+## v2.41.0 (setup that closes, tests that need the right role)
+
+[Read the notes](docs/releases/v2.41.0.md)
+
+## v2.40.0 (what the settings say, and the certificate that lost its key)
+
+[Read the notes](docs/releases/v2.40.0.md)
+
+## v2.39.0 (the renewal the CA asked for)
+
+[Read the notes](docs/releases/v2.39.0.md)
+
+## v2.38.0 (things that were true somewhere else)
+
+[Read the notes](docs/releases/v2.38.0.md)
+
 ## v2.37.0 (what a walk through it turned up)
 
 [Read the notes](docs/releases/v2.37.0.md)

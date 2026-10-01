@@ -154,6 +154,35 @@ def create_api_models(api):
         'multi': fields.Raw(description='Configuration for any DNS provider via certbot-dns-multi')
     })
 
+    # What the CA's ARI endpoint (RFC 9773) said at the last renewal sweep
+    # (#962). Read from the record the sweep keeps, never fetched on request.
+    renewal_info_model = api.model('RenewalInfo', {
+        'status': fields.String(
+            enum=['window', 'unsupported', 'unavailable', 'no_identifier',
+                  'disabled'],
+            description=(
+                "'window': the CA answered with a renewal window. "
+                "'unsupported': it publishes no renewalInfo, which will not "
+                "change. 'unavailable': it does, and the last sweep got no "
+                "usable answer. 'no_identifier': the certificate has no "
+                "Authority Key Identifier to name it by. 'disabled': "
+                "ari_enabled is false, so nothing is asked.")),
+        'checked_at': fields.String(
+            description='When the sweep asked, RFC 3339 UTC with Z.'),
+        'window_start': fields.String(
+            description="Start of the CA's suggested window, RFC 3339 UTC. Null unless status is 'window'."),
+        'window_end': fields.String(
+            description="End of the CA's suggested window, RFC 3339 UTC. Null unless status is 'window'."),
+        'renew_at': fields.String(
+            description=(
+                'The point inside the window at which the sweep renews this '
+                'certificate if the configured threshold has not already. '
+                'Derived from the certificate id, so it is stable across '
+                'sweeps. Null unless status is window.')),
+        'explanation_url': fields.String(
+            description="The CA's page explaining the window, when it gave one (https only)."),
+    })
+
     certificate_model = api.model('Certificate', {
         'domain': fields.String(required=True, description='Domain name'),
         'exists': fields.Boolean(description='Whether certificate exists'),
@@ -207,6 +236,16 @@ def create_api_models(api):
                 "`usable` is null because this node cannot answer for a key it "
                 "does not hold."
             )),
+        'reissue_required': fields.Boolean(
+            description=(
+                'True when this certificate has no private key anywhere: not '
+                'served, not in live/, not in any archived generation. What '
+                'restoring a share-safe backup leaves. Renewal answers '
+                'REISSUE_REQUIRED for it, and POST '
+                '/api/certificates/reissue-keyless reissues it. A key missing '
+                'only from the served copy is not this: it is republished from '
+                'the lineage. Added in API contract 2.28 (#966).'
+            )),
         'auto_renew': fields.Boolean(description='Whether automatic renewal is enabled for this certificate'),
         'dns_provider': fields.String(description='DNS provider used for the certificate'),
         'domain_alias': fields.String(description='DNS alias target used for DNS-01 validation'),
@@ -227,12 +266,28 @@ def create_api_models(api):
             description='When the certificate was first issued, ISO 8601, from its metadata.'),
         'renewed_at': fields.String(
             description='When the certificate was last renewed, ISO 8601, from its metadata. Null if it has never been renewed.'),
+        'renewal_info': fields.Nested(
+            renewal_info_model, allow_null=True,
+            description=(
+                "What the CA's ARI endpoint said at the last renewal sweep. "
+                'Null when no sweep has asked about this certificate yet, '
+                'including right after a renewal. Since API contract 2.23.')),
         'total_issued': fields.Integer(description='Total certificates issued'),
         'total_active': fields.Integer(description='Total active certificates'),
         'total_revoked': fields.Integer(description='Total revoked certificates'),
         'total_expired': fields.Integer(description='Total expired certificates'),
         'latest_issuance': fields.String(description='Latest issuance timestamp'),
         'oldest_active_issuance': fields.String(description='Oldest active issuance timestamp'),
+        'notes': fields.String(description=(
+            'Free-text note an operator attached to the certificate, or null. '
+            'Since API contract 2.33.')),
+        'tags': fields.List(fields.String, description=(
+            'Short tags an operator attached to the certificate, lower case; '
+            'an empty list when there are none. Since API contract 2.33.')),
+        'deployment_host': fields.String(description=(
+            'Hostname the deployment probe connects to and sends as SNI, when it is not the '
+            'certificate name (a wildcard is verified through a name it covers). Null when unset. '
+            'Since API contract 2.33.')),
         'deployment_port': fields.Integer(description='TCP port for deployment probe'),
         'deployment_protocol': fields.String(description='Protocol used by deployment probe (https-tls, tls, or smtp-starttls)')
     })
@@ -271,7 +326,14 @@ def create_api_models(api):
         'default_elliptic_curve': fields.String(
             description="Global default ECDSA curve — applied when default_key_type='ecdsa'.",
             enum=['secp256r1', 'secp384r1']
-        )
+        ),
+        'dns_propagation_seconds': fields.Raw(
+            description=('Seconds certbot waits after publishing the DNS-01 TXT record '
+                         'before the CA checks it, per DNS provider, e.g. '
+                         '{"edgedns": 180}. Raise a provider\'s value when validation '
+                         'fails although the record appears shortly after. POST it '
+                         'whole: providers left out return to their defaults. '
+                         'Returned since API contract 2.30.')),
     })
 
     create_cert_model = api.model('CreateCertificate', {
@@ -288,6 +350,9 @@ def create_api_models(api):
                                            'google', 'digicert', 'sslcom',
                                            'actalis', 'sectigo', 'private_ca']),
         'ca_account_id': fields.String(description='CA provider account ID (optional)'),
+        'challenge_type': fields.String(
+            description='ACME challenge (prevalidated requires Sectigo SCM authorization)',
+            enum=['dns-01', 'http-01', 'prevalidated']),
         'domain_alias': fields.String(description='Optional domain alias for DNS validation'),
         'alias_dns_provider': fields.String(
             description=('DNS provider that hosts the alias zone, when it is '
@@ -339,7 +404,9 @@ def create_api_models(api):
         'dns_provider': fields.String(description='Omit to keep the value the certificate was issued with'),
         'account_id': fields.String(description='Omit to keep the value the certificate was issued with'),
         'ca_provider': fields.String(description='Omit to keep the value the certificate was issued with'),
-        'challenge_type': fields.String(description='Omit to keep the value the certificate was issued with'),
+        'challenge_type': fields.String(
+            description='Omit to keep the issued challenge (prevalidated is Sectigo-only)',
+            enum=['dns-01', 'http-01', 'prevalidated']),
         'domain_alias': fields.String(description='Omit to keep the current alias; pass "" to clear it'),
         'alias_dns_provider': fields.String(description='Provider managing the alias zone when it differs from dns_provider. Omit to keep the issued value'),
         'csr': fields.String(
@@ -481,8 +548,11 @@ def create_api_models(api):
 
     aws_secrets_manager_storage_model = api.model('AWSSecretsManagerStorage', {
         'region': fields.String(description='AWS Region', default='us-east-1'),
-        'access_key_id': fields.String(description='AWS Access Key ID'),
-        'secret_access_key': fields.String(description='AWS Secret Access Key')
+        'auth_mode': fields.String(description='Key pair or AWS credential chain',
+                                   enum=['access_keys', 'iam_role']),
+        'access_key_id': fields.String(description='AWS Access Key ID (access_keys mode)'),
+        'secret_access_key': fields.String(description='AWS Secret Access Key (access_keys mode)'),
+        'assume_role_arn': fields.String(description='Optional AWS IAM role ARN to assume via STS')
     })
 
     hashicorp_vault_storage_model = api.model('HashiCorpVaultStorage', {
@@ -501,11 +571,13 @@ def create_api_models(api):
     })
 
     s3_compatible_storage_model = api.model('S3CompatibleStorage', {
-        'endpoint_url': fields.String(description='S3-compatible endpoint URL '
-                                      '(Hetzner / Contabo / OVHcloud / Scaleway / Wasabi / MinIO / AWS)'),
+        'endpoint_url': fields.String(description='S3-compatible endpoint URL; omit for AWS S3'),
         'bucket': fields.String(description='Bucket name'),
-        'access_key_id': fields.String(description='S3 access key ID'),
-        'secret_access_key': fields.String(description='S3 secret access key'),
+        'auth_mode': fields.String(description='Key pair or AWS credential chain',
+                                   enum=['access_keys', 'iam_role']),
+        'access_key_id': fields.String(description='S3 access key ID (access_keys mode)'),
+        'secret_access_key': fields.String(description='S3 secret access key (access_keys mode)'),
+        'assume_role_arn': fields.String(description='Optional AWS IAM role ARN to assume via STS'),
         'region': fields.String(description='Region', default='us-east-1'),
         'prefix': fields.String(description='Object key prefix', default='certmate/certificates')
     })

@@ -44,12 +44,15 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        # 3.12 matches the production Dockerfile. Python 3.14 is temporarily
-        # out of the matrix: the current pin of josepy 1.13.0 (required by
-        # certbot 2.10.0 → acme 3.3.0) raises ValueError at class definition
-        # under PEP 649 evaluation. Tracked in #103 — restore when the
-        # certbot/josepy/acme stack is upgraded.
-        python-version: ['3.12']
+        # 3.12 matches the production Dockerfile and is the gating leg. 3.14 is
+        # back (#103): what kept it out was josepy 1.13.0 (certbot 2.10.0 → acme
+        # 3.3.0), which raises ValueError at class definition under PEP 649
+        # evaluation, and josepy 2.2.0 came with the certbot 5.8 stack. It
+        # reports rather than gates (.github/required-checks.yml) until it has
+        # been green for a while. Running it found two things 3.12 could not
+        # show: the shared TLS fixtures were refused by the strict verification
+        # 3.13 turned on, and the probe never read the served chain on 3.13+.
+        python-version: ['3.12', '3.14']
 
     steps:
     - name: Checkout code
@@ -89,7 +92,7 @@ jobs:
       run: |
         # Pinned so the build pulls a known version (OpenSSF Scorecard
         # Pinned-Dependencies flags bare, unversioned pip installs).
-        pip install flake8==7.3.0
+        pip install flake8==7.4.1
         # stop the build if there are Python syntax errors or undefined names
         # Fails the build. E9/F63/F7/F82 are syntax errors and undefined
         # names; the rest are bug classes that are already clean in this
@@ -627,6 +630,9 @@ jobs:
         # as a real Vault deployment; a bare `pip install hvac` would make this
         # job the one place the version floats (Copilot, #559).
         pip install -r requirements-vault-storage.txt
+        # The Infisical SDK, for the one test file that runs the backend against it
+        # (a compiled core: 2.3.5 is the last release with an x86_64 Linux wheel).
+        pip install -r requirements-infisical-storage.txt
 
     # Started here rather than under `services:` because a service container
     # cannot be given a command, and the readiness wait below wants to be
@@ -701,6 +707,30 @@ jobs:
         pytest tests/test_storage_backends_live.py -m live -v | tee /tmp/live.log
         grep -q "12 passed" /tmp/live.log || {
           echo "::error::the live storage suite did not run the expected tests"
+          exit 1
+        }
+
+    # Needs hvac, which only this job installs, so it runs here. Four of its
+    # fourteen tests skip without hvac; the count is asserted so they cannot
+    # be the ones that quietly did not run.
+    - name: A redirect does not carry the key to another host
+      run: |
+        pytest tests/test_a_redirect_does_not_carry_the_key_to_another_host.py -v | tee /tmp/redirect.log
+        grep -q "14 passed" /tmp/redirect.log || {
+          echo "::error::the redirect tests did not all run (hvac missing?)"
+          exit 1
+        }
+
+    # The backend ran in no release that shipped its SDK pin: it imported a module
+    # the package does not have and called methods the client does not have, and the
+    # tests agreed with the backend because they put a fake in its way (#1054). This
+    # runs it against the real package, so the count is asserted: a skipped module
+    # (importorskip, no SDK) is "0 passed" and must not read as green.
+    - name: The Infisical backend runs against its real SDK
+      run: |
+        pytest tests/test_infisical_backend_matches_its_sdk.py -v | tee /tmp/infisical.log
+        grep -q "12 passed" /tmp/infisical.log || {
+          echo "::error::the Infisical SDK tests did not all run (infisical-python missing?)"
           exit 1
         }
 

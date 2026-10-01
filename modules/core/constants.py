@@ -308,6 +308,168 @@ METADATA_SCHEMA_VERSION = 1
 #                                   it shipped in 2.19 without moving the
 #                                   number — see the note under the rule.
 #
+#   GET /api/notifications/config   an `id` on each webhook, and the same field
+#                                   accepted on POST (#950). It is what a
+#                                   masked secret is matched back to on save,
+#                                   so renaming a webhook no longer drops its
+#                                   URL, token and headers. MINOR: a new field
+#                                   on a response and a new optional request
+#                                   field. A caller that ignores it keeps the
+#                                   old `(type, name)` matching, unchanged.
+#
+#   GET /api/activity               states its ordering for the first time:
+#                                   newest first (#941). The code's own
+#                                   docstrings always claimed it and the code
+#                                   did the opposite, so /activity opened on
+#                                   the oldest entry in the log. Counted MINOR
+#                                   rather than MAJOR because nothing
+#                                   published promised the other direction —
+#                                   docs/api.md described the WINDOW ("the
+#                                   most recent entries") and never the
+#                                   direction within it. A caller that relied
+#                                   on ascending was relying on behaviour that
+#                                   contradicted the documentation it came
+#                                   with, and a reader should be able to
+#                                   disagree having seen the reasoning. Same
+#                                   for GET /api/web/audit-logs.
+#
+#   GET /api/certificates[/<domain>]
+#                                   a `renewal_info` object: what the CA's ARI
+#                                   endpoint said at the last renewal sweep —
+#                                   the window, the instant inside it the
+#                                   sweep renews at, and which kind of absence
+#                                   when there is none (#962). MINOR: a new
+#                                   field on a response. Read from a record
+#                                   the sweep keeps, so it costs no request to
+#                                   the CA.
+#
+#   POST /api/storage/config        `auth_mode` ('access_keys' | 'iam_role')
+#   POST /api/storage/test          and `assume_role_arn` on the S3-compatible
+#                                   and AWS Secrets Manager backends (#971,
+#                                   contributed by QuentinBtd): the AWS
+#                                   credential chain and STS AssumeRole instead
+#                                   of static keys. MINOR: new optional request
+#                                   fields. An absent `auth_mode` keeps its old
+#                                   meaning, access keys required, so a caller
+#                                   that ignores it is unaffected. Same change:
+#                                   POST /api/storage/migrate now fails when an
+#                                   S3 or Secrets Manager source cannot be
+#                                   listed, where it used to report an empty
+#                                   migration as success. Counted as the bug
+#                                   fix it is, not a changed contract: nothing
+#                                   promised that a source nobody could read
+#                                   holds no certificates.
+#
+#   POST /api/backups/restore/<type>
+#                                   `reissue_required` (always present) and
+#                                   `next_step` (only when the list is not
+#                                   empty) on a successful restore (#966): the
+#                                   certificates that came back without a
+#                                   private key, said at restore time instead
+#                                   of discovered at the next sweep. MINOR: new
+#                                   fields on a response.
+#
+#   POST /api/certificates/<domain>/renew
+#                                   a new `code` value, REISSUE_REQUIRED (422),
+#                                   for a certificate with no private key
+#                                   anywhere (#966): what restoring a
+#                                   share-safe backup leaves. It used to come
+#                                   back as RENEWAL_CONFIG_BROKEN via certbot's
+#                                   parse failure, which names the symptom; the
+#                                   new code names the remedy. 2.26, MINOR: a
+#                                   new value of an existing field, the same rule
+#                                   as `unverifiable` above. The HTTP status is
+#                                   unchanged.
+#
+#   POST /api/certificates/reissue-keyless
+#                                   new endpoint (#966, step 3): queues a
+#                                   reissue for every certificate whose
+#                                   lineage lost its private key, at most
+#                                   `limit` per call (default 10, max 50) on
+#                                   the async executor, and answers `queued`,
+#                                   `remaining`, `refused`. MINOR: a new
+#                                   endpoint.
+#
+#   GET /api/certificates (and every certificate record)
+#                                   `reissue_required` (#966, step 3 from the
+#                                   UI): true when the certificate has no
+#                                   private key anywhere, the same test renewal
+#                                   answers REISSUE_REQUIRED with. The dashboard
+#                                   never read private_key_state, so such a
+#                                   certificate looked healthy there. 2.28,
+#                                   MINOR: a new field on a response.
+#
+#   POST /api/certificates/create, POST /api/certificates/<domain>/reissue
+#                                   `challenge_type` accepts a new value,
+#                                   `prevalidated` (#983): a Sectigo SCM
+#                                   account whose names are already authorized
+#                                   issues without a DNS or HTTP challenge. A
+#                                   reissue now also keeps the CA account the
+#                                   certificate was issued under when the CA
+#                                   does not change; it used the CA's default
+#                                   account. 2.29, MINOR: a new value of an
+#                                   existing request field.
+#
+#   GET /api/settings               `dns_propagation_seconds`: the per-provider
+#                                   wait between publishing a DNS-01 record and
+#                                   the CA checking it (#974). It was accepted
+#                                   on POST and never returned, so a caller
+#                                   could set it and not read it. 2.30, MINOR:
+#                                   a new field on a response.
+#
+#   POST /api/storage/test, POST /api/settings/test-ca-provider
+#                                   require admin, where they required
+#                                   operator. Each takes a whole configuration
+#                                   in the request and makes the server connect
+#                                   with it, and saving that configuration was
+#                                   already admin-only. 2.31. A new answer (403)
+#                                   to an existing request, which the rule below
+#                                   calls MAJOR; counted as the security fix it
+#                                   is, the precedent being 2.7.
+#
+#   Setup mode (no credential configured yet)
+#                                   refuses its anonymous admin, with 409
+#                                   SETUP_BOOTSTRAP_ONLY, deploy-hook changes,
+#                                   tests and runs, certificate and key
+#                                   downloads, and backup creation and
+#                                   download; restore and upload stay allowed.
+#                                   And POST /api/users (first admin, in setup
+#                                   mode) now also enables local auth, saying
+#                                   so with `local_auth_enabled: true`. 2.32.
+#                                   New answers to existing requests, counted
+#                                   as the security fix they are (2.7, 2.31).
+#
+#   GET /api/certificates, GET /api/certificates/<domain>
+#                                   `deployment_host`: the name the deployment
+#                                   probe connects to, which the PATCH has
+#                                   accepted and stored since #381 but the
+#                                   answer never returned. Settings -> Probe
+#                                   therefore opened its edit form with an
+#                                   empty host and saved `null`, deleting it.
+#                                   Also `notes` (free text) and `tags` (a list)
+#                                   on a server certificate: read on the same
+#                                   routes, written by PATCH /api/certificates/
+#                                   <domain> (#1043), which previously accepted
+#                                   the DNS and probe fields only. 2.33, MINOR:
+#                                   new fields on a response and two new
+#                                   optional request fields.
+#
+#   POST /api/deploy/targets/preview, POST /api/deploy/config
+#                                   a new typed deploy target, `webhook` (#218):
+#                                   it delivers the certificate, and when the
+#                                   template names `privkey_pkcs8` or
+#                                   `privkey_traditional` the private key, to an
+#                                   HTTPS endpoint. The preview renders the
+#                                   request without sending it or reading a file.
+#                                   The config answer gains `delivery_consent`
+#                                   on such a target (server-written: who
+#                                   confirmed which host, and when), and a save
+#                                   that sends the key must carry
+#                                   `config.acknowledge_key_delivery_to` with
+#                                   that host. 2.34, MINOR: a new endpoint, a
+#                                   new value of an existing request field, and
+#                                   a new field on a response.
+#
 # Bump the MINOR when the surface grows in a way a caller can ignore: a new
 # endpoint, a new field on a response, a new optional request field. Bump the
 # MAJOR when something a caller may depend on goes away or changes meaning: an
@@ -327,7 +489,7 @@ METADATA_SCHEMA_VERSION = 1
 # already did — `url_hint` above went out in 2.19. If you are changing what a
 # response CONTAINS rather than which responses exist, this comment is the only
 # thing that will stop you, so read the rule and move the number yourself.
-API_CONTRACT_VERSION = '2.20'
+API_CONTRACT_VERSION = '2.34'
 
 # Protocols the deployment probe can speak. A domain fact, not an API one: the
 # service validates against it and modules/api/tls_probe drives it (#672 — it

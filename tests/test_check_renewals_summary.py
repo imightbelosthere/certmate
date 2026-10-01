@@ -77,6 +77,9 @@ def test_summary_counts_every_kind_of_entry(tmp_path):
         # it happens, so a caller reading the summary does not have to know
         # which path produced the dict.
         'ari_advanced': 0,
+        'reissue_required': 0,
+        'auto_reissued': 0,
+        'early_forced': 0, 'early_deferred': 0,
     }
     # The sweep also reports its own shape now — how long it took and how many
     # entries it looked at — so an instance that is slowly outgrowing its
@@ -85,7 +88,9 @@ def test_summary_counts_every_kind_of_entry(tmp_path):
     # by tests/test_the_renewal_sweep_says_what_it_did.py.
     assert summary['duration_seconds'] >= 0
     assert summary['examined'] == 6   # 2 checked + 1 disabled + 3 invalid
-    mgr.renew_certificate.assert_called_once_with('good.com')
+    # force=False: the threshold path asks certbot; only a renewal the CA
+    # asked for through ARI is forced (#962).
+    mgr.renew_certificate.assert_called_once_with('good.com', force=False)
 
 
 def test_renew_failure_is_counted_not_swallowed(tmp_path):

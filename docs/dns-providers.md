@@ -10,7 +10,7 @@ CertMate supports a wide range of DNS providers for Let's Encrypt DNS-01 challen
 |----------|--------|---------------------|----------|
 | **Cloudflare** | `certbot-dns-cloudflare` | API Token | Major Cloud |
 | **AWS Route53** | `certbot-dns-route53` | Access Key, Secret Key | Major Cloud |
-| **Azure DNS** | `certbot-dns-azure` | Service Principal | Major Cloud |
+| **Azure DNS** | CertMate's own hook (`azure-mgmt-dns`) | Service Principal | Major Cloud |
 | **Google Cloud DNS** | `certbot-dns-google` | Service Account JSON | Major Cloud |
 | **PowerDNS** | `certbot-dns-powerdns` | API URL, API Key | Enterprise |
 | **EfficientIP SOLIDserver** | custom REST API script | Host, API Credentials | Enterprise |
@@ -113,6 +113,8 @@ curl -X POST http://localhost:8000/api/settings \
   }
 }
 ```
+
+Azure DNS is not answered by a certbot plugin: CertMate writes the challenge record itself with the Azure SDK, using the same service principal. The principal needs permission to read and write TXT records in the zone (the `DNS Zone Contributor` role on the resource group covers it). Certificates issued earlier through `certbot-dns-azure` move to this at their next renewal, and there is nothing to change. The wait before validation is the provider's propagation setting (180 seconds by default).
 
 ### Google Cloud DNS
 
@@ -398,9 +400,14 @@ multiple DuckDNS subdomains are not supported.
 
 ### Custom Script (bring your own provider)
 
-For DNS providers without a certbot plugin — Oracle Cloud (OCI), in-house DNS,
-appliance APIs — point CertMate at your own scripts and it drives them through
-certbot's core `--manual` mode. No plugin installation required.
+For DNS providers without a certbot plugin — Oracle Cloud (OCI), Total Uptime,
+Netriplex, in-house DNS, appliance APIs — point CertMate at your own scripts
+and it drives them through certbot's core `--manual` mode. No plugin
+installation required.
+
+**[Custom DNS Script](custom-dns-script.md)** is the full guide: the path rules
+and why they are strict, the exact environment your script is called with, the
+wildcard-plus-apex case, what renewal uses, and a worked example.
 
 ```json
 {
@@ -474,8 +481,8 @@ Requirements and trust model:
 - The per-provider `dns_propagation_seconds` setting is exported to the
   scripts as `CERTMATE_DNS_PROPAGATION_SECONDS` (an account-level
   `propagation_seconds` field overrides it)
-- Renewals replay the hook paths from certbot's renewal configuration:
-  keep the scripts at a stable path (if you move them, reissue)
+- Renewals use the hook paths configured now, as issuance does: move a
+  script, update its path in Settings, and the next renewal uses it
 - Wildcard certificates work (the hook receives each validation record)
 
 ---

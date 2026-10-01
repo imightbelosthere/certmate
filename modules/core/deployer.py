@@ -15,9 +15,10 @@ import time
 import uuid
 from pathlib import Path
 
+from .cert_labels import tags_from_metadata
 from .structured_logging import sanitize_text, JSONFormatter
 from .utils import utc_now_iso
-from .deploy_targets import run_targets, target_applies, TARGET_TYPES
+from .deploy_targets import run_targets, target_applies, target_needs_key, TARGET_TYPES
 from .deploy_window import (
     STALE_AFTER_DAYS, WindowError, describe as describe_window, is_open,
     next_open, normalize_window,
@@ -73,6 +74,12 @@ class DeployManager:
         # the EventBus listener threads and read by the scheduler's drain.
         self._pending_path = Path(data_dir) / 'pending_deploys.json'
         self._pending_lock = threading.Lock()
+        # Queued deploys that are running right now, by queue key, claimed by
+        # whoever runs them: the window drain, or Deploy Now. One deploy is never
+        # run by both at once. Shares `_pending_lock`, so a claim and the queue
+        # always change together.
+        self._claimed = set()
+        self._claims_changed = threading.Condition(self._pending_lock)
         # Run ids of hooks this process has started and not yet finished. A
         # `running` record in the history belongs to one of two situations,
         # and only this set tells them apart: the run is still going (its id
@@ -219,8 +226,45 @@ class DeployManager:
                 ),
             }
 
-        results = [self._run_hook(h, domain, 'manual') for h in hooks]
-        results.extend(self._execute_targets(domain, 'manual', config))
+        # The queue keys of what is about to run. A deploy that was held for its
+        # window is the same deploy as the one run by hand, so the two must not run
+        # at the same time: when the window opens during a manual run the drain
+        # leaves the entry for the next tick (and finds it gone if this run
+        # delivered it). Held until the entry has been dealt with, below.
+        keys = [f"hook:{h['id']}:{domain}" for h in hooks if h.get('id')]
+        keys += [f"target:{t['name']}:{domain}" for t in targets if t.get('name')]
+        self._claim_all(keys)
+        try:
+            # What was queued for this domain, as it stands BEFORE anything reads the
+            # certificate. A deploy that was held for its window and is then run by hand
+            # has been delivered; left in the queue it would run again when the window
+            # opens (#1058). Only what succeeded is consumed (a failed manual run leaves
+            # the window deploy as the retry), and only entries nobody queued again since
+            # this snapshot: a renewal that lands while the hooks run is a newer
+            # certificate than the one they read, and its deploy is still owed.
+            queued = self._pending_stamps(domain)
+
+            hook_results = [self._run_hook(h, domain, 'manual') for h in hooks]
+            target_results = self._execute_targets(domain, 'manual', config)
+            results = hook_results + target_results
+
+            handled = {}
+            for hook, result in zip(hooks, hook_results):
+                if result.get('success') and hook.get('id'):
+                    handled[f"hook:{hook['id']}:{domain}"] = None
+            for result in target_results:
+                if result.get('success') and result.get('target'):
+                    handled[f"target:{result['target']}:{domain}"] = None
+            handled = {key: queued[key] for key in handled if key in queued}
+            dropped = self._drop_unchanged(handled)
+        finally:
+            self._release(keys)
+        if dropped:
+            logger.info(
+                "Deploy Now for %s delivered %d deploy(s) that were held for a "
+                "maintenance window; they will not run again when it opens: %s",
+                domain, len(dropped), ', '.join(sorted(dropped)))
+
         succeeded = sum(1 for r in results if r.get('success'))
         failed = len(results) - succeeded
         return {
@@ -363,6 +407,60 @@ class DeployManager:
             return {}
         return data if isinstance(data, dict) else {}
 
+    def _try_claim(self, key):
+        """Claim one queue key without waiting. False if someone is running it."""
+        with self._claims_changed:
+            if key in self._claimed:
+                return False
+            self._claimed.add(key)
+            return True
+
+    def _claim_all(self, keys):
+        """Wait until none of `keys` is being run, then hold all of them.
+
+        All at once, never one by one while holding others, so two callers cannot
+        wait on each other.
+        """
+        keys = set(keys)
+        with self._claims_changed:
+            while keys & self._claimed:
+                self._claims_changed.wait()
+            self._claimed |= keys
+
+    def _release(self, keys):
+        with self._claims_changed:
+            self._claimed -= set(keys)
+            self._claims_changed.notify_all()
+
+    def _pending_stamps(self, domain=None):
+        """The queue as {key: entry}, for one domain or all, to be handed back to
+        `_drop_unchanged` once the deploys that read the certificate have finished."""
+        with self._pending_lock:
+            return {key: dict(entry) for key, entry in self._read_pending().items()
+                    if domain is None or entry.get('domain') == domain}
+
+    def _drop_unchanged(self, handled):
+        """Remove the queue entries that were handled, but only if nobody queued them again.
+
+        `handled` maps a key to the entry as it was when the deploy that handled it
+        began. An entry that is no longer equal to that (a renewal queued the same key
+        again, with a newer stamp) refers to a certificate the deploy did not read, so
+        it stays: dropping it by KEY would lose that deploy silently, which is how the
+        queue is meant to never fail. Returns the keys dropped.
+        """
+        if not handled:
+            return []
+        dropped = []
+        with self._pending_lock:
+            current = self._read_pending()
+            for key, seen in handled.items():
+                if current.get(key) == seen:
+                    del current[key]
+                    dropped.append(key)
+            if dropped:
+                self._write_pending(current)
+        return dropped
+
     def _write_pending(self, pending):
         """Replace the queue atomically. Callers hold `_pending_lock`."""
         import tempfile as _tmpmod
@@ -471,6 +569,13 @@ class DeployManager:
                 remaining[key] = entry
                 continue
 
+            if not self._try_claim(key):
+                # Deploy Now is running this very deploy. It takes the entry off
+                # the queue if it delivers it; if it fails, the entry is still
+                # here and the next tick is the retry.
+                remaining[key] = entry
+                continue
+
             domain, event_type = entry.get('domain'), entry.get('event')
             try:
                 if entry.get('kind') == 'hook':
@@ -485,16 +590,24 @@ class DeployManager:
                 logger.error("Queued deploy %s failed: %s", key, e)
                 results.append({'success': False, 'hook': entry.get('id'),
                                 'domain': domain, 'error': str(e)})
+            finally:
+                self._release([key])
 
         with self._pending_lock:
             current = self._read_pending()
             # Only drop what this drain actually handled. An event that queued
-            # a deploy while the loop above was running keeps its entry.
-            for key in pending:
-                if key not in remaining:
-                    current.pop(key, None)
-            for key, entry in remaining.items():
-                current.setdefault(key, entry)
+            # a deploy while the loop above was running keeps its entry, and that
+            # means the entry as well as the key: the window can close mid-drain,
+            # and a renewal that lands then queues the SAME key again with a newer
+            # stamp, for a certificate this drain did not read. Dropping by key
+            # lost that deploy, and said in this comment that it did not.
+            for key, entry in pending.items():
+                if key not in remaining and current.get(key) == entry:
+                    del current[key]
+            # What stays is whatever the queue holds now, not this drain's old
+            # copy of it: an entry it left for later may have been delivered by
+            # Deploy Now in the meantime, and putting the copy back would run it
+            # a second time when the window opens.
             self._write_pending(current)
 
         succeeded = sum(1 for r in results if r.get('success'))
@@ -542,38 +655,41 @@ class DeployManager:
         if not any(target_applies(t, domain, event_type) for t in targets):
             return []
 
-        cert_path = self.cert_dir / domain / 'fullchain.pem'
-        key_path = self.cert_dir / domain / 'privkey.pem'
+        domain_dir = self.cert_dir / domain
+        cert_path = domain_dir / 'fullchain.pem'
+        key_path = domain_dir / 'privkey.pem'
+        applicable = [t for t in targets if target_applies(t, domain, event_type)]
         if cert_path.exists() and not key_path.exists():
-            # A CSR-only certificate (#599). Every typed target ships the key
-            # along with the certificate, so none of them can serve one — and
-            # the generic "certificate files unreadable" this used to produce
-            # would fire on every renewal, reading as a broken instance rather
-            # than an incompatible pairing.
-            message = (
-                f'{domain} has no private key on this node: it was issued from '
-                f'a CSR and the key stays on the device that generated it. '
-                f'Typed deploy targets publish the key with the certificate, '
-                f'so use a shell hook that fetches only the certificate '
-                f'instead.')
-            logger.warning("Deploy targets skipped for %s: no local key", domain)
-            failure = {'success': False, 'target': None, 'type': None,
-                       'domain': domain, 'status_code': None,
-                       'message': message}
-            self._record_target(failure, domain, event_type)
-            return [failure]
-        try:
-            cert_pem = cert_path.read_bytes()
-            key_pem = key_path.read_bytes()
-        except OSError as e:
-            logger.error("Deploy targets: cannot read cert files for %s: %s", domain, e)
-            # An unreadable cert is an operational failure that affects deploy —
-            # record it (audit + history + failure alert), don't swallow it.
-            failure = {'success': False, 'target': None, 'type': None,
-                       'domain': domain, 'status_code': None,
-                       'message': f'certificate files unreadable: {e}'}
-            self._record_target(failure, domain, event_type)
-            return [failure]
+            # A CSR-only certificate (#599). A target that publishes the key
+            # cannot serve one, and the generic "certificate files unreadable"
+            # this used to produce would fire on every renewal, reading as a
+            # broken instance rather than an incompatible pairing. A target that
+            # sends only the certificate can, and is run.
+            keyed = [t for t in applicable if target_needs_key(t)]
+            if keyed:
+                message = (
+                    f'{domain} has no private key on this node: it was issued from '
+                    f'a CSR and the key stays on the device that generated it. '
+                    f'Typed deploy targets publish the key with the certificate, '
+                    f'so use a shell hook that fetches only the certificate '
+                    f'instead.')
+                logger.warning("Deploy targets skipped for %s: no local key", domain)
+                failure = {'success': False, 'target': None, 'type': None,
+                           'domain': domain, 'status_code': None,
+                           'message': message}
+                self._record_target(failure, domain, event_type)
+                if len(keyed) == len(applicable):
+                    return [failure]
+                targets = [t for t in targets if t not in keyed]
+                failures = [failure]
+            else:
+                failures = []
+        else:
+            failures = []
+
+        def material(name):
+            """One file of the certificate, read when a target asks for it."""
+            return (domain_dir / name).read_bytes()
 
         # Typed targets have the same gap shell hooks had: `run_targets`
         # publishes to every target and only then returns, so a process killed
@@ -598,41 +714,70 @@ class DeployManager:
             'targets': len(targets or []),
             'timestamp': utc_now_iso(),
         })
+        # What the closing record says is whether the batch FINISHED WITHOUT A
+        # FAILURE, not merely that it finished. It said `success` whatever the
+        # targets did: a delivery that failed read as a green batch beside its own
+        # red per-target record, and an exception out of `run_targets` was closed as
+        # a success too. Unknown until the results are in, so an exception leaves it
+        # false.
+        batch_ok = False
         try:
-            results = run_targets(targets, domain, cert_pem, key_pem, event_type)
+            results = run_targets(targets, domain, None, None, event_type, material=material)
             for result in results:
                 self._record_target(result, domain, event_type)
-            return results
+            outcome = failures + results
+            batch_ok = all(r.get('success') for r in outcome)
+            return outcome
         finally:
             with self._in_flight_lock:
                 self._in_flight.discard(batch_id)
             self._log_history({
                 'run_id': batch_id,
                 'kind': 'target-batch',
-                'status': STATUS_SUCCESS,
-                'success': True,
+                'status': STATUS_SUCCESS if batch_ok else STATUS_FAILURE,
+                'success': batch_ok,
                 'domain': domain,
                 'event': event_type,
                 'targets': len(targets or []),
                 'timestamp': utc_now_iso(),
             })
 
+    @staticmethod
+    def _target_audit_details(result, event_type):
+        """What the audit log says about one target result.
+
+        A delivery that carried the private key says so: where, and which
+        certificate. The key itself, the body and the receiver's answer are never
+        in it.
+        """
+        details = {
+            'target': result.get('target'),
+            'type': result.get('type'),
+            'event': event_type,
+            'status_code': result.get('status_code'),
+            'message': result.get('message') or '',
+        }
+        for extra in ('key_sent_to', 'certificate_sha256', 'attempts'):
+            if result.get(extra) is not None:
+                details[extra] = result[extra]
+        return details
+
     def _record_target(self, result, domain, event_type):
         """Audit + history + failure-event for one typed-target result."""
         status = 'success' if result.get('success') else 'failure'
+        # What a target reports is text from a remote system about a request
+        # that carried a private key. The audit log is a hash chain that cannot
+        # be edited afterwards, so whatever reaches it stays: every record of it
+        # (audit, history, the failure alert) gets the same pass, here, rather
+        # than each target being trusted to have scrubbed its own message.
+        result = dict(result, message=sanitize_text(result.get('message') or ''))
         try:
             self.audit_logger.log_operation(
                 operation='deploy_target',
                 resource_type='certificate',
                 resource_id=domain,
                 status=status,
-                details={
-                    'target': result.get('target'),
-                    'type': result.get('type'),
-                    'event': event_type,
-                    'status_code': result.get('status_code'),
-                    'message': result.get('message') or '',
-                },
+                details=self._target_audit_details(result, event_type),
                 error=None if result.get('success') else result.get('message'),
             )
         except Exception:  # pragma: no cover - audit must never break deploy
@@ -657,6 +802,19 @@ class DeployManager:
             'message': result.get('message'),
             'timestamp': utc_now_iso(),
         })
+
+    def _tags_of(self, domain):
+        """The certificate's tags, read from its metadata.json, or [].
+
+        Read on the file rather than through the certificate manager: the
+        deployer has no manager, and a hook must still fire when the metadata
+        is unreadable. A missing or malformed file means no tags, not no hook.
+        """
+        try:
+            with open(self.cert_dir / domain / 'metadata.json', encoding='utf-8') as f:
+                return tags_from_metadata(json.load(f))
+        except (OSError, ValueError):
+            return []
 
     def _run_hook(self, hook, domain, event_type, dry_run=False):
         """Execute a single deploy hook."""
@@ -696,6 +854,13 @@ class DeployManager:
         # (issue #232).
         deploy_env['CERTMATE_CHAIN_PATH'] = str(self.cert_dir / domain / 'chain.pem')
         deploy_env['CERTMATE_EVENT'] = event_type
+        # The tags an operator put on the certificate (#1043), comma-separated,
+        # so one hook can decide per certificate whether to act: `case
+        # ",$CERTMATE_TAGS," in *,loadbalancer,*)`. Always set, empty when there
+        # are none, so a hook can rely on it and never inherits a stale value
+        # from CertMate's own environment. The tag charset has no quote, space
+        # or `$`, which is what makes it safe to hand over.
+        deploy_env['CERTMATE_TAGS'] = ','.join(self._tags_of(domain))
         if dry_run:
             deploy_env['CERTMATE_DRY_RUN'] = '1'
 
@@ -1127,6 +1292,9 @@ class DeployManager:
                 return False, "kubernetes-secret needs config.api_server + config.token (or in_cluster)"
             if not cfg.get('namespace'):
                 return False, "kubernetes-secret needs config.namespace"
+        if ttype == 'webhook':
+            from .deploy_target_webhook import validate_webhook_target
+            return validate_webhook_target(target)
         return True, None
 
     @staticmethod

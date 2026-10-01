@@ -7,6 +7,7 @@
 **CertMate** is a self-hosted certificate lifecycle management platform: it issues and renews TLS certificates, **discovers the ones you did not issue**, keeps a single inventory of what exists across your estate — what is served where, who issued it, when it expires, which cryptography it uses — and deploys renewed certificates to where they are needed. It supports 29 DNS providers, runs its own private CA for internal names, keeps a tamper-evident audit trail of every operation, and exposes all of it through a REST API.
 
 [![Live Demo](https://img.shields.io/badge/Live%20Demo-try%20it%20now-2563eb?logo=probot&logoColor=white)](https://demo.certmate.org)
+[![Video Guide](https://img.shields.io/badge/Video%20Guide-CertMate%20in%2060%20seconds-FF0000?logo=youtube&logoColor=white)](https://www.youtube.com/playlist?list=PLM-wnWN4g5XA)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.12](https://img.shields.io/badge/python-3.12-blue.svg)](https://www.python.org/downloads/)
 [![Docker](https://img.shields.io/badge/docker-ready-blue)](https://hub.docker.com/)
@@ -25,7 +26,7 @@
  
 ![screenshot1](screenshot_1.png)
 
-[Quick Start](#quick-start-with-docker) • [CLI](#command-line-interface) • [Documentation](#documentation) • [Installation](#installation-methods) • [DNS Providers](#supported-dns-providers) • [CA Providers](docs/ca-providers.md) • [Storage Backends](#certificate-storage-configuration) • [Backup and Recovery](#backup-and-recovery) • [API Reference](#api-usage)
+[Quick Start](#quick-start-with-docker) • [Video Guide](https://www.youtube.com/playlist?list=PLM-wnWN4g5XA) • [CLI](#command-line-interface) • [Documentation](#documentation) • [Installation](#installation-methods) • [DNS Providers](#supported-dns-providers) • [CA Providers](docs/ca-providers.md) • [Storage Backends](#certificate-storage-configuration) • [Backup and Recovery](#backup-and-recovery) • [API Reference](#api-usage)
 
 </div>
 
@@ -114,7 +115,7 @@ Full tool reference, attribution model and safety notes: **[docs/mcp.md](docs/mc
 CertMate solves the complexity of SSL certificate management in modern distributed architectures. Whether you're running a single application or managing certificates across multiple datacenters, CertMate provides:
 
 - **Zero-Downtime Automation** - Certificates renew automatically 30 days before expiry, with deploy hooks to reload services
-- **Multi-Cloud Support** - Works with two dozen+ DNS providers (Cloudflare, AWS, Azure, GCP, Akamai Edge DNS, Hetzner, Porkbun, GoDaddy, and more — see [docs/dns-providers.md](docs/dns-providers.md) for the full list)
+- **Multi-Cloud Support** - Cloudflare, AWS, Azure, GCP, Akamai Edge DNS, Hetzner, Porkbun, GoDaddy and the rest — [docs/dns-providers.md](docs/dns-providers.md) has the full list
 - **Enterprise-Ready** - RBAC, scoped API keys, Docker, Kubernetes, REST API, and monitoring built-in
 - **Simple Integration** - One-URL certificate downloads for easy automation
 - **Security-First** - Role-based access control, scoped API keys, audit logging, HMAC-signed webhooks
@@ -308,79 +309,41 @@ For supported providers, you can configure multiple accounts to enable:
 
 ## Quick Start with Docker
 
-Get CertMate running in under 5 minutes with Docker Compose:
+Get CertMate running in under 5 minutes with Docker Compose. One file, the published image, nothing to clone or build.
 
 ### Prerequisites
-- Docker 20.10+
-- Docker Compose 2.0+
-- Domain with DNS managed by supported provider
+- Docker 20.10+ with Docker Compose v2 (`docker compose`)
+- A domain with DNS managed by a supported provider
 
-### 1. Clone and Setup
-
-```bash
-# Clone the repository
-git clone https://github.com/fabriziosalmi/certmate.git
-cd certmate
-
-# Copy environment template
-cp .env.example .env
-```
-
-### 2. Configure Environment
-
-Edit `.env` file with your credentials:
+### 1. Download and configure
 
 ```bash
-# Recommended for any network-exposed deployment: API Security.
-# Auto-generated if unset, but a not-yet-onboarded instance serves the
-# first-run setup bypass to anyone who can reach it — set this (or bind to
-# localhost) before exposing CertMate. When set, the first-run screen asks
-# you to paste this same token once to create the initial admin.
-API_BEARER_TOKEN=your_super_secure_api_token_here_change_this
-
-# DNS Provider Configuration
-#
-# Cloudflare is the only provider configured from the environment: this token
-# bootstraps the default Cloudflare account on first run. Route53, Azure,
-# Google Cloud DNS, PowerDNS and the other 25+ providers are configured in the
-# web UI (Settings -> DNS Providers) or through the API — CertMate reads no
-# environment variable for any of them, so setting AWS_ACCESS_KEY_ID or
-# AZURE_CLIENT_ID here does nothing at all.
-CLOUDFLARE_TOKEN=your_cloudflare_api_token_here
-
-# Backups. Without a passphrase, automatic backups are written with their
-# secrets masked and CANNOT restore this instance — they are configuration
-# snapshots. With one, every automatic backup is complete and encrypted at
-# rest. Set it before you need it; see Backup and Recovery below.
-# CERTMATE_BACKUP_PASSPHRASE=a_long_random_passphrase
-
-# Optional: Application Settings
-SECRET_KEY=your_flask_secret_key_here
-FLASK_ENV=production
-PORT=8000
-# Note: there is no HOST variable. The container binds 0.0.0.0 in its own
-# namespace — publish it as 127.0.0.1:8000:8000 to reach it on loopback only,
-# and front it with a reverse proxy for external access.
+mkdir certmate && cd certmate
+curl -fsSLO https://raw.githubusercontent.com/fabriziosalmi/certmate/main/deploy/docker-compose.yml
+printf 'API_BEARER_TOKEN=%s\nSECRET_KEY=%s\nCERTMATE_BACKUP_PASSPHRASE=%s\n' \
+  "$(openssl rand -hex 32)" "$(openssl rand -hex 32)" "$(openssl rand -hex 32)" > .env
+chmod 600 .env
 ```
+
+`.env` now holds the three secrets CertMate needs: the API token (also asked once by the first-run screen to create the admin), the session signing key, and the backup passphrase. Optionally add `CLOUDFLARE_TOKEN=...` to bootstrap a Cloudflare DNS account; every other DNS provider is configured in the web UI. What each setting does, and how to upgrade: [docs/docker.md](docs/docker.md#production-with-docker-compose).
 
 > **Storage Backends**: By default, certificates are stored locally. For enterprise deployments, you can configure Azure Key Vault, AWS Secrets Manager, HashiCorp Vault, Infisical, or any S3-compatible object storage via the web interface after startup. See [Storage Backends](#certificate-storage-configuration) for details.
 
 > **Backup Best Practices**: CertMate includes a unified backup system that creates atomic snapshots of both settings and certificates. **Set `CERTMATE_BACKUP_PASSPHRASE`.** With it, every automatic backup is complete and encrypted at rest, so it can actually restore this instance; without it, automatic backups keep their credentials masked and are configuration snapshots that cannot. The backup list marks which archives can restore, and Settings disables Restore on the ones that cannot. Then keep a copy off the host — archives on the host are pruned after 30 days, and a lost volume takes them with it. `POST /api/backups/upload` brings one back.
 
-### 3. Deploy
+### 2. Start
 
 ```bash
-# Start all services
-docker-compose up -d
-
-# Check status
-docker-compose ps
-
-# View logs
-docker-compose logs -f certmate
+docker compose up -d
+docker compose ps
+docker compose logs -f certmate
 ```
 
-### 4. Access CertMate
+CertMate listens on `127.0.0.1:8000` only. For remote access, put a reverse proxy in front and set `BEHIND_PROXY=true` in `.env`.
+
+To build from source instead, clone the repository and use its root `docker-compose.yml` (development).
+
+### 3. Access CertMate
 
 | Service                  | URL                          | Description                           |
 | ------------------------ | ---------------------------- | ------------------------------------- |
@@ -389,7 +352,7 @@ docker-compose logs -f certmate
 | **Alternative API Docs** | http://localhost:8000/redoc/ | ReDoc documentation                   |
 | **Health Check**         | http://localhost:8000/health | Service health monitoring             |
 
-### 5. Create Your First Certificate
+### 4. Create Your First Certificate
 
 Using the Web Interface:
 1. Navigate to http://localhost:8000
@@ -414,14 +377,7 @@ Isolated, reproducible, and the way CertMate is tested and released. Run **one**
 container (see the single-instance note above); give it more CPU and memory
 rather than more replicas. **Published images cover two architectures**: AMD64 (Intel/AMD) and ARM64 (Apple Silicon, ARM servers). ARM v7 (32-bit Raspberry Pi) is not published; build it yourself with `./build-multiplatform.sh --platforms linux/arm/v7`.
 
-```bash
-# Quick start with Docker Compose
-git clone https://github.com/fabriziosalmi/certmate.git
-cd certmate
-cp .env.example .env
-# Edit .env with your configuration
-docker-compose up -d
-```
+The production Compose bundle is one file that runs the published image; the [Quick Start](#quick-start-with-docker) above shows the commands. To build the image yourself instead, clone the repository and run `docker compose up -d` with its root `docker-compose.yml`, after preparing its bind-mounted directories as its comments describe.
 
 **Multi-Platform Support:**
 ```bash
@@ -464,75 +420,30 @@ For container orchestration and managed rollouts. **`replicas: 1` is not an
 example value** — it is the supported configuration, and the Helm chart fails at
 template time if you change it.
 
-```yaml
-# Example Kubernetes deployment
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: certmate
-spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      app: certmate
-  template:
-    metadata:
-      labels:
-        app: certmate
-    spec:
-      containers:
-        - name: certmate
-          image: certmate:latest
-          ports:
-            - containerPort: 8000
-          resources:
-            requests:
-              cpu: 250m
-              memory: 512Mi
-            limits:
-              cpu: "1"
-              memory: 1536Mi
-          env:
-            - name: API_BEARER_TOKEN
-              valueFrom:
-                secretKeyRef:
-                  name: certmate-secrets
-                  key: api-token
-            - name: CERTMATE_CERT_INFO_CACHE_TTL
-              value: "60"
-          volumeMounts:
-            - name: certificates
-              mountPath: /app/certificates
-      volumes:
-        - name: certificates
-          persistentVolumeClaim:
-            claimName: certmate-certificates
-```
-
-For production sizing, OOM troubleshooting, and a `kubectl patch` example, see
-[Kubernetes Production Notes](docs/kubernetes.md).
-
-### System Package Installation
-For system-wide installation on Linux distributions.
+Install the Helm chart, published to GHCR on every release:
 
 ```bash
-# Install system dependencies (Ubuntu/Debian)
-sudo apt update
-sudo apt install python3 python3-pip python3-venv certbot openssl
-
-# Clone and install
-git clone https://github.com/fabriziosalmi/certmate.git
-sudo mv certmate /opt/
-cd /opt/certmate
-sudo pip3 install -r requirements.txt
-
-# Create systemd service (see Service Setup section below for detailed instructions)
-sudo cp certmate.service /etc/systemd/system/
-sudo systemctl enable certmate
-sudo systemctl start certmate
+kubectl create namespace certmate
+kubectl -n certmate create secret generic certmate-secrets \
+  --from-literal=API_BEARER_TOKEN="$(openssl rand -hex 32)" \
+  --from-literal=SECRET_KEY="$(openssl rand -hex 32)" \
+  --from-literal=CERTMATE_BACKUP_PASSPHRASE="$(openssl rand -hex 32)"
+helm install certmate oci://ghcr.io/fabriziosalmi/charts/certmate \
+  --namespace certmate --set secrets.existingSecret=certmate-secrets
 ```
 
-> **Detailed Instructions**: See [Installation Guide](docs/installation.md) for complete setup guides for each method.
+[CertMate on Kubernetes](docs/kubernetes.md) covers the first login, Argo CD and Flux, production sizing and OOM troubleshooting. Every chart value is in the [chart README](charts/certmate/README.md).
+
+### Linux server with systemd
+One command on Debian, Ubuntu, Fedora, RHEL, Rocky or Alma Linux:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/fabriziosalmi/certmate/main/deploy/install.sh | sudo sh
+```
+
+The installer puts CertMate in `/opt/certmate` with its own Python 3.12 (fetched by [uv](https://docs.astral.sh/uv/), so the system Python is not touched), generates the secrets into `/etc/certmate/certmate.env`, and starts the `certmate` systemd service on `127.0.0.1:8000`. Run it again to upgrade: certificates, data and configuration stay. Details and options: [docs/installation.md](docs/installation.md#linux-server-with-systemd).
+
+To set the service up by hand instead, follow the next section.
 
 ## Service Setup
 
@@ -1488,6 +1399,25 @@ pip install -r requirements-aws-storage.txt
 }
 ```
 
+For **IAM authentication**, choose **AWS credentials / IAM role (no keys)** in
+Settings → Storage, enter the region and leave access keys empty. CertMate uses
+the AWS credential chain (for example an EC2 instance profile, ECS task role or
+EKS pod identity). An optional **Assume role ARN** uses `sts:AssumeRole` and
+refreshes the temporary credentials automatically. Existing key-based settings
+still work. If `auth_mode` is absent in a manual configuration, access keys
+remain required. Equivalent settings without an additional assumed role:
+
+```json
+{"certificate_storage":{"backend":"aws_secrets_manager","aws_secrets_manager":{"region":"eu-west-1","auth_mode":"iam_role"}}}
+```
+
+The IAM identity needs `secretsmanager:ListSecrets` (account-wide, resource
+`*`) and `GetSecretValue`, `DescribeSecret`, `CreateSecret`, `UpdateSecret`
+and `DeleteSecret` for the `certmate/certificates/*` secrets. Assuming a
+second role also requires permission to call
+`sts:AssumeRole` and a trust policy on the target role. The connection test
+reports AWS permission errors rather than treating them as an empty store.
+
 **Benefits:**
 - AWS-native secret management
 - Automatic encryption at rest with AWS KMS
@@ -1563,6 +1493,15 @@ pip install -r requirements-infisical-storage.txt
 }
 ```
 
+**`site_url` must be `https://`** (plain `http://` is accepted only for a loopback address: `localhost`, `127.0.0.1` or `::1`). The Infisical
+SDK follows a redirect and sends the request body on, and here the body is the certificate and its
+private key; its HTTP client cannot be configured from CertMate, so the one thing CertMate can
+refuse is the position where anyone on the path could answer with a redirect. Point it at a server
+you trust with the key, which is what storing it there means anyway.
+
+**This backend did not work in v2.44.0 or earlier.** It could not run at all: it imported a module
+name the pinned `infisical-python` does not have, and called methods that SDK does not have.
+
 **Benefits:**
 - Open-source secret management with transparency
 - End-to-end encryption for maximum security
@@ -1578,7 +1517,7 @@ pip install -r requirements-infisical-storage.txt
 - Multi-environment certificate management
 
 #### S3-Compatible Object Storage
-One backend for any S3 endpoint, selected by `endpoint_url`: Hetzner, Contabo, OVHcloud, Scaleway, Exoscale, Wasabi, self-hosted MinIO, or AWS S3 itself. Each domain is stored as one JSON object, `<prefix>/<domain>.json`, holding the certificate files and their metadata.
+One backend for S3-compatible object storage: Hetzner, Contabo, OVHcloud, Scaleway, Exoscale, Wasabi, self-hosted MinIO, or AWS S3 itself. Each domain is stored as one JSON object, `<prefix>/<domain>.json`, holding the certificate files and their metadata.
 
 **Required Dependencies:** `boto3`, already in `requirements.txt` and `requirements-storage-all.txt` (not in `requirements-minimal.txt`).
 
@@ -1599,7 +1538,11 @@ One backend for any S3 endpoint, selected by `endpoint_url`: Hetzner, Contabo, O
 }
 ```
 
-`endpoint_url`, `bucket`, `access_key_id` and `secret_access_key` are required; `region` defaults to `us-east-1` and `prefix` to `certmate/certificates`.
+For S3-compatible services, use **Access keys** and provide both keys, the bucket and the service's endpoint. Existing key-based configurations continue to work unchanged. `region` defaults to `us-east-1` and `prefix` to `certmate/certificates`.
+
+For **AWS S3 with an IAM role**, select **AWS credentials / IAM role (no keys)** in Settings → Storage, provide the bucket and region, and leave the endpoint URL and access keys empty. Boto3 uses its standard credential chain (for example an EC2 instance profile, ECS task role or EKS pod identity). You can optionally enter an **Assume role ARN** (`arn:aws:iam::123456789012:role/CertMateS3`): the current identity must have `sts:AssumeRole` permission and the destination role must trust it. CertMate refreshes the temporary STS credentials automatically. The role needs `s3:ListBucket` on the bucket and `s3:GetObject`, `s3:PutObject`, and `s3:DeleteObject` on `<prefix>/*` (including object existence checks). The **Test Storage Backend** action lists the prefix and reports authentication/permission failures.
+
+For manual `settings.json`, explicitly set `"auth_mode":"iam_role"` to use AWS credentials without keys or an endpoint: `{"backend":"s3_compatible","s3_compatible":{"bucket":"certmate","region":"eu-west-1","auth_mode":"iam_role","assume_role_arn":"arn:aws:iam::123456789012:role/CertMateS3"}}`. Omit `assume_role_arn` to use the attached role directly. Without `auth_mode`, legacy key-pair requirements still apply. The optional off-site S3 backup storage has separate credential settings; this option configures **certificate storage** only.
 
 #### Quick Installation Guide
 
@@ -1690,6 +1633,17 @@ backend currently saved in settings, so migrate **before** switching:
 3. Check the response: `migrated_count`, `failed_count`, and `migration_results`, one `true`/`false` per domain
 4. Switch the active backend (`POST /api/storage/config`)
 5. Optionally clean up the old storage — CertMate never deletes it
+
+If you already saved the new backend, choose **Local filesystem** (or the
+previously configured backend) as **Source backend** in the Settings migration
+dialog. The dialog always requires an explicit source choice: when migrating
+from bucket A to bucket B within S3, choose the **saved S3 backend** as source,
+even though S3 is also selected as the target. The target remains the backend
+selected in Settings. Via the API,
+include `"source_backend": "local_filesystem"` in the migration request.
+A zero-domain result means no certificates were found in that source; check
+the source selection and certificate directory rather than assuming the
+certificates were copied.
 
 *Migration via API:*
 ```bash
@@ -2421,24 +2375,6 @@ python app.py --debug --log-level DEBUG
 FLASK_ENV=development
 ```
 
-### What's New in v2.0.0
-
-CertMate 2.0 is a major release that adds enterprise-grade access control, a notification system, post-issuance automation, and a modernized UI.
-
-**Highlights:**
-- **Role-Based Access Control** - Three-tier RBAC (viewer / operator / admin) with per-user roles
-- **Scoped API Key Management** - Create, list, revoke API keys with role scope and optional expiry
-- **Notification System** - Email (SMTP), Slack, Discord, and webhook channels with HMAC signatures
-- **Deploy Hooks** - Post-issuance shell commands with environment variables, dry-run testing, and execution history
-- **Weekly Digest** - Scheduled email summary of certificate health and upcoming renewals
-- **Setup Wizard** - Guided first-run flow for DNS, CA, and authentication configuration
-- **Command Palette** - Cmd+K / Ctrl+K quick search and navigation
-- **Keyboard Shortcuts** - Power-user shortcuts (`?` help, `/` search, `g+h` home, `g+s` settings, etc.)
-- **Activity Timeline** - Chronological event log for all certificate and system operations
-- **SSE Real-Time Events** - Live push notifications on the dashboard
-- **Dark Mode Toggle** - System-aware theme switching
-- **Mobile Bottom Tab Bar** - Responsive navigation on small screens
-- **HTTP-01 Challenge Support** - Alternative to DNS-01 for simple setups
 
 ### Reporting Bugs
 
@@ -2477,6 +2413,8 @@ curl -sS -H "Authorization: Bearer $TOKEN" http://localhost:8000/api/diagnostics
 
 ## Documentation
 
+**Prefer watching?** [CertMate in 60 seconds](https://www.youtube.com/playlist?list=PLM-wnWN4g5XA) is a video guide of 24 one-minute shorts, made from the documentation on [certmate.org](https://certmate.org).
+
 ### Complete Documentation Set
 
 | Document                                           | Description                         | Target Audience       |
@@ -2484,6 +2422,7 @@ curl -sS -H "Authorization: Bearer $TOKEN" http://localhost:8000/api/diagnostics
 | **[README.md](README.md)**                         | Main documentation and quick start  | All users             |
 | **[docs/installation.md](docs/installation.md)**   | Installation and deployment         | System administrators |
 | **[docs/dns-providers.md](docs/dns-providers.md)** | DNS provider setup                  | DevOps engineers      |
+| **[docs/custom-dns-script.md](docs/custom-dns-script.md)** | Any DNS provider with no plugin, via your own hooks | DevOps engineers      |
 | **[docs/ca-providers.md](docs/ca-providers.md)**   | Certificate Authority configuration | Enterprise users      |
 | **[docs/docker.md](docs/docker.md)**               | Docker and multi-platform builds    | DevOps engineers      |
 | **[docs/testing.md](docs/testing.md)**             | Testing framework and CI/CD         | Developers            |
@@ -2496,7 +2435,7 @@ curl -sS -H "Authorization: Bearer $TOKEN" http://localhost:8000/api/diagnostics
 | **[docs/csr-only-certificates.md](docs/csr-only-certificates.md)** | Issuing from a CSR when the key stays on the device | Appliance operators |
 | **[docs/webhooks.md](docs/webhooks.md)**           | Generic webhooks: payload templates, auth, signature verification | Integrators |
 | **[docs/compliance.md](docs/compliance.md)**       | Audit chain, attribution, NIS2/eIDAS posture | Compliance, security |
-| **[docs/kubernetes.md](docs/kubernetes.md)**       | Pod sizing, OOM troubleshooting, Helm chart | SRE              |
+| **[docs/kubernetes.md](docs/kubernetes.md)**       | Install with Helm, Argo CD or Flux; pod sizing, OOM troubleshooting | SRE              |
 | **[docs/probes.en.md](docs/probes.en.md)**         | Deployment probe configuration      | DevOps engineers      |
 | **[CONTRIBUTING.md](CONTRIBUTING.md)**             | Development and contribution guide  | Developers            |
 | **[CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md)**       | Community guidelines                | Contributors          |

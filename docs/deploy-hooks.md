@@ -112,6 +112,7 @@ Every invocation sets these in the hook's process environment:
 | `CERTMATE_KEY_PATH` | `/app/certificates/api.example.com/privkey.pem` — **not set** for a [CSR-only certificate](csr-only-certificates.md), whose key stays on the device |
 | `CERTMATE_FULLCHAIN_PATH` | `/app/certificates/api.example.com/fullchain.pem` |
 | `CERTMATE_CHAIN_PATH` | `/app/certificates/api.example.com/chain.pem` (intermediates only, no leaf — for targets that want the chain as a separate file) |
+| `CERTMATE_TAGS` | `loadbalancer,env:prod` — the certificate's [tags](api.md), comma-separated and lower case; **empty** when it has none, and always set, so a hook can rely on it (since API contract 2.33) |
 | `CERTMATE_EVENT` | `created` / `renewed` / `revoked` / `manual` (Deploy Now) / `test` (per-hook test) |
 | `CERTMATE_DRY_RUN` | Set to `1` only for a per-hook test (`/api/deploy/test/<id>`, the **Test** button); absent otherwise, including for Deploy Now. The command still runs; this is only a signal your script can check. |
 
@@ -157,6 +158,7 @@ The queue lives at `data/pending_deploys.json` and survives a restart — the wi
 - A second renewal before the window opens does **not** queue a second deploy. The hook reads the certificate from disk when it runs, so one deferred run always publishes the newest one.
 - If the hook is deleted or disabled, or deploy hooks are switched off entirely, the queued deploy is **dropped** at the next drain. Your current configuration says not to run it.
 - If you remove the window, the deploy is released at the next drain rather than waiting one more time.
+- **Deploy Now consumes the deploy that was waiting.** If the hook (or typed target) you run by hand succeeds, its queued entry for that domain is removed: the certificate has been delivered, and running it again when the window opens would be an unannounced second deploy. If the manual run **fails**, the entry stays, so the window deploy is the retry. A renewal that happens *while* Deploy Now is running keeps its entry, because that certificate is newer than the one the manual run read. The two never run the same deploy at the same time: if the window opens while Deploy Now is running a hook, the scheduled run skips it and the next tick finds it either delivered or still owed, and if the scheduled run is already in the hook when you press the button, Deploy Now waits for it to finish and then runs. A queued deploy you do not want can still only be removed by disabling or deleting the hook (it is then dropped at the next drain).
 - A hook that fails inside its window is **not** re-queued. It is recorded in the history like any other failure; re-queuing would retry every minute for as long as the window stayed open.
 - A deploy still waiting after seven days is logged as a warning. That is not a limit — waiting is the feature — but a week means the window has not opened at all, which usually means the days or the timezone are not what you meant.
 
@@ -179,7 +181,7 @@ curl -H "Authorization: Bearer $TOKEN" https://certmate.local/api/deploy/pending
 
 ### What ignores the window
 
-**Deploy Now** does. Pressing it is choosing this moment; holding the deploy until 02:00 would make the button do nothing visible. The same is true of `POST /api/deploy/test/<id>`.
+**Deploy Now** does. Pressing it is choosing this moment; holding the deploy until 02:00 would make the button do nothing visible. What it delivers is not delivered again: see *What happens while a deploy is held*. The same ignoring of the window is true of `POST /api/deploy/test/<id>`, which never touches the queue.
 
 ---
 
@@ -250,11 +252,31 @@ If you need any of those, put the logic in a script file inside the container an
 
 ### Blocked file references
 
-References to CertMate's own sensitive files are rejected outright (case-insensitive):
+A command that names one of CertMate's own sensitive files is rejected (case-insensitive):
 
 `settings.json`, `api_bearer_token`, `client_secret`, `vault_token`, `.env`
 
-Certificate files are not on the list: installing the certificate and its key (`privkey.pem`, `$CERTMATE_KEY_PATH`) is the normal job of a hook. `cat /app/data/settings.json` would be rejected at save.
+Certificate files are not on the list: installing the certificate and its key (`privkey.pem`, `$CERTMATE_KEY_PATH`) is the normal job of a hook. `cat /app/data/settings.json` is rejected at save.
+
+The check matches those names **as written**. It catches a hook that names one of those files by mistake. It does not stop a command that reaches the same file without spelling its name: a glob (`settings*`), a `?` wildcard, or a name split by quotes (`settings"."json`) all get past it. It is a guard against accidents, not a security boundary. Only an admin can save or run a hook, and an admin who can save a hook can already run any command as CertMate. The same holds for the shell patterns above.
+
+### Sending the private key from a hook
+
+A hook can send the key to a URL: `CERTMATE_KEY_PATH` is not on the blocked list
+and `curl` is in the image, so `curl --data-binary @"$CERTMATE_KEY_PATH" …`
+saves. CertMate does not look at what such a command does with the key. The
+checks are yours to make:
+
+- use `https://`, never `http://`: the key would cross the network in clear;
+- do not add `-k`/`--insecure`, which turns off the check that the server is the
+  one you meant;
+- do not add `-L`/`--location`, which repeats the request, key included, at
+  whatever address the answer names;
+- do not let the command print what the server answers into the output: hook
+  output is kept in the history, and the audit log cannot be edited.
+
+For Kubernetes use the [typed target](#typed-deploy-targets) instead, which holds
+to the first three for you.
 
 ### What's allowed
 
@@ -357,6 +379,21 @@ Mounted into the container, and written against what the container has. Use a
 script whenever you need `;` or `&&` — the command field rejects both, and the
 script is where that logic belongs anyway.
 
+### Act only on some certificates
+
+Tag a certificate (`PATCH /api/certificates/<domain>` with `tags`, or **Edit** in
+its detail panel) and one global hook can decide per certificate whether to
+act. `CERTMATE_TAGS` is always set, comma-separated and lower case, and a tag
+contains only letters, digits and `. _ - : /`, so it is safe to use unquoted. In
+your script:
+
+```sh
+echo ",$CERTMATE_TAGS," | grep -q ',loadbalancer,' || exit 0
+```
+
+The surrounding commas are what make the match exact: without them `loadbalancer`
+would also match a tag called `loadbalancer-old`.
+
 ### Skip real work during a Test run
 
 In your script (the variable is set only by the per-hook **Test**):
@@ -444,6 +481,195 @@ shell hooks). The service-account token used should be scoped to
 > **Security:** the deploy config is admin-only, and — like a secret embedded in
 > a shell hook — the Kubernetes `token` is stored in settings and returned to
 > admins on `GET /api/deploy/config`. Keep the token minimally scoped.
+
+A target sends the private key to the address it is configured with, so two
+things are held to:
+
+- **Redirects are not followed.** A redirect would repeat the request, key
+  included, at whatever address the answer names. A `3xx` from the API server is
+  reported as a failure that says so (without the address it named); point
+  `api_server` at the address that answers directly.
+- **What comes back is never copied into the records.** The answer to a failed
+  request is shown to the operator, and also lands in the audit log, the deploy
+  history and the failure alert. The audit log is a hash chain and cannot be
+  edited afterwards, so the answer is stripped of the bearer token and of the key
+  (as PEM, JSON-escaped, base64, URL-encoded, or a line of it) before it is
+  shortened and kept.
+
+`verify_ssl: false` is still accepted for a cluster with a certificate you cannot
+verify. It turns off the check that the server is the one you configured, so use
+it only on a network you control.
+
+### Webhook target: deliver the certificate, and optionally the key
+
+A **notification webhook** (Settings → Notifications) *announces* a renewal, and
+what it reports reaches alerts, mail and logs. It never carries the private key
+([webhooks.md](webhooks.md)). The **webhook target** *delivers*: it sends the
+certificate and chain, and, if the template asks for it, the private key, to a
+HTTPS endpoint you chose, typically an appliance or a service with an upload
+API. They are different things with different rules, so this is a deploy target
+and not another placeholder of the notification webhook.
+
+```jsonc
+{
+  "deploy_hooks": {
+    "enabled": true,
+    "targets": [
+      {
+        "id": "lb-cert",
+        "name": "Upload to the load balancer",
+        "type": "webhook",
+        "enabled": true,
+        "domains": ["shop.example.com"],      // required: never "all domains" by default
+        "on_events": ["created", "renewed"],
+        "config": {
+          "url": "https://lb.internal:8443/api/certificate",
+          "method": "POST",                   // POST, PUT or PATCH
+          "payload_template": "{\"name\": \"{{domain}}\", \"cert\": \"{{fullchain}}\", \"key\": \"{{privkey_pkcs8}}\"}",
+          "auth_type": "bearer", "auth_token": "<token>",   // none | bearer | basic | header
+          "ca_cert": "-----BEGIN CERTIFICATE-----\n…",     // or "pin_sha256": "<fingerprint>"
+          "allow_internal": true,             // the destination is on a private network
+          "acknowledge_key_delivery_to": "lb.internal"      // needed because the template names the key
+        }
+      }
+    ]
+  }
+}
+```
+
+**In the UI.** Settings → Deploy → **Deploy Targets** lists every target and
+edits the webhook ones: name, domains (required), events, URL, method,
+authentication, signing secret, how the server is verified, a private-network
+switch, timeout and attempts, and the payload with the variables as buttons. The
+key variables are red, and adding one is what triggers the confirmation below. **Preview what would be
+sent** calls the preview endpoint below and shows the destination with its port,
+how the server is verified, the files a delivery reads, the headers (credentials
+masked) and the body rendered with an example certificate and key. A preview
+disappears as soon as the form changes, so what is on screen is always what would
+be saved.
+
+If the payload names a private-key variable, the form shows a red box with the
+destination host and keeps **Save target** disabled until you have typed that host.
+A target already confirmed for its host is not asked again when you rename it or
+change its domains; a different host asks again and says which host it was
+confirmed for. Saving writes only `targets`, from the list the server holds at that
+moment with this one target changed, so it cannot overwrite an edit made through
+the API in between, and it leaves the other target types (Kubernetes secrets)
+exactly as they are. They are listed there and edited through the API. The page
+never sends a consent: the server writes it.
+
+**Template variables.** The payload is JSON you write. A placeholder inside a
+string is inserted escaped, so a PEM (which has newlines) cannot break the JSON.
+
+| Variable | What it is |
+|---|---|
+| `{{cert}}`, `{{fullchain}}`, `{{chain}}` | the certificate, the certificate with its chain, the chain alone (PEM) |
+| `{{privkey_pkcs8}}` | the private key as PKCS#8 (`BEGIN PRIVATE KEY`) |
+| `{{privkey_traditional}}` | the private key as PKCS#1 for RSA (`BEGIN RSA PRIVATE KEY`) or SEC1 for EC (`BEGIN EC PRIVATE KEY`). A key type with no such form, such as Ed25519, is refused with a message, not silently replaced |
+| `{{event}}`, `{{domain}}`, `{{timestamp}}`, `{{certificate_sha256}}` | the event, the certificate's name, the time, and the SHA-256 of the leaf certificate |
+
+There is no bare `privkey`: the two spellings make the choice visible, and a
+typo in a name is refused when you save instead of silently sending nothing. A
+name that is not in this table is refused.
+
+**Sending the key is a decision about a destination.** If the template names a
+private-key variable, the save must carry `config.acknowledge_key_delivery_to`
+set to the host in `url`. The server then records who confirmed it and when
+(`delivery_consent`, returned by `GET /api/deploy/config`); it is never read from
+what you send. If you later change the host, the confirmation no longer applies:
+the target refuses to send until it is given again, and a save without it is
+refused. Each confirmation is in the audit log.
+
+**How the server is verified.** Always. By default against the system store. With
+`ca_cert`, against that CA only (it replaces the system store). With
+`pin_sha256`, against the exact SHA-256 fingerprint of the server's own
+certificate, for an appliance that signs itself: give the fingerprint (colons
+allowed), not the certificate. There is no setting that turns verification off,
+and the URL must be `https://`.
+
+**Where it may send.** The host is resolved once, every address is checked, and
+the connection goes to that address. A loopback, link-local or cloud-metadata
+address is never a destination. A destination on a private network needs
+`allow_internal: true` **on this target**, which is deliberate and narrower than
+a switch for the whole instance. Redirects are not followed: a `3xx` is a
+failure that says so.
+
+**What it does when something goes wrong.** An error from the network, or a
+status of `408`, `425`, `429`, `500`, `502`, `503` or `504`, is retried with backoff
+up to `attempts` (default 3, at most 5). Any other status is not: a `4xx` says the
+request is wrong, and sending a key again to be told so again helps nobody. Every delivery carries an `Idempotency-Key`
+that is the same for the retries of one delivery and for the same certificate
+sent again, and different for the next certificate, so a receiver can tell a
+repeat from a new one. With `signing_secret` the body is signed in
+`X-CertMate-Signature`, as for the notification webhook.
+
+**What is recorded, and what is not.** A result is a status and one sentence that
+names the host: never the address, the query, the headers, the body you sent or
+the body the receiver answered, which can echo what it was sent. A delivery that
+carried the private key is marked in the audit log: where it went (`key_sent_to`),
+for which domain, the certificate's fingerprint, the status and the attempts, and
+never the key. A reset after the TLS handshake is recorded as possibly sent,
+because it cannot be told apart from one before it.
+
+**There is no "send a test" for a target that sends the key**, on purpose. A test
+that delivered a key to an appliance that accepts uploads would install it in
+place of the real one. Use the **preview** instead
+([`POST /api/deploy/targets/preview`](api.md)): it renders the request against an
+example certificate and key, reads no file and sends nothing. To deliver for real
+once, use *Run hooks for a domain* (admin), which is an explicit action.
+
+**What this protects against, and what it does not.**
+
+| It protects against | It does not |
+|---|---|
+| The key going to a host you did not confirm, including after the URL is edited | A receiver that is compromised or that logs what it is sent: it holds the key once it has it. Some automation platforms keep every request body in an execution history; do not point a key-carrying target at one |
+| A redirect, a rebound DNS answer or a metadata address taking the request elsewhere | An administrator: anyone who can save this configuration can already write a [shell hook](#sending-the-private-key-from-a-hook) that sends the key, without any of the checks above |
+| Sending over plain HTTP, or to a server nobody verified | Keeping the key out of the receiver's own backups and logs |
+| The receiver's answer carrying the key into the audit log | |
+| | The target's own credentials: `auth_token`, `auth_password` and `signing_secret` are kept in `settings.json` (mode `0600`) and returned to an administrator by `GET /api/deploy/config`, exactly as a Kubernetes target's token is. The form shows them as password fields. Give the receiver a token that can do this one thing |
+
+Not in this version: a bundle as a file upload or PKCS#12, and custom request
+headers other than the authentication one. Say what a receiver needs.
+
+#### Receiving it in n8n
+
+Checked against n8n 2.41.4 with a real certificate, a Webhook node and the payload
+below; the three steps are what had to be done, not what is generally true of n8n.
+
+```json
+{"domain": "{{domain}}", "event": "{{event}}",
+ "certificates": {"cert": "{{cert}}", "key": "{{privkey_pkcs8}}", "rsa_key": "{{privkey_traditional}}",
+                  "fullchain": "{{fullchain}}", "intermediate": "{{chain}}"}}
+```
+
+1. **n8n has to answer over HTTPS.** A default n8n listens on plain HTTP, and a target
+   refuses that (`url must be https://`). Put a TLS terminator in front of it, or give n8n
+   a certificate itself with `N8N_PROTOCOL=https`, `N8N_SSL_KEY=/path/key.pem` and
+   `N8N_SSL_CERT=/path/cert.pem`. For a certificate n8n signed itself, set `pin_sha256` on
+   the target to its fingerprint: the digits only, not the label. The command
+   `openssl x509 -in cert.pem -noout -fingerprint -sha256` prints
+   `SHA256 Fingerprint=AA:BB:...`; paste what follows the `=`, because the field refuses the
+   label. If n8n is at a private address, also set `allow_internal: true` on the target.
+2. **The Webhook node:** HTTP Method `POST`, a Path such as `certmate`, Respond
+   *Immediately*, and publish the workflow. The target must call the **production** URL
+   (`https://host:5678/webhook/certmate`), not the test one.
+3. **What the node receives.** `$json.body` is the payload you wrote, so the example above
+   gives `{{ $json.body.certificates.fullchain }}` and so on, as an ordinary multi-line
+   PEM string. The headers are in `$json.headers`: `x-certmate-event`, `idempotency-key`
+   (the same for a retry of one delivery, so a workflow can ignore a repeat) and
+   `user-agent: CertMate-Deploy/1`. In the check, every certificate arrived identical to
+   the file, the PKCS#8 key identical to `privkey.pem`, and the key in the traditional
+   form (`RSA PRIVATE KEY` or `EC PRIVATE KEY`) was the key of the certificate, for an RSA
+   and an EC certificate.
+
+**n8n keeps what it receives.** With its default settings n8n stored every request body
+in its own database, and in the check the private key could be read out of that
+execution data. Treat n8n's database and its backups as holding the key, or leave the key
+variables out of an n8n target and fetch the key some other way. Setting the workflow not
+to save executions did **not** behave as expected in the same check (the executions stayed
+in the `running` state with their data), so do not rely on that setting without looking at
+what your own instance stores. This is the case the table above means by "a receiver that
+keeps what it is sent".
 
 ---
 

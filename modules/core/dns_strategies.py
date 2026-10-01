@@ -52,20 +52,38 @@ def clamp_propagation_seconds(value, default):
 def check_certbot_plugin_installed(plugin_name: str) -> bool:
     """Check if a certbot plugin is installed and registered.
 
-    Runs ``certbot plugins`` and looks for the given *plugin_name*
-    (e.g. ``dns-route53``) in the output.  Returns ``True`` when found.
+    List plugins without preparing them: --prepare initializes every plugin,
+    so an unrelated provider's missing credentials can hide this one.
     """
     try:
         result = subprocess.run(
-            ['certbot', 'plugins', '--prepare'],
+            ['certbot', 'plugins'],
             capture_output=True, text=True, timeout=30,
         )
-        # Plugin names appear as "* dns-route53" or "PluginEntryPoint#dns-route53"
-        return plugin_name in result.stdout or plugin_name in result.stderr
+        return result.returncode == 0 and any(
+            line.strip() == f'* {plugin_name}' for line in result.stdout.splitlines())
     except Exception:
         # If we can't check, assume it's available and let certbot fail
         # with its own error message.
         return True
+
+def manual_hook_arguments(script: Path, config_path: Path) -> list:
+    """The certbot arguments that answer a DNS-01 challenge with one of CertMate's own hooks.
+
+    *script* is run with the interpreter CertMate itself runs under (so it sees the
+    same installed packages) and takes ``--config <file> --action auth|cleanup``.
+    Every part is quoted: certbot executes the hook through a shell.
+    """
+    def command(action):
+        return (f"{shlex.quote(sys.executable)} {shlex.quote(str(script))} "
+                f"--config {shlex.quote(str(config_path))} --action {action}")
+    return [
+        '--manual',
+        '--preferred-challenges', 'dns',
+        '--manual-auth-hook', command('auth'),
+        '--manual-cleanup-hook', command('cleanup'),
+    ]
+
 
 class DNSProviderStrategy(ABC):
     """Abstract base class for DNS provider strategies"""
@@ -83,6 +101,15 @@ class DNSProviderStrategy(ABC):
     def default_propagation_seconds(self) -> int:
         """Return default propagation time in seconds"""
         return 120
+
+    @property
+    def propagation_via_environment(self) -> bool:
+        """Whether the wait is handed to a hook in ``CERTMATE_DNS_PROPAGATION_SECONDS``.
+
+        True for the providers answered by a manual hook (Custom Script, Azure):
+        ``--manual`` has no propagation flag, so the hook does the waiting.
+        """
+        return False
 
     @property
     def supports_propagation_seconds_flag(self) -> bool:
@@ -127,6 +154,10 @@ class DNSProviderStrategy(ABC):
         if credentials_file:
             cmd.extend([f'--{self.plugin_name}-credentials', str(credentials_file)])
 
+        self._note_domain_alias(domain_alias)
+
+    @staticmethod
+    def _note_domain_alias(domain_alias: Optional[str]) -> None:
         if domain_alias:
             logger.info(
                 f"DNS alias '{domain_alias}' requested — ensure a CNAME "
@@ -233,17 +264,40 @@ class AzureStrategy(DNSProviderStrategy):
 
     @property
     def plugin_name(self) -> str:
-        return 'dns-azure'
+        # 'manual': Azure DNS-01 is answered by CertMate's own hook, not by a
+        # certbot plugin (certbot-dns-azure has no release for certbot 4+, #103).
+        # Like the Custom Script provider, there is nothing for the
+        # plugin-installed preflight to look for.
+        return 'manual'
+
+    @property
+    def supports_propagation_seconds_flag(self) -> bool:
+        # --manual has no propagation flag; the hook does the waiting.
+        return False
+
+    @property
+    def propagation_via_environment(self) -> bool:
+        return True
+
+    def prepare_environment(self, env: Dict[str, str], config_data: Dict[str, Any]) -> None:
+        # An account-level wait wins over the global one, which
+        # CertificateManager sets with setdefault.
+        propagation = config_data.get('propagation_seconds')
+        if propagation:
+            env['CERTMATE_DNS_PROPAGATION_SECONDS'] = str(
+                clamp_propagation_seconds(propagation, self.default_propagation_seconds))
+
+    def configure_certbot_arguments(self, cmd: list, credentials_file: Optional[Path], domain_alias: Optional[str] = None) -> None:
+        if not credentials_file:
+            raise ValueError("Azure DNS needs the hook config create_config_file writes")
+        cmd.extend(manual_hook_arguments(
+            Path(__file__).with_name('azure_dns_hook.py'), credentials_file))
+        self._note_domain_alias(domain_alias)
 
     @property
     def default_propagation_seconds(self) -> int:
         return 180
 
-    # The configure_certbot_arguments override that v2.4.3 added here for
-    # #113 was made redundant by 47aacfd, which generalised the
-    # --authenticator selector to the base DNSProviderStrategy. The base
-    # method now does the same thing for every plugin, so AzureStrategy
-    # can fall through to it unchanged.
 
 class GoogleStrategy(DNSProviderStrategy):
     """Google Cloud DNS.
@@ -345,7 +399,10 @@ class EdgeDNSStrategy(DNSProviderStrategy):
 
     @property
     def default_propagation_seconds(self) -> int:
-        return 90
+        # The plugin's own default, and half of what its docs suggest (240).
+        # 90 was not enough for Edge DNS to reach all of its authoritative
+        # nameservers before the CA looked (#974).
+        return 180
 
     def configure_certbot_arguments(self, cmd: list, credentials_file: Optional[Path], domain_alias: Optional[str] = None) -> None:
         cmd.extend(['--authenticator', self.plugin_name])
@@ -569,11 +626,10 @@ class CustomScriptStrategy(DNSProviderStrategy):
     quoted, and rejecting them here beats certbot's cryptic
     HookCommandNotFound on a truncated token.
 
-    Renewals work because certbot persists manual_auth_hook /
-    manual_cleanup_hook in its per-domain renewal conf: the scripts are
-    stable admin paths, not temp files, so the replay just works. If the
-    admin moves a script after issuance, the conf still points at the old
-    path — reissue (or edit the renewal conf) after relocating scripts.
+    Renewals pass the hooks configured today, as create does (#666, D6),
+    rather than relying on certbot replaying the paths it persisted in the
+    per-domain renewal conf at issue time: a script moved after issuance
+    only needs its new path in Settings.
     """
 
     def __init__(self):
@@ -644,6 +700,10 @@ class CustomScriptStrategy(DNSProviderStrategy):
         # --manual has no propagation flag; waiting is the auth hook's job.
         return False
 
+    @property
+    def propagation_via_environment(self) -> bool:
+        return True
+
     def configure_certbot_arguments(self, cmd: list, credentials_file: Optional[Path], domain_alias: Optional[str] = None) -> None:
         if not self._auth_hook:
             raise ValueError(
@@ -711,6 +771,31 @@ class HTTP01Strategy(DNSProviderStrategy):
     @property
     def default_propagation_seconds(self) -> int:
         return 0  # No propagation needed for HTTP-01
+
+
+class PrevalidatedStrategy(DNSProviderStrategy):
+    """Certbot manual mode for an ACME order already authorized by the CA.
+
+    Manual needs a hook in non-interactive mode even when every authorization
+    is valid. Certbot never invokes it for valid authorizations; if an order
+    contains a pending one, /usr/bin/false cannot publish a DNS challenge.
+    """
+
+    @property
+    def plugin_name(self) -> str:
+        return 'manual'
+
+    @property
+    def supports_propagation_seconds_flag(self) -> bool:
+        return False
+
+    def create_config_file(self, config_data: Dict[str, Any]) -> Optional[Path]:
+        return None
+
+    def configure_certbot_arguments(self, cmd: list, credentials_file: Optional[Path],
+                                    domain_alias: Optional[str] = None) -> None:
+        cmd.extend(['--manual', '--preferred-challenges', 'dns',
+                    '--manual-auth-hook', '/usr/bin/false'])
 
 
 class SolidServerStrategy(DNSProviderStrategy):

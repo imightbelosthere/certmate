@@ -5,6 +5,7 @@ local filesystem, Azure Key Vault, AWS Secrets Manager, HashiCorp Vault, Infisic
 and S3-compatible object storage
 """
 
+import ipaddress
 import os
 import json
 import logging
@@ -17,9 +18,11 @@ from abc import ABC, abstractmethod
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple, Any
+from urllib.parse import urlparse
 
 from .constants import CERTIFICATE_FILES
 from .domain_paths import STORAGE_DOMAIN_RE, reject_unsafe_domain
+from .redirect_guard import GuardedSession
 
 logger = logging.getLogger(__name__)
 
@@ -93,6 +96,56 @@ def _looks_absent(error, *, codes=(), names=()) -> bool:
     code = str(response.get('Error', {}).get('Code', ''))
     status = response.get('ResponseMetadata', {}).get('HTTPStatusCode')
     return code in codes or status == 404
+
+
+def _aws_storage_auth(config, backend_name):
+    """Resolve legacy key-pair settings or an explicit AWS credential-chain mode."""
+    key = (config.get('access_key_id') or '').strip()
+    secret = (config.get('secret_access_key') or '').strip()
+    mode = config.get('auth_mode') or 'access_keys'
+    role_arn = (config.get('assume_role_arn') or '').strip()
+    if mode not in ('access_keys', 'iam_role'):
+        raise ValueError(f"{backend_name} auth_mode must be access_keys or iam_role")
+    if mode == 'access_keys' and not (key and secret):
+        raise ValueError(f"{backend_name} requires access_key_id and secret_access_key in access_keys mode")
+    if role_arn and not re.fullmatch(
+            r'arn:aws(?:-us-gov|-cn)?:iam::[0-9]{12}:role/[A-Za-z0-9+=,.@_/-]+', role_arn):
+        raise ValueError("assume_role_arn must be an IAM role ARN")
+    return mode, key, secret, role_arn
+
+
+def _aws_storage_client(service, region, mode, key, secret, role_arn='', endpoint_url=None):
+    """Create an AWS client, refreshing STS credentials for an assumed role."""
+    import boto3
+
+    options = {'region_name': region}
+    if mode == 'access_keys':
+        options.update(aws_access_key_id=key, aws_secret_access_key=secret)
+    service_options = {'endpoint_url': endpoint_url} if service == 's3' else {}
+    if not role_arn:
+        return boto3.client(service, **options, **service_options)
+
+    from botocore.credentials import RefreshableCredentials
+    from botocore.session import get_session
+
+    sts = boto3.client('sts', **options)
+
+    def refresh():
+        creds = sts.assume_role(
+            RoleArn=role_arn, RoleSessionName=f'certmate-{service}-storage')['Credentials']
+        return {
+            'access_key': creds['AccessKeyId'],
+            'secret_key': creds['SecretAccessKey'],
+            'token': creds['SessionToken'],
+            'expiry_time': creds['Expiration'].isoformat(),
+        }
+
+    session = get_session()
+    session._credentials = RefreshableCredentials.create_from_metadata(
+        metadata=refresh(), refresh_using=refresh, method='sts-assume-role')
+    session.set_config_variable('region', region)
+    return boto3.Session(botocore_session=session).client(
+        service, region_name=region, **service_options)
 
 
 def _is_transient(exc):
@@ -1281,15 +1334,9 @@ class AWSSecretsManagerBackend(CertificateStorageBackend):
     """AWS Secrets Manager storage backend"""
     
     def __init__(self, config: Dict[str, str]):
-        self.region = config.get('region', 'us-east-1')
-        self.access_key_id = config.get('access_key_id')
-        self.secret_access_key = config.get('secret_access_key')
-        
-        self.region = (self.region or 'us-east-1').strip()
-        self.access_key_id = (self.access_key_id or '').strip()
-        self.secret_access_key = (self.secret_access_key or '').strip()
-        if not all([self.access_key_id, self.secret_access_key]):
-            raise ValueError("AWS Secrets Manager backend requires access_key_id and secret_access_key")
+        self.region = (config.get('region') or 'us-east-1').strip()
+        (self.auth_mode, self.access_key_id, self.secret_access_key,
+         self.assume_role_arn) = _aws_storage_auth(config, 'AWS Secrets Manager backend')
         
         self._client = None
         logger.info(f"AWSSecretsManagerBackend initialized for region: {self.region}")
@@ -1298,13 +1345,9 @@ class AWSSecretsManagerBackend(CertificateStorageBackend):
         """Get AWS Secrets Manager client with lazy initialization"""
         if self._client is None:
             try:
-                import boto3
-                self._client = boto3.client(
-                    'secretsmanager',
-                    region_name=self.region,
-                    aws_access_key_id=self.access_key_id,
-                    aws_secret_access_key=self.secret_access_key
-                )
+                self._client = _aws_storage_client(
+                    'secretsmanager', self.region, self.auth_mode,
+                    self.access_key_id, self.secret_access_key, self.assume_role_arn)
             except ImportError:
                 raise ImportError("AWS Secrets Manager backend requires 'boto3' package")
         return self._client
@@ -1432,6 +1475,14 @@ class AWSSecretsManagerBackend(CertificateStorageBackend):
         return "aws_secrets_manager"
 
 
+# Vault answers 307 from a standby node that is not forwarding requests to the
+# active one. That is the one legitimate redirect off the configured address, and
+# it is not followed: the request holds the key and the token.
+_VAULT_REDIRECT_HINT = (
+    'If Vault runs without request forwarding, set vault_url to the active node, '
+    'or to a load balancer that routes to it.')
+
+
 class HashiCorpVaultBackend(CertificateStorageBackend):
     """HashiCorp Vault storage backend"""
     
@@ -1455,7 +1506,14 @@ class HashiCorpVaultBackend(CertificateStorageBackend):
         if self._client is None:
             try:
                 import hvac
-                self._client = hvac.Client(url=self.vault_url, token=self.vault_token)
+                # A session that refuses a redirect to another host. hvac follows
+                # them by default and `requests` drops only `Authorization` on a
+                # host change, while Vault authenticates with `X-Vault-Token`:
+                # so a redirect took the private key AND the token that opens the
+                # vault to whatever host the answer named.
+                self._client = hvac.Client(
+                    url=self.vault_url, token=self.vault_token,
+                    session=GuardedSession(hint=_VAULT_REDIRECT_HINT))
                 if not self._client.is_authenticated():
                     raise ValueError("Failed to authenticate with HashiCorp Vault")
                 self._token_renewed_at = time.time()
@@ -1668,7 +1726,7 @@ class InfisicalBackend(CertificateStorageBackend):
     """Infisical storage backend"""
     
     def __init__(self, config: Dict[str, str]):
-        self.site_url = config.get('site_url', 'https://app.infisical.com')
+        self.site_url = config.get('site_url') or 'https://app.infisical.com'
         self.client_id = config.get('client_id')
         self.client_secret = config.get('client_secret')
         self.project_id = config.get('project_id')
@@ -1679,16 +1737,50 @@ class InfisicalBackend(CertificateStorageBackend):
         self.project_id = (self.project_id or '').strip()
         if not all([self.client_id, self.client_secret, self.project_id]):
             raise ValueError("Infisical backend requires client_id, client_secret, and project_id")
-        
+        self._require_https(self.site_url)
+
         self._client = None
         logger.info(f"InfisicalBackend initialized for project: {self.project_id}")
+
+    @staticmethod
+    def _require_https(site_url: str) -> None:
+        """The SDK talks to `site_url` with a client CertMate cannot configure.
+
+        It is a compiled core that FOLLOWS a 307/308 and sends the request body on:
+        measured against a server that answered a secret write with a redirect, the
+        secret value (here a certificate and its private key) arrived at the other
+        host, with the credentials header stripped and the body not. Nothing in
+        `ClientSettings` turns that off, so what can be refused is the network
+        position that makes a redirect likely: plain HTTP, where anyone on the path
+        can answer instead of the server. Loopback may use HTTP, since nobody
+        stands between a process and itself (this is also what lets the tests run
+        the real SDK against a local server).
+        """
+        parsed = urlparse(site_url or '')
+        if parsed.scheme == 'https' and parsed.hostname:
+            return
+        host = (parsed.hostname or '').lower()
+        loopback = host == 'localhost'
+        if not loopback:
+            try:
+                loopback = ipaddress.ip_address(host).is_loopback
+            except ValueError:
+                loopback = False
+        if parsed.scheme == 'http' and loopback:
+            return
+        raise ValueError("Infisical site_url must be an https:// address (http:// is accepted only "
+                         "for a loopback address: localhost, 127.0.0.1 or ::1): the SDK follows "
+                         "redirects with the request body, which "
+                         "carries the private key")
     
     def _get_client(self):
         """Get Infisical client with lazy initialization"""
         if self._client is None:
             try:
-                from infisical import InfisicalClient, ClientSettings
-                
+                # The package is `infisical-python`; the MODULE it installs is
+                # `infisical_client` (there is no `infisical`).
+                from infisical_client import InfisicalClient, ClientSettings
+
                 settings = ClientSettings(
                     client_id=self.client_id,
                     client_secret=self.client_secret,
@@ -1696,9 +1788,47 @@ class InfisicalBackend(CertificateStorageBackend):
                 )
                 self._client = InfisicalClient(settings)
             except ImportError:
-                raise ImportError("Infisical backend requires 'infisical-python' package")
+                raise ImportError("Infisical backend requires the 'infisical-python' package "
+                                  "(imported as 'infisical_client')")
         return self._client
+
+    def _options(self, kind: str, **fields):
+        """The SDK's options object for one call: its methods take ONE such object.
+
+        `kind` is the class name in `infisical_client` (`GetSecretOptions`, ...). The
+        project and environment are the same for every call this backend makes.
+        """
+        import infisical_client
+        return getattr(infisical_client, kind)(
+            project_id=self.project_id, environment=self.environment, **fields)
     
+    def _upsert_secret(self, client, name: str, value: str) -> None:
+        """Update the secret, and create it when there was nothing to update.
+
+        The SDK offers no upsert and no typed not-found (a missing secret is a bare
+        `Exception` whose message names the secret), so absence cannot be told from
+        any other failure without depending on wording. Update first, then create.
+
+        If the create fails too, the UPDATE's error is the one to act on when it is
+        the kind that passes (a rate limit, a timeout): a create over a secret that
+        exists answers "already exists", which is permanent and would hide the
+        retryable failure from `_with_retry`, turning a blip into a lost write.
+        The create is still ALWAYS tried first, rather than raising a transient-looking
+        update error up front, because `_is_transient` also reads keywords out of the
+        message and the not-found message contains the secret's name: for
+        `corporate.example.com` a plain "not found" looks like a rate limit, and
+        raising on it would make the first write of such a domain fail forever.
+        """
+        try:
+            client.updateSecret(self._options(
+                'UpdateSecretOptions', secret_name=name, secret_value=value))
+        except Exception as update_error:
+            try:
+                client.createSecret(self._options(
+                    'CreateSecretOptions', secret_name=name, secret_value=value))
+            except Exception as create_error:
+                raise (update_error if _is_transient(update_error) else create_error)
+
     def store_certificate(self, domain: str, cert_files: Dict[str, bytes], metadata: Dict[str, Any]) -> bool:
         """Store certificate files and metadata to Infisical"""
         try:
@@ -1715,45 +1845,10 @@ class InfisicalBackend(CertificateStorageBackend):
         # Store certificate files as individual secrets (upsert: update if exists, create otherwise)
         for filename, content in cert_files.items():
             secret_key = f"certmate-{domain}-{filename.replace('.', '-')}"
-            secret_value = _as_text(filename, content)
-            try:
-                client.update_secret(
-                    secret_name=secret_key,
-                    secret_value=secret_value,
-                    project_id=self.project_id,
-                    environment=self.environment
-                )
-            except Exception:
-                # Update-then-create: the SDK does not offer an upsert, and it
-                # does not document a distinct not-found error either, so the
-                # absence cannot be told from anything else without depending
-                # on an undocumented type. A create that also fails raises,
-                # which is the honest outcome.
-                client.create_secret(
-                    secret_name=secret_key,
-                    secret_value=secret_value,
-                    project_id=self.project_id,
-                    environment=self.environment
-                )
+            self._upsert_secret(client, secret_key, _as_text(filename, content))
 
         # Store metadata (upsert)
-        metadata_key = f"certmate-{domain}-metadata"
-        metadata_value = json.dumps(metadata)
-        try:
-            client.update_secret(
-                secret_name=metadata_key,
-                secret_value=metadata_value,
-                project_id=self.project_id,
-                environment=self.environment
-            )
-        except Exception:
-            # Same update-then-create as above, for the metadata secret.
-            client.create_secret(
-                secret_name=metadata_key,
-                secret_value=metadata_value,
-                project_id=self.project_id,
-                environment=self.environment
-            )
+        self._upsert_secret(client, f"certmate-{domain}-metadata", json.dumps(metadata))
 
         logger.info(f"Certificate stored successfully in Infisical for {domain}")
         return True
@@ -1776,11 +1871,7 @@ class InfisicalBackend(CertificateStorageBackend):
         for filename in standard_files:
             try:
                 secret_key = f"certmate-{domain}-{filename.replace('.', '-')}"
-                secret = client.get_secret(
-                    secret_name=secret_key,
-                    project_id=self.project_id,
-                    environment=self.environment
-                )
+                secret = client.getSecret(self._options('GetSecretOptions', secret_name=secret_key))
                 cert_files[filename] = secret.secret_value.encode('utf-8')
             except Exception as e:
                 # Log the PEM filename, not the storage key or the SDK error
@@ -1796,11 +1887,7 @@ class InfisicalBackend(CertificateStorageBackend):
         metadata = {}
         try:
             metadata_key = f"certmate-{domain}-metadata"
-            secret = client.get_secret(
-                secret_name=metadata_key,
-                project_id=self.project_id,
-                environment=self.environment
-            )
+            secret = client.getSecret(self._options('GetSecretOptions', secret_name=metadata_key))
             metadata = json.loads(secret.secret_value)
         except Exception as e:
             logger.debug(f"Metadata not found in Infisical for {domain}: {e}")
@@ -1820,22 +1907,18 @@ class InfisicalBackend(CertificateStorageBackend):
         client = self._get_client()
         domains = set()
 
-        secrets = client.list_secrets(
-            project_id=self.project_id,
-            environment=self.environment
-        )
+        secrets = client.listSecrets(self._options('ListSecretsOptions'))
 
         for secret in secrets:
-            if not (secret.secret_name.startswith('certmate-') and secret.secret_name.endswith('-metadata')):
+            # A result's name is `secret_key` (not `secret_name`, which is what the
+            # option objects call it).
+            if not (secret.secret_key.startswith('certmate-') and secret.secret_key.endswith('-metadata')):
                 continue
             # Read each metadata secret to get the authoritative domain name instead
             # of reversing the sanitized key (which is lossy for hyphenated domains).
             try:
-                meta_secret = client.get_secret(
-                    secret_name=secret.secret_name,
-                    project_id=self.project_id,
-                    environment=self.environment
-                )
+                meta_secret = client.getSecret(
+                    self._options('GetSecretOptions', secret_name=secret.secret_key))
                 meta = json.loads(meta_secret.secret_value)
                 domain = meta.get('domain')
                 if domain:
@@ -1855,11 +1938,7 @@ class InfisicalBackend(CertificateStorageBackend):
             for filename in standard_files:
                 try:
                     secret_key = f"certmate-{domain}-{filename.replace('.', '-')}"
-                    client.delete_secret(
-                        secret_name=secret_key,
-                        project_id=self.project_id,
-                        environment=self.environment
-                    )
+                    client.deleteSecret(self._options('DeleteSecretOptions', secret_name=secret_key))
                 except Exception as e:
                     logger.debug(f"Could not delete secret {secret_key} for {domain}: {e}")
                     continue
@@ -1867,11 +1946,7 @@ class InfisicalBackend(CertificateStorageBackend):
             # Delete metadata
             try:
                 metadata_key = f"certmate-{domain}-metadata"
-                client.delete_secret(
-                    secret_name=metadata_key,
-                    project_id=self.project_id,
-                    environment=self.environment
-                )
+                client.deleteSecret(self._options('DeleteSecretOptions', secret_name=metadata_key))
             except Exception as e:
                 logger.debug(f"Could not delete metadata for {domain} from Infisical: {e}")
             
@@ -1887,13 +1962,12 @@ class InfisicalBackend(CertificateStorageBackend):
 
         Answered by listing rather than by fetching one secret, which is the
         opposite of what the other backends do, and deliberate. The other four
-        narrow to the exception their SDK raises for "no such thing"; the
-        shapes are verifiable here because azure-core, hvac and botocore are
-        installed. `infisical-python` is NOT: the pin is held back on purpose
-        (it has no manylinux x86_64 wheel and no sdist), so it cannot be
-        imported, and its not-found exception cannot be read off the library.
-        Guessing a class name is how a contract gets invented instead of
-        copied.
+        narrow to the exception their SDK raises for "no such thing". This one
+        has none: measured against the real SDK, a missing secret raises a bare
+        `Exception` whose only distinguishing mark is its message ("Secret with
+        name 'x' not found."), the same type as "Failed to authenticate". Matching
+        on that wording is how a contract gets invented instead of copied, and it
+        would read an authentication failure as an absence.
 
         `_list_certificates_attempt()` needs no such guess. It is the
         unswallowed form of `list_certificates()`, so a listing that returns
@@ -1925,30 +1999,28 @@ class S3CompatibleBackend(CertificateStorageBackend):
     def __init__(self, config: Dict[str, str]):
         self.endpoint_url = (config.get('endpoint_url') or '').strip()
         self.bucket = (config.get('bucket') or '').strip()
-        self.access_key_id = (config.get('access_key_id') or '').strip()
-        self.secret_access_key = (config.get('secret_access_key') or '').strip()
+        (self.auth_mode, self.access_key_id, self.secret_access_key,
+         self.assume_role_arn) = _aws_storage_auth(config, 'S3-compatible backend')
         self.region = (config.get('region') or 'us-east-1').strip()
         # Key namespace inside the bucket; trailing slashes normalised away.
         self.prefix = (config.get('prefix') or 'certmate/certificates').strip().strip('/')
-        if not all([self.endpoint_url, self.bucket, self.access_key_id, self.secret_access_key]):
-            raise ValueError(
-                "S3-compatible backend requires endpoint_url, bucket, "
-                "access_key_id and secret_access_key")
+        if not self.bucket:
+            raise ValueError("S3-compatible backend requires bucket")
+        if self.auth_mode == 'iam_role' and self.endpoint_url:
+            raise ValueError("IAM role authentication requires an empty endpoint_url (AWS S3)")
+        if self.assume_role_arn and self.endpoint_url:
+            raise ValueError("AssumeRole requires an empty endpoint_url (AWS S3)")
         self._client = None
         logger.info("S3CompatibleBackend initialized for endpoint %s bucket %s",
-                    self.endpoint_url, self.bucket)
+                    self.endpoint_url or 'AWS S3 (default)', self.bucket)
 
     def _get_client(self):
         if self._client is None:
             try:
-                import boto3
-                self._client = boto3.client(
-                    's3',
-                    endpoint_url=self.endpoint_url,
-                    aws_access_key_id=self.access_key_id,
-                    aws_secret_access_key=self.secret_access_key,
-                    region_name=self.region,
-                )
+                self._client = _aws_storage_client(
+                    's3', self.region, self.auth_mode, self.access_key_id,
+                    self.secret_access_key, self.assume_role_arn,
+                    endpoint_url=self.endpoint_url or None)
             except ImportError:
                 raise ImportError("S3-compatible backend requires 'boto3' package")
         return self._client
@@ -2329,7 +2401,13 @@ class StorageManager:
         migration_results = {}
         
         try:
-            domains = source_backend.list_certificates()
+            # These two public list methods return [] after a permission or
+            # network error. For migration, that is indistinguishable from an
+            # actually empty source, so use the raising attempts instead.
+            if isinstance(source_backend, (S3CompatibleBackend, AWSSecretsManagerBackend)):
+                domains = source_backend._list_certificates_attempt()
+            else:
+                domains = source_backend.list_certificates()
             logger.info(f"Starting migration of {len(domains)} certificates from {source_backend.get_backend_name()} to {target_backend.get_backend_name()}")
             
             for domain in domains:

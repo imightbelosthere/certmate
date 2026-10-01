@@ -1,6 +1,6 @@
 # Provider DNS
 
-<!-- CERTMATE-TRANSLATED-FROM 9b103696fbd47ac1 -->
+<!-- CERTMATE-TRANSLATED-FROM 4dcc9496784670bc -->
 
 CertMate supporta un'ampia gamma di provider DNS per le challenge DNS-01 di Let's Encrypt tramite plugin certbot individuali. La lista completa si trova nella tabella seguente.
 
@@ -12,7 +12,7 @@ CertMate supporta un'ampia gamma di provider DNS per le challenge DNS-01 di Let'
 |----------|--------|-----------------------|-----------|
 | **Cloudflare** | `certbot-dns-cloudflare` | API Token | Cloud principale |
 | **AWS Route53** | `certbot-dns-route53` | Access Key, Secret Key | Cloud principale |
-| **Azure DNS** | `certbot-dns-azure` | Service Principal | Cloud principale |
+| **Azure DNS** | Hook proprio di CertMate (`azure-mgmt-dns`) | Service Principal | Cloud principale |
 | **Google Cloud DNS** | `certbot-dns-google` | Service Account JSON | Cloud principale |
 | **PowerDNS** | `certbot-dns-powerdns` | URL API, Chiave API | Enterprise |
 | **DNS Made Easy** | `certbot-dns-dnsmadeeasy` | Chiave API, Secret Key | Enterprise |
@@ -114,6 +114,8 @@ curl -X POST http://localhost:8000/api/settings \
   }
 }
 ```
+
+Azure DNS non viene risolto da un plugin certbot: CertMate scrive da sé il record della challenge con l'SDK di Azure, usando lo stesso service principal. Il principal deve poter leggere e scrivere i record TXT della zona (il ruolo `DNS Zone Contributor` sul gruppo di risorse basta). I certificati emessi in precedenza tramite `certbot-dns-azure` passano a questo metodo al prossimo rinnovo; non c'è nulla da cambiare. L'attesa prima della validazione è l'impostazione di propagazione del provider (180 secondi per impostazione predefinita).
 
 ### Google Cloud DNS
 
@@ -374,7 +376,9 @@ I wildcard come `*.mybox.duckdns.org` sono supportati con lo stesso token. Poich
 
 ### Script personalizzato (porta il tuo provider)
 
-Per i provider DNS privi di plugin certbot — Oracle Cloud (OCI), DNS interno, API di appliance — punta CertMate ai tuoi script e li gestirà tramite la modalità `--manual` di certbot. Non è richiesta alcuna installazione di plugin.
+Per i provider DNS privi di plugin certbot — Oracle Cloud (OCI), Total Uptime, Netriplex, DNS interno, API di appliance — punta CertMate ai tuoi script e li gestirà tramite la modalità `--manual` di certbot. Non è richiesta alcuna installazione di plugin.
+
+**[Script DNS personalizzato](../custom-dns-script.md)** è la guida completa: le regole sui percorsi e perché sono severe, l'ambiente esatto con cui il tuo script viene chiamato, il caso wildcard più apice, cosa usa il rinnovo e un esempio funzionante. *(in inglese)*
 
 ```json
 {
@@ -431,7 +435,7 @@ Requisiti e modello di fiducia:
 - I percorsi devono essere **assoluti**, i file devono esistere, essere **eseguibili**, non scrivibili da tutti gli utenti **né dal gruppo** (`chmod 755` o più restrittivo), e non contenere spazi o metacaratteri della shell (certbot esegue gli hook tramite la shell). Un hook con `chmod 775` — un modo ordinario per uno script di proprietà di un gruppo di deploy — viene rifiutato: chiunque appartenga a quel gruppo potrebbe riscrivere ciò che CertMate sta per eseguire. Validati all'emissione e dall'endpoint API di test (`POST /api/web/certificates/test-provider`)
 - Gli script vengono eseguiti con i privilegi di CertMate — stesso modello di fiducia dei deploy hook: solo gli amministratori possono configurarli, trattali come parte del tuo deployment
 - L'impostazione `dns_propagation_seconds` per provider viene esportata agli script come `CERTMATE_DNS_PROPAGATION_SECONDS` (un campo `propagation_seconds` a livello di account lo sovrascrive)
-- I rinnovi rieseguono i percorsi degli hook dalla configurazione di rinnovo di certbot: mantieni gli script in un percorso stabile (se li sposti, riemetti il certificato)
+- I rinnovi usano i percorsi degli hook configurati adesso, come l'emissione: se sposti uno script, aggiorna il percorso nelle Impostazioni e il rinnovo successivo userà quello
 - I certificati wildcard funzionano (l'hook riceve ogni record di validazione)
 
 ---

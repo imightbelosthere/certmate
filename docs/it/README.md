@@ -1,6 +1,6 @@
 # Documentazione CertMate
 
-<!-- CERTMATE-TRANSLATED-FROM 5d329368f9d77176 -->
+<!-- CERTMATE-TRANSLATED-FROM c4146ec562570ee8 -->
 
 Benvenuto nella documentazione di CertMate. Questa cartella contiene guide complete per tutte le funzionalità.
 
@@ -15,6 +15,7 @@ Benvenuto nella documentazione di CertMate. Questa cartella contiene guide compl
 
 ### Funzionalità principali
 - **[Provider DNS](./dns-providers.md)** — Provider supportati, multi-account, alias di dominio
+- **[Script DNS personalizzato](../custom-dns-script.md)** — qualsiasi provider senza plugin, guidato dai tuoi script *(in inglese)*
 - **[Provider CA](./ca-providers.md)** — Let's Encrypt, DigiCert, CA privata
 - **[Certificati client](./guide.md)** — Ciclo di vita dei certificati client, dashboard web, operazioni batch
 - **[Server MCP (Model Context Protocol)](./mcp.md)** — Server Node.js standalone per l'integrazione con agenti IA
@@ -58,7 +59,7 @@ Benvenuto nella documentazione di CertMate. Questa cartella contiene guide compl
 ## Panoramica delle funzionalità
 
 ### Certificati server
-- **Oltre due dozzine di provider DNS** per le sfide Let's Encrypt DNS-01 (vedere [Provider DNS](./dns-providers.md) per l'elenco completo)
+- **Tutti i provider DNS supportati** per le sfide Let's Encrypt DNS-01 (vedere [Provider DNS](./dns-providers.md) per l'elenco completo)
 - **Più provider CA**: Let's Encrypt, DigiCert, CA privata
 - **Supporto multi-account** per provider DNS
 - **Storage backend intercambiabili**: locale, Azure Key Vault, AWS Secrets Manager, HashiCorp Vault, Infisical, S3-compatible
@@ -245,7 +246,7 @@ CertMate è distribuito sotto licenza MIT. Vedere il file LICENSE nel repository
 
 ---
 
-**Versione corrente**: 2.37.0
+**Versione corrente**: 2.45.2
 
 <div align="center">
 

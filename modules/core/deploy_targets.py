@@ -20,6 +20,8 @@ import logging
 import os
 import tempfile
 
+from .secret_scrub import scrub
+
 logger = logging.getLogger(__name__)
 
 # Well-known in-cluster service-account locations (mounted into every pod).
@@ -30,7 +32,11 @@ _SA_NAMESPACE = f'{_SA_DIR}/namespace'
 
 # Recognised target types.
 TARGET_KUBERNETES_SECRET = 'kubernetes-secret'
-TARGET_TYPES = (TARGET_KUBERNETES_SECRET,)
+# Delivers the certificate, and optionally the key, to an HTTPS endpoint (#218).
+# Its implementation lives in deploy_target_webhook and is imported where it is
+# built, so importing this module stays cheap.
+TARGET_WEBHOOK = 'webhook'
+TARGET_TYPES = (TARGET_KUBERNETES_SECRET, TARGET_WEBHOOK)
 
 
 class DeployTargetError(Exception):
@@ -128,6 +134,17 @@ class KubernetesSecretTarget:
             },
         }
 
+    # --- what it reads ----------------------------------------------------- #
+
+    @staticmethod
+    def required_files():
+        """The files a run reads: this target always publishes the key with the certificate."""
+        return ('fullchain.pem', 'privkey.pem')
+
+    def deploy_from(self, material, domain, event_type):
+        """Read what it needs through *material* and deploy it."""
+        return self.deploy(material('fullchain.pem'), material('privkey.pem'))
+
     # --- deploy ------------------------------------------------------------ #
 
     def deploy(self, cert_pem, key_pem):
@@ -160,14 +177,20 @@ class KubernetesSecretTarget:
         # inside the try/finally, so a config error can never leak a temp file.
         verify, ca_tempfile = _materialize_verify(verify_spec)
         try:
-            resp = patch(url, json=manifest, headers=headers, verify=verify, timeout=15)
+            # Redirects are refused, not followed. A 307/308 keeps the method
+            # and the body, so following one would send the private key to
+            # whichever host the answer names while the operator is told the
+            # deploy went to the server they configured.
+            resp = patch(url, json=manifest, headers=headers, verify=verify, timeout=15,
+                         allow_redirects=False)
         except Exception as e:
             # Broad because `requests` raises a family of them and they all
             # mean the same thing to the caller. The exception reaches the
-            # operator in `message`, scrubbed of the bearer token first —
-            # which is the reason this cannot simply propagate.
+            # operator in `message`, scrubbed of the bearer token AND the key
+            # first — which is the reason this cannot simply propagate.
             return {'success': False, 'status_code': None,
-                    'message': f'Kubernetes API request failed: {_scrub(str(e), token)}'}
+                    'message': 'Kubernetes API request failed: '
+                               + scrub(str(e), token=token, key_pem=key_pem)}
         finally:
             if ca_tempfile:
                 try:
@@ -179,7 +202,15 @@ class KubernetesSecretTarget:
         if status is not None and 200 <= status < 300:
             return {'success': True, 'status_code': status,
                     'message': f'Applied Secret {namespace}/{secret_name}'}
-        body = _scrub(_safe_body(resp), token)
+        if status is not None and 300 <= status < 400:
+            # Said plainly, and without the Location: it can carry credentials
+            # in its query, and it names a host the operator did not configure.
+            return {'success': False, 'status_code': status,
+                    'message': f'Kubernetes API answered with a redirect ({status}). '
+                               f'Redirects are not followed, so the request was not '
+                               f'repeated anywhere else; point api_server at the address '
+                               f'that answers directly.'}
+        body = _answer_excerpt(resp, token, key_pem)
         return {'success': False, 'status_code': status,
                 'message': f'Kubernetes API returned {status}: {body}'}
 
@@ -204,24 +235,28 @@ def _default_patch(url, timeout=15, **kwargs):
     return requests.patch(url, timeout=timeout, **kwargs)
 
 
-def _scrub(text, secret):
-    """Remove *secret* (the bearer token) from a diagnostic string before it is
-    returned/stored. The Kubernetes API never echoes the token, but scrubbing it
-    guarantees a token can never reach the deploy history/audit through an error
-    message or response body (and satisfies clear-text-storage analysis)."""
-    if secret and text:
-        return text.replace(secret, '[REDACTED]')
-    return text
+# How much of an answer is read before scrubbing, and how much of the scrubbed
+# text is kept. The first is large so the scrub sees the whole of what a
+# receiver could echo; the second is what reaches the records.
+_ANSWER_READ_LIMIT = 64 * 1024
+_ANSWER_KEEP = 300
 
 
-def _safe_body(resp):
+def _answer_excerpt(resp, token, key_pem):
+    """The start of a response body, for the operator, with no secret in it.
+
+    Scrubbed BEFORE it is shortened. The other order (cut to a few hundred
+    characters, then scrub) leaves whatever fragment of the key fell inside the
+    cut, because a fragment matches none of the whole forms the scrub looks for.
+    """
     try:
-        return (resp.text or '')[:300]
+        text = (resp.text or '')[:_ANSWER_READ_LIMIT]
     except Exception:
         # A response body is only ever quoted back to the operator here, so
         # any failure to read one has to be a string rather than an exception
         # that replaces the status code the caller is reporting.
         return '<unreadable response>'
+    return scrub(text, token=token, key_pem=key_pem)[:_ANSWER_KEEP]
 
 
 def build_target(target, http_patch=None):
@@ -229,7 +264,23 @@ def build_target(target, http_patch=None):
     ttype = (target or {}).get('type')
     if ttype == TARGET_KUBERNETES_SECRET:
         return KubernetesSecretTarget(target.get('config') or {}, http_patch=http_patch)
+    if ttype == TARGET_WEBHOOK:
+        from .deploy_target_webhook import WebhookTarget
+        return WebhookTarget(target)
     raise DeployTargetError(f'unknown deploy target type: {ttype!r}')
+
+
+def target_needs_key(target):
+    """Whether running *target* reads the private key.
+
+    Decided from the configuration, before any file is opened, because it is what
+    lets a certificate whose key lives on another device (a CSR issuance) still be
+    delivered by a target that only sends the certificate.
+    """
+    try:
+        return 'privkey.pem' in build_target(target).required_files()
+    except DeployTargetError:
+        return False
 
 
 def target_applies(target, domain, event_type):
@@ -247,12 +298,24 @@ def target_applies(target, domain, event_type):
     return event_type in on_events or event_type == 'manual'
 
 
-def run_targets(targets, domain, cert_pem, key_pem, event_type, http_patch=None):
+def run_targets(targets, domain, cert_pem, key_pem, event_type, http_patch=None, *, material=None):
     """Run every applicable typed target for *domain*, failure-isolated.
 
     Returns a list of per-target result dicts. A build/deploy error for one
     target is captured and never aborts the others (or the cert operation).
+
+    *material* is a callable ``name -> bytes`` that reads a file of the
+    certificate on demand, so a target that does not use the private key never
+    causes it to be opened. Without it the two byte strings given are used, which
+    is how the tests and the older callers supply them.
     """
+    if material is None:
+        given = {'fullchain.pem': cert_pem, 'cert.pem': cert_pem, 'privkey.pem': key_pem}
+
+        def material(name):
+            if given.get(name) is None:
+                raise FileNotFoundError(name)
+            return given[name]
     results = []
     for target in targets or []:
         if not target_applies(target, domain, event_type):
@@ -260,9 +323,13 @@ def run_targets(targets, domain, cert_pem, key_pem, event_type, http_patch=None)
         name = target.get('name') or target.get('id') or target.get('type')
         try:
             instance = build_target(target, http_patch=http_patch)
-            outcome = instance.deploy(cert_pem, key_pem)
+            outcome = instance.deploy_from(material, domain, event_type)
         except DeployTargetError as e:
             outcome = {'success': False, 'status_code': None, 'message': str(e)}
+        except OSError:
+            # Not the path: it names the certificate directory, and this message is recorded.
+            outcome = {'success': False, 'status_code': None,
+                       'message': 'certificate files unreadable'}
         except Exception as e:  # pragma: no cover - defensive isolation
             logger.exception('Deploy target %s crashed', name)
             outcome = {'success': False, 'status_code': None,

@@ -10,9 +10,10 @@ type: application
 # in the application's repository and only ever ships that application, so it
 # tracks it: one number, bumped by scripts/release.sh, pinned by
 # tests/test_helm_chart.py. A chart-only fix rides the next release.
-version: 2.37.0
-appVersion: "2.37.0"
+version: 2.45.2
+appVersion: "2.45.2"
 home: https://www.certmate.org
+icon: https://raw.githubusercontent.com/fabriziosalmi/certmate/main/static/img/certmate_logo_256.png
 sources:
   - https://github.com/fabriziosalmi/certmate
 keywords:
@@ -26,3 +27,22 @@ keywords:
 maintainers:
   - name: fabriziosalmi
     url: https://github.com/fabriziosalmi
+# Read by Artifact Hub (#1018). The image line carries the release number and
+# is moved by scripts/release.sh with version/appVersion above; listing the
+# image is what makes Artifact Hub run its security scan against it.
+annotations:
+  artifacthub.io/category: security
+  artifacthub.io/license: MIT
+  artifacthub.io/links: |
+    - name: Documentation
+      url: https://github.com/fabriziosalmi/certmate/blob/main/docs/kubernetes.md
+    - name: Chart values
+      url: https://github.com/fabriziosalmi/certmate/blob/main/charts/certmate/README.md
+    - name: support
+      url: https://github.com/fabriziosalmi/certmate/issues
+  artifacthub.io/images: |
+    - name: certmate
+      image: docker.io/fabriziosalmi/certmate:2.45.2
+      platforms:
+        - linux/amd64
+        - linux/arm64

@@ -1,6 +1,6 @@
 # CertMate Certificados de Cliente - Guía de uso
 
-<!-- CERTMATE-TRANSLATED-FROM c9f680a52f9eca05 -->
+<!-- CERTMATE-TRANSLATED-FROM f31f91fe8af58072 -->
 
 ## Descripción general
 
@@ -390,8 +390,10 @@ El umbral de 30 dias es la opinion de CertMate, y es la misma para cada
 certificado y cada CA. Desde la [RFC 9773](https://www.rfc-editor.org/rfc/rfc9773.html)
 una CA puede publicar la suya, por certificado: un endpoint `renewalInfo` que
 responde con una ventana durante la cual quiere que ese certificado se
-sustituya. Let's Encrypt ofrece uno en produccion; step-ca tambien, para una
-CA privada.
+sustituya. Let's Encrypt ofrece uno, en produccion y en staging. step-ca todavia
+no (0.30.2, medido; vea smallstep/certificates#2162), asi que en una step-ca
+privada decide solo el umbral y el panel del certificado indica que la CA no
+publica una ventana.
 
 El barrido de renovacion TLS lo pregunta. Para cada certificado que el umbral
 **no** ha declarado ya vencido, CertMate obtiene la ventana de la CA y renueva
@@ -415,6 +417,17 @@ CA no quiere que todos sus clientes renueven a la vez.
 El resumen del barrido los cuenta como `ari_advanced`, para que una renovacion
 que su configuracion no explica sea atribuible.
 
+El panel de detalle del certificado muestra, bajo **CA renewal window**, lo
+que dijo la CA en el ultimo barrido: la ventana, el instante dentro de ella en
+que CertMate renueva, y el enlace de explicacion de la CA cuando lo da. Si no
+hay ventana, indica que ausencia es: la CA no publica ninguna, la CA no
+respondio en la ultima comprobacion, o el certificado no se puede nombrar en
+ARI. El mismo registro lo devuelve `GET /api/certificates/<domain>` como
+`renewal_info`. Se lee de lo que guardo el barrido, asi que abrir el panel
+nunca envia una peticion a la CA. Justo despues de una renovacion muestra
+"Not checked yet" hasta que el siguiente barrido pregunte por el nuevo
+certificado.
+
 Ponga `"ari_enabled": false` en `settings.json` para desactivarlo; esta activo
 por defecto y cuesta una GET no autenticada por certificado y barrido, mas una
 por CA y hora para el directory.
@@ -424,6 +437,32 @@ mas alla de su umbral. Esa es la mitad que importa para los certificados de
 corta duracion, donde una regla fija de 30 dias no tiene sentido frente a un
 certificado de 6 dias — llegara con el soporte de perfiles que esos
 certificados necesitan.
+
+### Un umbral de mas de 30 dias
+
+certbot tiene su propia barrera de renovacion: si no se le fuerza, solo renueva
+dentro de los ultimos 30 dias antes de la caducidad. Antes de la 2.40 CertMate lo
+llamaba sin forzarlo, asi que un `renewal_threshold_days` de 45 se comportaba
+como 30, y el barrido contaba la diferencia como `skipped_not_due` cada noche.
+
+Cuando el umbral, y solo el umbral, declara un certificado pendiente de
+renovar mientras certbot se negaria, CertMate ahora fuerza la renovacion, como
+ya hacia con una ventana publicada por la CA. Dentro de los ultimos 30 dias no
+cambia nada. Vienen con dos protecciones:
+
+- **Como maximo `early_renewals_per_sweep` por barrido** (10 por defecto, entre
+  1 y 50). Subir el umbral en muchos certificados reparte las renovaciones
+  anticipadas en varias noches en lugar de enviar todos los pedidos a la CA en
+  una sola. El resumen del barrido las cuenta como `early_forced`, y las que
+  quedan para el barrido siguiente como `early_deferred`.
+- **Un certificado emitido hace menos de 7 dias nunca se fuerza.** Un umbral
+  igual o superior a la vida del certificado lo declararia pendiente para
+  siempre. Con esta proteccion cuesta como mucho una renovacion por semana, no
+  una por noche.
+
+Un certificado que necesita atencion por otro motivo, una clave servida que
+falta o no coincide, no se fuerza: se repara desde su linaje sin una clave
+nueva.
 
 ### Activar la renovación automática
 

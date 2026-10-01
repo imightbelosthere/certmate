@@ -302,6 +302,9 @@ class _Manager:
         self.real = CertificateManager.__new__(CertificateManager)
         self.real.cert_dir = tmp_path
         self.real.ca_manager = self
+        # The real one: recording an ARI answer invalidates it (#962).
+        from modules.core.utils import DeploymentStatusCache
+        self.real._certificate_info_cache = DeploymentStatusCache()
         self._directory = directory
 
     def get_ca_config(self, provider, account_id):
@@ -469,3 +472,316 @@ def test_the_encoding_matches_a_real_ca():
     assert start < cert.not_valid_after_utc.replace(tzinfo=None), (
         'the CA suggests renewing after the certificate expires')
     assert os.environ is not None  # keeps the import honest
+
+
+# --- what the CA said, kept where an operator can see it (#962) -------------
+
+def _record(manager, domain):
+    from modules.core.certificates import RENEWAL_INFO_FILE
+
+    path = manager.cert_dir / domain / RENEWAL_INFO_FILE
+    return json.loads(path.read_text()) if path.exists() else None
+
+
+def test_the_sweep_keeps_the_window_it_acted_on(swept):
+    """THE point of the step. The instant shown is the one `due_at` picks —
+    not re-derived later — so what an operator reads is what the sweep does."""
+    manager, domain, cert_id = swept
+    payload = _window(24, 48)
+    payload['explanationURL'] = 'https://ca.example.test/incident/42'
+    _with_client(manager, _transport({
+        DIRECTORY: (200, {'renewalInfo': ARI_BASE}),
+        f'{ARI_BASE}/{cert_id}': (200, payload),
+    }))
+
+    assert manager._ari_says_renew(domain, {}, {}, now=NOW) is False
+    record = _record(manager, domain)
+
+    start, end = ari.parse_window(payload)
+    assert record['status'] == ari.STATUS_WINDOW
+    assert record['cert_id'] == cert_id
+    assert record['checked_at'] == '2026-09-24T12:00:00Z'
+    assert record['window_start'] == start.isoformat() + 'Z'
+    assert record['window_end'] == end.isoformat() + 'Z'
+    assert record['renew_at'] == \
+        ari.due_at(cert_id, start, end).replace(microsecond=0).isoformat() + 'Z'
+    assert record['explanation_url'] == 'https://ca.example.test/incident/42'
+
+
+@pytest.mark.parametrize('directory_answer, ari_answer, expected', [
+    # The CA does not speak ARI: a fact about the CA.
+    ((200, {'newOrder': 'x'}), None, ari.STATUS_UNSUPPORTED),
+    # It does, and did not answer tonight: an incident.
+    ((200, {'renewalInfo': ARI_BASE}), (500, b'oops'), ari.STATUS_UNAVAILABLE),
+    ((200, {'renewalInfo': ARI_BASE}), (200, b'not json'), ari.STATUS_UNAVAILABLE),
+    ((200, {'renewalInfo': ARI_BASE}), (200, {'suggestedWindow': {}}),
+     ari.STATUS_UNAVAILABLE),
+    # The directory itself is down.
+    ((503, b''), None, ari.STATUS_UNAVAILABLE),
+])
+def test_each_kind_of_absence_is_recorded_as_itself(
+        swept, directory_answer, ari_answer, expected):
+    """The renewal decision needs only "no". An operator needs to know which
+    no: `unsupported` never changes, `unavailable` should not last."""
+    manager, domain, cert_id = swept
+    answers = {DIRECTORY: directory_answer}
+    if ari_answer is not None:
+        answers[f'{ARI_BASE}/{cert_id}'] = ari_answer
+    _with_client(manager, _transport(answers))
+
+    assert manager._ari_says_renew(domain, {}, {}, now=NOW) is False
+    record = _record(manager, domain)
+    assert record['status'] == expected
+    assert record['window_start'] is None and record['renew_at'] is None
+
+
+def test_a_certificate_that_cannot_be_named_is_recorded(tmp_path):
+    cert, _key = _cert(aki=None)
+    domain = 'ari.example.test'
+    (tmp_path / domain).mkdir()
+    (tmp_path / domain / 'cert.pem').write_bytes(
+        cert.public_bytes(serialization.Encoding.PEM))
+    manager = _with_client(_Manager(tmp_path).real, _transport({}))
+
+    assert manager._ari_says_renew(domain, {}, {}, now=NOW) is False
+    assert _record(manager, domain)['status'] == ari.STATUS_NO_IDENTIFIER
+
+
+@pytest.mark.parametrize('url', [
+    'javascript:alert(1)',
+    'http://ca.example.test/incident',
+    'https://',
+    'https://ca.example.test/' + 'a' * 3000,
+    42,
+])
+def test_only_an_https_explanation_is_kept(url):
+    """It is rendered as a link, and the CA's answer arrives over the
+    network: a `javascript:` URL here would be a script in the dashboard."""
+    assert ari.explanation_url({'explanationURL': url}) is None
+
+
+def test_a_record_that_cannot_be_written_does_not_fail_the_sweep(swept):
+    manager, domain, cert_id = swept
+    _with_client(manager, _transport({
+        DIRECTORY: (200, {'renewalInfo': ARI_BASE}),
+        f'{ARI_BASE}/{cert_id}': (200, _window(-48, -24)),
+    }))
+
+    def refuse(path, data):
+        raise PermissionError(13, 'Permission denied', str(path))
+
+    manager._atomic_json_write = refuse
+
+    # Still the renewal decision it was before the record existed.
+    assert manager._ari_says_renew(domain, {}, {}, now=NOW) is True
+
+
+# --- and read back, without asking the CA ----------------------------------
+
+def _parsed(manager, domain, settings=None):
+    raw = (manager.cert_dir / domain / 'cert.pem').read_bytes()
+    return manager._parse_certificate_info(
+        domain, raw, {'dns_provider': 'cloudflare'},
+        settings=settings if settings is not None else {})
+
+
+def _forbidden_transport(url, timeout):
+    raise AssertionError(f'asked the CA from a read path: {url}')
+
+
+def test_the_response_carries_the_recorded_window(swept):
+    manager, domain, cert_id = swept
+    _with_client(manager, _transport({
+        DIRECTORY: (200, {'renewalInfo': ARI_BASE}),
+        f'{ARI_BASE}/{cert_id}': (200, _window(24, 48)),
+    }))
+    manager._ari_says_renew(domain, {}, {}, now=NOW)
+    # Every read below must be served from the record.
+    _with_client(manager, _forbidden_transport)
+
+    info = _parsed(manager, domain)['renewal_info']
+
+    assert info['status'] == ari.STATUS_WINDOW
+    assert info['renew_at'] == _record(manager, domain)['renew_at']
+    assert 'cert_id' not in info, 'an on-disk key leaked into the API'
+
+
+def test_a_record_about_the_previous_certificate_is_not_shown(swept):
+    """After a renewal the serial changes; until the next sweep asks again
+    the file on disk describes a certificate that is no longer served."""
+    manager, domain, _cert_id = swept
+    from modules.core.certificates import RENEWAL_INFO_FILE
+
+    predecessor = ari.certificate_id(_cert(serial=54321)[0])
+    assert predecessor != _cert_id
+    stale = ari.observation(predecessor, ari.STATUS_WINDOW, _window(24, 48), NOW)
+    (manager.cert_dir / domain / RENEWAL_INFO_FILE).write_text(json.dumps(stale))
+
+    assert _parsed(manager, domain)['renewal_info'] is None
+
+
+def test_switched_off_says_so(swept):
+    manager, domain, _cert_id = swept
+    info = _parsed(manager, domain, settings={'ari_enabled': False})
+    assert info['renewal_info']['status'] == 'disabled'
+    assert info['renewal_info']['renew_at'] is None
+
+
+def test_the_list_endpoint_keeps_the_field():
+    """The dashboard reads GET /api/certificates, which marshals through
+    the model: a field the model does not declare is silently dropped."""
+    from flask_restx import Api, marshal
+
+    from flask import Flask
+    from modules.api.models import create_api_models
+
+    api = Api(Flask(__name__))
+    model = create_api_models(api)['certificate_model']
+    record = ari.observation('aa.bb', ari.STATUS_WINDOW, _window(24, 48), NOW)
+    shown = {k: v for k, v in record.items() if k != 'cert_id'}
+
+    out = marshal({'domain': 'a.example', 'renewal_info': shown}, model)
+    assert out['renewal_info'] == shown
+    assert marshal({'domain': 'a.example', 'renewal_info': None},
+                   model)['renewal_info'] is None
+
+
+def test_no_record_yet_is_null(swept):
+    manager, domain, _cert_id = swept
+    assert _parsed(manager, domain)['renewal_info'] is None
+
+
+def test_a_broken_record_never_becomes_a_renewal(swept):
+    """THE control on the read path. `_parse_certificate_info` answers any
+    exception inside it with "unparseable, needs_renewal: True". A defect in
+    a display field must not reach that branch."""
+    manager, domain, _cert_id = swept
+
+    def explode(*args, **kwargs):
+        raise KeyError('a bug in the reader')
+
+    manager._read_renewal_info = explode
+    info = _parsed(manager, domain)
+
+    assert info['renewal_info'] is None
+    assert info['expiry_date'] is not None
+    assert info['needs_renewal'] is False
+
+
+def test_a_link_on_disk_is_filtered_again_on_the_way_out(swept):
+    """The record can come from a restored backup rather than from the sweep,
+    and API clients other than the dashboard may render it as a link."""
+    manager, domain, cert_id = swept
+    from modules.core.certificates import RENEWAL_INFO_FILE
+
+    record = ari.observation(cert_id, ari.STATUS_WINDOW, _window(24, 48), NOW)
+    record['explanation_url'] = 'javascript:alert(document.domain)'
+    (manager.cert_dir / domain / RENEWAL_INFO_FILE).write_text(json.dumps(record))
+
+    info = _parsed(manager, domain)['renewal_info']
+    assert info['status'] == ari.STATUS_WINDOW
+    assert info['explanation_url'] is None
+
+
+@pytest.mark.parametrize('cert_id', ['aa.bb', 'cc.dd', 'uVnyjs8i8Ib.BUOTO'])
+def test_the_instant_shown_is_the_instant_acted_on(cert_id):
+    """Found by the LE-staging E2E, not by these tests (#962). The record
+    showed `renew_at` to the second while the sweep compared against the
+    point to the microsecond, so a sweep at the shown instant did not renew.
+    Staging's windows carry fractional seconds, so the start has one here."""
+    payload = {'suggestedWindow': {'start': '2026-11-25T12:06:10.412Z',
+                                   'end': '2026-11-27T07:16:59.907Z'}}
+    record = ari.observation(cert_id, ari.STATUS_WINDOW, payload, NOW)
+    shown = datetime.fromisoformat(record['renew_at'].replace('Z', ''))
+
+    assert ari.is_due(cert_id, payload, shown) is True
+    assert ari.is_due(cert_id, payload, shown - timedelta(seconds=1)) is False
+    start, end = ari.parse_window(payload)
+    assert start <= shown <= end
+
+
+# --- the renewal the window asked for has to reach the CA (#962) ------------
+
+def _certbot_gate(days_left):
+    """`renew_certificate` as the pinned certbot 2.10.0 behaves.
+
+    Measured by running the real `certbot renew --cert-name` against
+    hand-built lineages (#962): without `--force-renewal` it renews only when
+    fewer than 30 days are left (`RENEWER_DEFAULTS['renew_before_expiry']`)
+    and otherwise answers "not yet due", which `renew_certificate` reports as
+    `renewed: False`. With 29 days left it attempts the renewal; with 31, 45
+    and 60 it does nothing.
+    """
+    from unittest.mock import MagicMock
+
+    def renew(domain, force=False):
+        if not force and days_left >= 30:
+            return {'success': True, 'renewed': False, 'domain': domain}
+        return {'success': True, 'renewed': True, 'domain': domain}
+
+    return MagicMock(side_effect=renew)
+
+
+def _sweep_manager(needs_renewal, ari_says, days_left):
+    from unittest.mock import MagicMock
+
+    from modules.core.certificates import CertificateManager
+
+    manager = CertificateManager.__new__(CertificateManager)
+    manager.get_certificate_info = MagicMock(return_value={
+        'exists': True, 'needs_renewal': needs_renewal, 'days_left': days_left})
+    manager._ari_says_renew = MagicMock(return_value=ari_says)
+    manager.renew_certificate = _certbot_gate(days_left)
+    manager._audit_scheduled_renew = MagicMock()
+    manager._record_renewal_metrics = MagicMock()
+    manager._publish_failed_event = MagicMock()
+    manager._publish_renewed_event = MagicMock()
+    return manager
+
+
+def _summary():
+    return {'checked': 0, 'renewed': 0, 'failed': 0, 'skipped_busy': 0,
+            'skipped_not_due': 0, 'ari_advanced': 0}
+
+
+def test_a_renewal_the_ca_asked_for_actually_happens():
+    """THE regression. A mass revocation moves the window to now on a
+    certificate with 60 days left. The threshold says no, the CA says yes —
+    and certbot, asked without `--force-renewal`, says "not yet due" and
+    renews nothing. That was #926 in the one case it exists for."""
+    manager = _sweep_manager(needs_renewal=False, ari_says=True, days_left=60)
+    summary = _summary()
+
+    assert manager._renew_if_due('ari.example.test', {}, summary) is True
+    assert summary['renewed'] == 1
+    assert summary['skipped_not_due'] == 0
+    assert summary['ari_advanced'] == 1
+    manager.renew_certificate.assert_called_once_with(
+        'ari.example.test', force=True)
+
+
+def test_the_counter_says_what_happened_not_what_was_tried():
+    """`ari_advanced` is what makes an early renewal attributable. Counted
+    before the attempt, it reported renewals that never happened — and still
+    would, for a renewal that fails."""
+    manager = _sweep_manager(needs_renewal=False, ari_says=True, days_left=60)
+    manager.renew_certificate.side_effect = RuntimeError('certbot exited 1')
+    summary = _summary()
+
+    assert manager._renew_if_due('ari.example.test', {}, summary) is False
+    assert summary['failed'] == 1
+    assert summary['ari_advanced'] == 0
+
+
+def test_the_threshold_path_is_not_forced():
+    """CONTROL. Only the renewal the CA asked for is forced. The threshold
+    path keeps asking certbot, so a threshold above certbot's 30 days behaves
+    exactly as before — that is a separate decision (#962, out of scope)."""
+    manager = _sweep_manager(needs_renewal=True, ari_says=False, days_left=20)
+    summary = _summary()
+
+    assert manager._renew_if_due('ari.example.test', {}, summary) is True
+    manager.renew_certificate.assert_called_once_with(
+        'ari.example.test', force=False)
+    manager._ari_says_renew.assert_not_called()
+    assert summary['ari_advanced'] == 0

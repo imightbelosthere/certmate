@@ -43,7 +43,19 @@ def utc_now_iso() -> str:
 # Constants for API token validation
 _MIN_TOKEN_LENGTH = 32  # Increased minimum for better security
 _MAX_TOKEN_LENGTH = 512
-_MIN_UNIQUE_CHARS = 12  # Increased for better entropy
+# Distinct characters, a floor and not a measure of strength. It used to be 12,
+# which a RANDOM token over a 16-symbol alphabet fails by chance: 1.70% of the
+# 32-character hex tokens `openssl rand -hex 16` makes have fewer than 12 (exact:
+# 1.7e-2), and a token refused here is refused at startup, so the service does not
+# come up. At 8 the same figure is 3.6e-8, and what the floor is for, a token built
+# from a handful of symbols, is still refused (and by the repetition check below).
+_MIN_UNIQUE_CHARS = 8
+# Share of a token's 3-character windows that must differ from each other. A token
+# made of a short unit repeated has few distinct windows (`abc` x21: 5%, a phrase
+# said twice: 53%); a random one has nearly all of them different (never under
+# 82.6% in 200,000 samples of each generator the documentation names, mostly
+# above 90%). 0.7 sits between the two with room on both sides.
+_MIN_TRIGRAM_VARIETY = 0.7
 # Placeholder and classic-weak values, matched as substrings anywhere in the
 # token. Deliberately NOT generic nouns: 'api', 'key', 'token', 'secret',
 # 'admin', 'test', 'demo', 'default' and 'example' used to be in this set, and
@@ -305,12 +317,16 @@ def validate_api_token(token: str) -> Tuple[bool, str]:
         return False, f"API token lacks character variety (must have at least {_MIN_UNIQUE_CHARS} unique characters)."
     
     # Additional security checks
-    # Check for repeating patterns
-    if len(token) >= 6:
-        for i in range(len(token) - 5):
-            pattern = token[i:i+3]
-            if token.count(pattern) > 2:
-                return False, "API token contains too many repeating patterns."
+    # Check for repetition. This counted how many times any one 3-character window
+    # occurs and refused the token at a third occurrence, which is not a property of
+    # a weak token: in 64 hex characters (62 windows over 4096 possible ones) some
+    # window turns up three times by chance in about 1 token in 580, and the token
+    # `openssl rand -hex 32` makes was refused at startup. What distinguishes a
+    # repetitive token is how FEW of its windows are different, so that is measured.
+    windows = len(token) - 2
+    distinct = len({token[i:i + 3] for i in range(windows)})
+    if distinct < windows * _MIN_TRIGRAM_VARIETY:
+        return False, "API token contains too many repeating patterns."
     
     # Check character type distribution for better entropy
     has_upper = any(c.isupper() for c in token)
@@ -409,7 +425,7 @@ _CERTBOT_STDERR_CREDENTIAL_LINE_RE = re.compile(
 # client-facing error message is consistent with the general policy of
 # not echoing internal paths.
 _CERTBOT_CONFIG_PATH_RE = re.compile(
-    r'(?i)(?:[\w\-./]+/)?letsencrypt/config/[A-Za-z0-9_\-.]+\.ini'
+    r'(?i)(?:[\w\-./]+/)?letsencrypt/config/[A-Za-z0-9_\-.]+\.(?:ini|json)'
 )
 
 # Hard cap on the sanitized stderr we surface to API clients. Certbot's
@@ -471,6 +487,15 @@ def classify_renewal_error(reason: str) -> tuple:
     pad with the sanitized reason.
     """
     low = (reason or '').lower()
+    if 'no private key anywhere' in low:
+        # ReissueRequired (#966): checked first, because a lineage with no
+        # key would otherwise read as the broken-config case below.
+        return (
+            "This certificate has no private key left to renew with (typically "
+            "after restoring a share-safe backup). Reissue it: that issues a "
+            "new key.",
+            'REISSUE_REQUIRED',
+        )
     broken_markers = ('parsefail', 'renewal configuration', 'is broken', 'to be a symlink')
     if any(marker in low for marker in broken_markers):
         return (
@@ -497,6 +522,11 @@ def classify_renewal_error(reason: str) -> tuple:
     return ('Certificate renewal failed', 'RENEWAL_FAILED')
 
 
+CERTBOT_OUTPUT_TRUNCATED = (
+    "\n[…truncated; certbot's full log is logs/letsencrypt.log in the "
+    "certificate's directory]")
+
+
 def sanitize_certbot_stderr(stderr_text: str) -> str:
     """Strip credential material from a certbot stderr blob before it
     is sent to an API client.
@@ -519,9 +549,10 @@ def sanitize_certbot_stderr(stderr_text: str) -> str:
       failures, hint URLs, exit codes — everything an operator needs
       to figure out why a renewal failed.
 
-    The full unredacted stderr is still written to the application log
-    (``logger.error``) at the call site; this helper only sanitises the
-    copy that flows into the API response.
+    Both call sites, create and renew, log this sanitised copy too: the
+    unredacted stderr is written nowhere. (This docstring used to say the
+    opposite, which is the sentence someone reads before "restoring" the raw
+    log line.)
     """
     if not stderr_text:
         return ''
@@ -529,7 +560,9 @@ def sanitize_certbot_stderr(stderr_text: str) -> str:
     text = _CERTBOT_STDERR_CREDENTIAL_LINE_RE.sub(lambda m: f'{m.group(1)} = [REDACTED]', text)
     text = _CERTBOT_CONFIG_PATH_RE.sub('<credential file>', text)
     if len(text) > _CERTBOT_STDERR_MAX_BYTES:
-        text = text[:_CERTBOT_STDERR_MAX_BYTES] + '\n[…truncated — see application log for full output]'
+        # Not "see the application log": that gets this same truncated copy.
+        # certbot's own debug log (--logs-dir) has the whole run.
+        text = text[:_CERTBOT_STDERR_MAX_BYTES] + CERTBOT_OUTPUT_TRUNCATED
     return text
 
 
@@ -585,7 +618,7 @@ def generate_secure_token(length: int = 40) -> str:
 # CERTBOT CONFIGURATION FILE CREATORS
 # =============================================
 
-def _create_config_file(plugin_name: str, content: str) -> Path:
+def _create_config_file(plugin_name: str, content: str, suffix: str = ".ini") -> Path:
     """Generic helper to create a per-operation credentials file.
 
     The filename carries a random suffix so two concurrent operations on the
@@ -598,7 +631,7 @@ def _create_config_file(plugin_name: str, content: str) -> Path:
     config_dir = Path("letsencrypt/config")
     config_dir.mkdir(parents=True, exist_ok=True)
 
-    config_file = config_dir / f"{plugin_name}-{secrets.token_hex(8)}.ini"
+    config_file = config_dir / f"{plugin_name}-{secrets.token_hex(8)}{suffix}"
     # Create the file 0600 ATOMICALLY: O_EXCL never follows a pre-planted
     # symlink at this (world-writable-dir) path, and the mode is set at open()
     # so the DNS-provider secret is never briefly world-readable under the
@@ -618,36 +651,24 @@ def create_route53_config(access_key_id: str, secret_access_key: str) -> Path:
     return _create_config_file("route53", content)
 
 def create_azure_config(subscription_id: str, resource_group: str, tenant_id: str, client_id: str, client_secret: str, zone_domain: Union[str, List[str]]) -> Path:
-    """Create Azure DNS credentials file for certbot-dns-azure (terrycain).
+    """Write the config ``azure_dns_hook`` reads, and return its path.
 
-    The plugin (certbot-dns-azure >= 2.x) expects:
+    Azure DNS-01 is answered by CertMate's own manual hook (``azure_dns_hook``),
+    not by ``certbot-dns-azure``, which has no release for certbot 4 or later
+    (#103). The file is JSON, 0600, one per operation, and removed by the caller
+    when the operation ends, like every other credentials file here.
 
-    * ``dns_azure_sp_client_id`` / ``dns_azure_sp_client_secret`` /
-      ``dns_azure_tenant_id`` — service principal credentials. Note the
-      ``sp_`` prefix; the older bare ``dns_azure_client_id`` keys that
-      certmate used previously are ignored and the plugin reports
-      "No authentication methods have been configured for Azure DNS".
-    * ``dns_azure_zoneN = <zone>:<azure-resource-id>`` — at least one
-      zone mapping. ``subscription_id`` and ``resource_group`` are NOT
-      top-level keys; they live inside the resource id of the zone line.
+    * the service principal: ``tenant_id``, ``client_id``, ``client_secret``;
+    * ``subscription_id`` and ``resource_group`` of the hosted zones;
+    * ``zones``: the hosted zones to choose from. The hook takes the longest one a
+      challenge name falls under, which is what lets a wildcard under a parent
+      hosted zone (``*.example2.example.com`` under ``example.com``) land in the
+      parent.
 
-    See ``certbot_dns_azure/_internal/dns_azure.py:_validate_credentials``
-    in v2.5.0 for the validation that drives this format.
-
-    ``zone_domain`` accepts two shapes:
-
-    * **str** — legacy single-zone usage. Writes one ``dns_azure_zone1``
-      line. Kept for callers (and tests) that haven't migrated to the
-      list form.
-    * **list[str]** — one ``dns_azure_zoneN`` per entry, in the order
-      given. The cert-issuance path passes the deduplicated longest-first
-      list returned by ``resolve_zones_for_domains`` so the plugin's
-      longest-prefix match selects the most specific hosted zone per
-      ACME challenge — that's what enables nested-subdomain wildcards
-      against a parent hosted zone (e.g. ``*.example2.example.com``
-      issued under hosted zone ``example.com``).
+    ``zone_domain`` is a single zone (``str``, the legacy shape kept for callers
+    that predate discovery) or a list of zones as
+    ``resolve_zones_for_domains`` returns them.
     """
-    zone_resource_id = f"/subscriptions/{subscription_id}/resourceGroups/{resource_group}"
     if isinstance(zone_domain, str):
         zone_list = [zone_domain]
     else:
@@ -656,18 +677,15 @@ def create_azure_config(subscription_id: str, resource_group: str, tenant_id: st
         raise ValueError(
             "create_azure_config requires at least one zone (received empty list)"
         )
-    zone_lines = ''.join(
-        f"dns_azure_zone{idx} = {zone}:{zone_resource_id}\n"
-        for idx, zone in enumerate(zone_list, start=1)
-    )
-    content = (
-        f"dns_azure_sp_client_id = {client_id}\n"
-        f"dns_azure_sp_client_secret = {client_secret}\n"
-        f"dns_azure_tenant_id = {tenant_id}\n"
-        f"dns_azure_environment = AzurePublicCloud\n"
-        f"{zone_lines}"
-    )
-    return _create_config_file("azure", content)
+    content = json.dumps({
+        'tenant_id': tenant_id,
+        'client_id': client_id,
+        'client_secret': client_secret,
+        'subscription_id': subscription_id,
+        'resource_group': resource_group,
+        'zones': zone_list,
+    })
+    return _create_config_file("azure", content, suffix=".json")
 
 def create_google_config(project_id: str, service_account_key: str) -> Path:
     """Write the Google Cloud DNS service-account JSON and return its path.
@@ -1066,6 +1084,72 @@ class DeploymentStatusCache:
 # certificates expired (#410).
 _CERTBOT_LINEAGE_FILES = ('cert.pem', 'chain.pem', 'fullchain.pem', 'privkey.pem')
 _ARCHIVE_VERSION_RE = re.compile(r'^(?P<stem>cert|chain|fullchain|privkey)(?P<n>\d+)\.pem$')
+
+
+def repair_certbot_renewal_paths(domain_dir: Union[str, Path], domain: str) -> bool:
+    """Point renewal/<domain>.conf at THIS lineage, not the one it came from.
+
+    certbot writes absolute paths into the conf: ``archive_dir``, the four
+    ``live/`` files, and ``config_dir`` / ``work_dir`` / ``logs_dir``. A backup
+    restored into another directory (``CERTMATE_CERT_DIR`` changed, bare metal
+    moved into the container, a second install on the same host) keeps the
+    original install's paths, and certbot follows them: measured in #966, it
+    evaluated the OTHER install's lineage and would have renewed those files.
+    Where the old path is gone, it is a parse failure every night instead.
+
+    The old domain directory is read off ``archive_dir``, and only when it has
+    the exact shape certbot gives it under CertMate, ``<dir>/<domain>/archive/
+    <domain>``. Anything else is left alone: certbot's own error is better
+    than a guessed repair. Only lines whose value starts with that old
+    directory are rewritten; the rest of the file is kept byte for byte.
+
+    Returns True when the conf was rewritten. Same untrusted-``domain``
+    precautions as :func:`repair_certbot_lineage_symlinks`, which runs next to
+    it on both the restore path and the renewal path.
+    """
+    shape_ok, _ = validate_domain(domain)
+    if not shape_ok:
+        return False
+    domain_dir = Path(domain_dir)
+    try:
+        base = domain_dir.resolve()
+        conf = (base / 'renewal' / f'{domain}.conf').resolve()
+        conf.relative_to(base)
+    except (OSError, ValueError):
+        return False
+    if not conf.is_file():
+        return False
+
+    text = conf.read_text(encoding='utf-8')
+    match = re.search(r'^archive_dir\s*=\s*(.+?)\s*$', text, re.MULTILINE)
+    if not match:
+        return False
+    suffix = f'/archive/{domain}'
+    archive_value = match.group(1)
+    if not archive_value.endswith(suffix):
+        return False
+    old_dir = archive_value[:-len(suffix)]
+    if Path(old_dir).name != domain or old_dir == str(base) or old_dir == str(domain_dir):
+        return False
+
+    new_dir = str(domain_dir)
+    changed = False
+    out = []
+    for line in text.splitlines(keepends=True):
+        key, sep, value = line.partition('=')
+        stripped = value.strip()
+        if sep and (stripped == old_dir or stripped.startswith(old_dir + '/')):
+            ending = '\n' if line.endswith('\n') else ''
+            line = f"{key}{sep} {new_dir}{stripped[len(old_dir):]}{ending}"
+            changed = True
+        out.append(line)
+    if not changed:
+        return False
+
+    tmp = conf.with_name(f'.{conf.name}.repath')
+    tmp.write_text(''.join(out), encoding='utf-8')
+    os.replace(tmp, conf)
+    return True
 
 
 def repair_certbot_lineage_symlinks(domain_dir: Union[str, Path], domain: str) -> bool:

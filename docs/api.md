@@ -140,6 +140,7 @@ rather than written by hand:
   "needs_renewal": false,
   "private_key_present": true,
   "private_key_state": "present",
+  "reissue_required": false,
   "usable": true,
   "dns_provider": "cloudflare",
   "domain_alias": null,
@@ -149,10 +150,21 @@ rather than written by hand:
   "challenge_type": "dns-01",
   "account_id": "default",
   "storage_warning": null,
+  "deployment_host": null,
+  "notes": null,
+  "tags": [],
   "deployment_port": null,
   "deployment_protocol": null,
   "created_at": "2026-09-01T10:14:02Z",
-  "renewed_at": "2026-09-14T02:31:55Z"
+  "renewed_at": "2026-09-14T02:31:55Z",
+  "renewal_info": {
+    "status": "window",
+    "checked_at": "2026-09-27T02:00:04Z",
+    "window_start": "2026-11-02T17:18:36Z",
+    "window_end": "2026-11-04T12:29:25Z",
+    "renew_at": "2026-11-03T08:41:10Z",
+    "explanation_url": null
+  }
 }
 ```
 
@@ -186,6 +198,7 @@ A certificate with no private key beside it cannot complete a handshake, and
 | `private_key_state` | `present`, `missing`, `mismatched`, `unknown`, or `external`. |
 | `private_key_present` | Whether a key was found. `null` when it was not looked for. |
 | `usable` | `exists` AND a matching key. `null` when the storage backend does not fetch key material on this path and says so, which today means Azure Key Vault. |
+| `reissue_required` | No private key anywhere: not served, not in `live/`, not in any archived generation. This is what restoring a share-safe backup leaves. Renewal refuses it with `REISSUE_REQUIRED`, and [`POST /api/certificates/reissue-keyless`](#reissue-every-certificate-that-lost-its-key) repairs it. A key missing only from the served copy is `false`, because renewal republishes it from the lineage. Since API contract **2.28**. |
 
 `mismatched` is a certificate from one issuance sitting beside a key from
 another: the two are compared, not assumed to match. `external` is a CSR-only
@@ -196,6 +209,62 @@ does not force renewal.
 `missing` and `mismatched` force `needs_renewal`, because a certificate that
 cannot serve TLS has nothing to wait for. Restoring a share-safe backup
 produces certificates with no key, which is the case this exists for.
+
+##### When will it renew?
+
+`renewal_info` is what the CA said, per certificate, through ACME Renewal
+Information ([RFC 9773](https://www.rfc-editor.org/rfc/rfc9773.html)) at the
+last renewal sweep. It is read from a record the sweep keeps beside the
+certificate, never fetched from the CA when you call this endpoint. It is
+`null` until a sweep has asked, and again right after a renewal until the next
+sweep asks about the new certificate.
+
+| `status` | meaning |
+| :--- | :--- |
+| `window` | The CA suggested a window. `renew_at` is the instant inside it at which the sweep renews this certificate, if the configured threshold has not already. |
+| `unsupported` | The CA publishes no `renewalInfo`. That does not change from one sweep to the next. |
+| `unavailable` | The CA publishes it, and the last sweep got no usable answer. If this lasts, look at the CA. |
+| `no_identifier` | The certificate has no Authority Key Identifier, so ARI cannot name it. Common on hand-made private-CA certificates. |
+| `disabled` | `ari_enabled` is `false` in settings. Nothing is asked. |
+
+The timestamps are RFC 3339 UTC with a `Z`. `explanation_url` is the page the
+CA attached to the window, when it gave one; only `https` URLs are kept. The
+window can only bring a renewal forward: the threshold stays the backstop.
+Available since API contract **2.23**.
+
+#### Reissue every certificate that lost its key
+
+**Endpoint**: `POST /api/certificates/reissue-keyless` — operator
+
+Restoring a share-safe backup leaves certificates with **no private key
+anywhere** (a renewal of one answers `REISSUE_REQUIRED`). This queues a reissue
+for each of them, with the configuration its metadata records, at a pace: at
+most `limit` per call (default 10, at most 50) on the async executor, which
+runs two at a time. Call it again for the rest once the queued jobs finish.
+
+```json
+{ "limit": 10 }
+```
+
+Answers `202` when something was queued, `200` when there was nothing to do:
+
+```json
+{
+  "queued": [{"domain": "a.example.com", "job_id": "…", "status_url": "/api/certificates/jobs/…"}],
+  "remaining": ["k.example.com"],
+  "refused": [{"domain": "x.example.com", "reason": "out of scope"}],
+  "next_step": "1 more certificate(s) need a reissue. Call this again once the queued jobs finish."
+}
+```
+
+A scoped API key only sees and reissues its own domains. A full queue stops
+the loop, and what was not queued is in `remaining`. With async issuance off
+the answer is `503 ASYNC_ISSUANCE_DISABLED`. Since API contract **2.27**.
+
+For an unattended instance, `"auto_reissue_keyless": true` in `settings.json`
+lets the nightly renewal sweep do this itself, at most
+`auto_reissue_keyless_per_sweep` per sweep (default 5, clamped 1-50). It is
+off by default, because a reissue changes the key and deploy hooks ship it.
 
 #### Turn automatic renewal on or off
 
@@ -210,6 +279,49 @@ A missing `enabled` is `400 AUTO_RENEW_FLAG_REQUIRED`; a domain that is not
 tracked in settings is `404 DOMAIN_NOT_IN_SETTINGS`, because only those have a
 renewal flag to toggle. The change is audited and published on the event
 stream as `certificate_auto_renew_changed`.
+
+#### Change a certificate's probe, notes or tags
+
+**Endpoint**: `PATCH /api/certificates/<domain>` — operator
+
+```json
+{
+  "notes": "Order 4711, installed by hand on lb-2",
+  "tags": ["production", "customer-x", "loadbalancer"]
+}
+```
+
+Send only what should change. A key that is absent is left alone; `null` removes
+it. The same request also carries the DNS provider fields
+(`dns_provider`, `account_id`, `alias_dns_provider`) and the deployment probe
+(`deployment_host`, `deployment_port`, `deployment_protocol`), and at least one
+of them is required.
+
+`notes` and `tags` record what CertMate cannot know on its own: where a
+certificate was installed by hand, which ticket it was issued for, who owns it.
+They are returned by `GET /api/certificates` and `GET /api/certificates/<domain>`
+(`notes` is `null` and `tags` is `[]` when there is nothing), shown in the
+dashboard, and searched by the ⌘K palette. They stay with the certificate
+through renewal, Edit & Reissue and backup restore, and every change is written
+to the audit log.
+
+- `notes` is free text of up to 2,000 characters, with no control characters
+  other than a line break or a tab. An empty note removes it. The audit log
+  records that a note was set and how long it is, not what it says.
+- `tags` is a list of at most 20 tags. A tag is 1-32 characters from letters,
+  digits and `. _ - : /`, starting with a letter or a digit, and is stored in
+  lower case, so `Prod` and `prod` are one tag. The audit log records the tags
+  before and after. An empty list removes them.
+
+A value that does not fit is `400` with the reason, and nothing is changed,
+including the other keys in the same request. Answers
+`{"message", "domain", "dns_provider", "alias_dns_provider", "account_id"}` plus
+the probe fields or `notes` and `tags` when the request named them. Since API
+contract **2.33**; `deployment_host` is returned by the certificate reads from the
+same version, where it had been accepted here and never shown.
+
+Tags reach [deploy hooks](deploy-hooks.md#environment-variables-passed-to-your-command)
+as `CERTMATE_TAGS`.
 
 #### Check DNS-01 alias records
 
@@ -892,6 +1004,12 @@ explicitly changed (no key flags are sent and certbot keeps the lineage key).
 - `san_domains`: replacement SAN set — omit to keep, `[]` to drop every SAN
 - `domain_alias`: omit to keep, `""` to clear
 - `dns_provider`, `account_id`, `ca_provider`, `challenge_type`: omit to keep
+- `challenge_type`: `dns-01`, `http-01`, or `prevalidated` (Sectigo only: the
+  SCM account must already authorize every name, and no DNS provider, account
+  or alias may be given; see [CA providers](ca-providers.md)). Since API
+  contract **2.29**.
+- the CA account the certificate was issued under is kept when `ca_provider`
+  does not change; before 2.29 a reissue used the CA's default account.
 - `key_type`/`key_size`/`elliptic_curve`: omit to keep the existing key shape
 - `async`: defer issuance to a background job (202 + job id, poll `GET /api/certificates/jobs/<job_id>`)
 
@@ -1287,6 +1405,20 @@ does not make an instance into a source of traffic.
 
 What ran, when, and whether it succeeded.
 
+#### Preview a webhook deploy target
+
+**Endpoint**: `POST /api/deploy/targets/preview` — admin, since API contract **2.34**
+
+Send a target of type `webhook` (the body you would put in `deploy_hooks.targets`)
+and get back what it would send: the method, the destination host and path, the
+header names (credentials masked), the body rendered against an **example**
+certificate and key (`body`), the destination (`host`, `port`, `path`), the files a
+delivery would read (`files_needed`), how the server is verified, and whether the
+private key is part of it (`sends_private_key`, `key_variables`). It sends nothing and reads no file, so it
+is safe to call before confirming a destination. The target is validated first,
+and a refusal is a `400` with the reason. See
+[Webhook target](deploy-hooks.md#webhook-target-deliver-the-certificate-and-optionally-the-key).
+
 #### Deploys waiting for a window
 
 **Endpoint**: `GET /api/deploy/pending` — admin
@@ -1413,9 +1545,16 @@ without being handed the credential. It is derived on read and ignored on write;
 sending it back changes nothing. `GET /api/settings`, which the viewer role may
 read, carries no `url_hint` and masks the URL whole.
 
-Secrets are matched to their stored values by `(type, name)`. Changing either of
-those in the same save that leaves a secret masked drops it — see
-[#950](https://github.com/fabriziosalmi/certmate/issues/950).
+Each webhook carries an `id`, assigned by CertMate and returned on every read.
+Since API contract **2.21** it is what a masked secret is matched back to on
+save, so renaming a webhook or changing its type keeps its URL, its token and
+its custom headers. Echo it back unchanged; a submission carrying an `id` that
+names no stored webhook is treated as a new one and inherits nothing. A webhook
+sent without an `id` still matches on `(type, name)`, which is what
+configurations written before 2.21 have, and what they had before.
+
+Existing configurations are given ids the first time CertMate loads them, so
+there is nothing to do on upgrade.
 
 #### Send a test message
 
@@ -1490,6 +1629,17 @@ it would stay valid once setup is complete. Enable local authentication (or set
 same `409` for any user after the first one while setup is incomplete: the
 first admin is the bootstrap.
 
+The first admin closes setup: creating it while the instance is in setup mode
+also enables local authentication, and the response says so with
+`"local_auth_enabled": true`. A separate `POST /api/auth/config` is no longer
+needed (on an instance already closed it answers `401`).
+
+Until setup is complete, the anonymous admin is also refused, with the same
+`409 SETUP_BOOTSTRAP_ONLY`, anything that outlives setup or carries private
+keys away: deploy-hook changes, tests and runs, certificate and key downloads,
+and backup creation and download. Restoring and uploading a backup stay
+allowed, since that is how an instance is recovered onto a fresh host.
+
 #### Revoke an API key
 
 **Endpoint**: `DELETE /api/keys/<key_id>` — admin
@@ -1522,7 +1672,7 @@ an unknown key (`404 API_KEY_NOT_FOUND`).
 
 #### Test a CA provider
 
-**Endpoint**: `POST /api/settings/test-ca-provider` — operator
+**Endpoint**: `POST /api/settings/test-ca-provider` — admin (operator before API contract 2.31)
 
 Checks that the configured ACME directory answers, before an issuance depends
 on it.
@@ -1559,7 +1709,7 @@ perfectly healthy from everywhere else.
 
 #### Test a backend before committing to it
 
-**Endpoint**: `POST /api/storage/test` — operator
+**Endpoint**: `POST /api/storage/test` — admin (operator before API contract 2.31)
 
 Opens a connection with the credentials given and reports whether they work,
 without storing them. Worth doing before `POST /api/storage/config`: a backend
@@ -1603,6 +1753,15 @@ one that can actually restore, encrypted at rest.
 **Endpoint**: `DELETE /api/backups/delete/<backup_type>/<filename>` — admin
 
 Only unified backups can be restored.
+
+A successful restore answers with `reissue_required`: the certificates that came
+back **without a private key**, which is every certificate in a share-safe
+archive, and never a CSR-only one, whose key was never here. The list is empty
+after a full restore. When it is not, `next_step` says what to do: re-enter
+the DNS provider credentials (a share-safe archive masks them), then reissue
+each listed certificate. Until then they cannot serve TLS. These fields are
+there since API contract **2.25**; since **2.26** a renewal of such a
+certificate answers `REISSUE_REQUIRED` rather than trying.
 
 #### Upload one taken elsewhere
 
@@ -1715,6 +1874,7 @@ and may be reworded.
 | `ACME_RATE_LIMITED` | 422 | The CA refused because a rate limit was reached — waiting is the fix, retrying is the cause |
 | `CERTIFICATE_CREATION_FAILED` / `CERTIFICATE_REISSUE_FAILED` / `CERTIFICATE_REISSUE_REJECTED` | 422 | Issuance was attempted and refused |
 | `RENEWAL_CONFIG_BROKEN` | 422 | certbot's renewal config for this lineage no longer resolves; reissue |
+| `REISSUE_REQUIRED` | 422 | The certificate has no private key left anywhere to renew with (typically after restoring a share-safe backup); only a reissue repairs it |
 | `DNS_ACCOUNT_NOT_CONFIGURED` | 422 | The DNS account this certificate uses is gone from settings |
 | `ISSUANCE_QUEUE_FULL` | 429 | Too much async issuance is already queued or running; the body carries the depth and the limit |
 | `ADOPTION_UNAVAILABLE` | 503 | Discovery/adoption is not available on this build |
@@ -1827,7 +1987,11 @@ key with `is_agent: true` (a checkbox on Settings → API Keys, or `is_agent` in
 ### Reading the audit log over the API
 
 `GET /api/activity?limit=N` returns the most recent entries (admin/viewer,
-bounded to 500).
+bounded to 500), **newest first**. Since API contract **2.22** that ordering is
+stated rather than merely observed: the code always documented it and did the
+opposite, so the page opened on the oldest entry in the log. `limit` selects
+the window — the most recent N — and the direction within it is newest to
+oldest. `GET /api/web/audit-logs` answers the same way.
 
 It can also be **narrowed**, by any of `operation`, `resource_type`,
 `resource_id`, `user` and `status`:

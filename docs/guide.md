@@ -388,7 +388,9 @@ The 30-day threshold is CertMate's opinion, and it is the same opinion for
 every certificate and every CA. Since [RFC 9773](https://www.rfc-editor.org/rfc/rfc9773.html)
 a CA can publish its own, per certificate: a `renewalInfo` endpoint answering a
 window during which it wants that certificate replaced. Let's Encrypt serves
-one in production; so does step-ca, for a private CA.
+one, in production and on staging. step-ca does not yet (0.30.2, measured; see
+smallstep/certificates#2162), so on a private step-ca the threshold decides
+alone and the certificate panel says the CA does not publish a window.
 
 The TLS renewal sweep asks. For every certificate the threshold has **not**
 already called due, CertMate fetches the CA's window and renews now if that
@@ -410,6 +412,16 @@ want all of its clients renewing at once.
 The sweep summary counts these as `ari_advanced`, so a renewal your
 configuration does not explain is attributable.
 
+The certificate's detail panel shows what the CA said at the last sweep, under
+**CA renewal window**: the window, the instant inside it at which CertMate
+renews, and the CA's explanation link when it gave one. When there is no
+window it says which absence it is: the CA publishes none, the CA did not
+answer at the last check, or the certificate cannot be named in ARI. The same
+record is returned as `renewal_info` by `GET /api/certificates/<domain>`. It is
+read from what the sweep kept, so opening the dashboard never sends a request
+to the CA. Right after a renewal it reads "Not checked yet" until the next
+sweep asks about the new certificate.
+
 Set `"ari_enabled": false` in `settings.json` to turn it off; it is on by
 default and costs one unauthenticated GET per certificate per sweep, plus one
 per CA per hour for the directory.
@@ -418,6 +430,31 @@ Not yet done, and deliberately: letting ARI *defer* a renewal past your
 threshold. That is the half that matters for short-lived certificates, where a
 fixed 30-day rule is meaningless against a 6-day certificate — it arrives with
 the profile support those certificates need.
+
+### A threshold above 30 days
+
+certbot has a renewal gate of its own: without being forced, it renews only
+inside 30 days of expiry. Before 2.40 CertMate asked it unforced, so a
+`renewal_threshold_days` of 45 behaved as 30, and the sweep counted the gap as
+`skipped_not_due` every night.
+
+When the threshold, and only the threshold, calls a certificate due while
+certbot would refuse, CertMate now forces the renewal, as it already did for a
+window the CA published. Inside the last 30 days nothing changes. Two guards
+come with it:
+
+- **At most `early_renewals_per_sweep` a sweep** (default 10, between 1 and
+  50). Raising the threshold on a large estate spreads the early renewals over
+  several nights instead of sending every order to the CA in one. The sweep
+  summary counts them as `early_forced`, and the ones left for the next sweep
+  as `early_deferred`.
+- **A certificate issued less than 7 days ago is never forced.** A threshold at
+  or above the certificate's lifetime would otherwise call it due forever. With
+  this guard it costs at most one renewal a week, not one a night.
+
+A certificate that needs attention for another reason, a served key that is
+missing or does not match, is not forced: it is repaired from its lineage
+without a new key.
 
 ### Enabling Auto-Renewal
 

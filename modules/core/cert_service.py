@@ -16,8 +16,10 @@ denial can be audited here and raised as :class:`DomainOutOfScope`, which the
 adapters map to HTTP 403.
 """
 import logging
+import time
 
 from .structured_logging import scrub_log_value
+from .cert_labels import normalize_notes, normalize_tags
 from .constants import PROBE_PROTOCOLS
 from .csr_issuance import CSRError, csr_domains, read_csr
 from .utils import validate_domain, validate_key_options
@@ -271,7 +273,12 @@ class CertificateService:
             ca_provider = settings.get('default_ca', 'letsencrypt')
         if not challenge_type:
             challenge_type = settings.get('challenge_type', 'dns-01')
-        if challenge_type != 'http-01' and not dns_provider:
+        if challenge_type == 'prevalidated':
+            if ca_provider != 'sectigo':
+                raise ValueError('Prevalidated ACME is available only for Sectigo')
+            if dns_provider or account_id or domain_alias or alias_dns_provider:
+                raise ValueError('Prevalidated ACME does not use DNS providers, accounts or aliases')
+        if challenge_type not in ('http-01', 'prevalidated') and not dns_provider:
             dns_provider = settings.get('dns_provider')
             if not dns_provider:
                 raise ValueError('No DNS provider specified')
@@ -304,6 +311,18 @@ class CertificateService:
         ``DomainOperationInProgress`` (409), ``RuntimeError`` or
         ``FileExistsError``.
         """
+        return self._issue_create(prepared, register=True)
+
+    def _issue_create(self, prepared, *, register):
+        """Issue one certificate, audit it, announce it: what every create owes.
+
+        ``register=False`` leaves the settings entry to the caller: a batch
+        registers all its domains in ONE write, because every settings save
+        takes a full unified backup (settings plus every certificate) and one
+        write per domain would zip the whole store N times. Everything else,
+        the account, the audit record and the event, is this method's, so a
+        batch cannot skip any of it again (#666, D9).
+        """
         domain = prepared['domain']
         audit_ctx = prepared.get('_audit_ctx')
         try:
@@ -326,15 +345,14 @@ class CertificateService:
 
             # Append the new domain under the settings manager's lock so two
             # parallel creates for different domains cannot race and drop an entry.
-            resolved_dns_provider = prepared['dns_provider'] or prepared['_settings_dns_provider']
-            self._settings.update(
-                _make_add_domain(domain, resolved_dns_provider, prepared['account_id']),
-                'certificate_created',
-            )
+            if register:
+                self._settings.update(_add_domain_entry(prepared), 'certificate_created')
         except Exception as e:
             self._audit_emit(audit_ctx, 'create', domain, 'failure', error=e)
             raise
-        logger.info("Ensured domain %s is in settings after certificate creation", _scrub_log(domain))
+        if register:
+            logger.info("Ensured domain %s is in settings after certificate creation",
+                        _scrub_log(domain))
         self._audit_emit(audit_ctx, 'create', domain, 'success', details={
             'ca_provider': prepared.get('ca_provider'),
             'challenge_type': prepared.get('challenge_type'),
@@ -347,6 +365,80 @@ class CertificateService:
             'ca_provider': result.get('ca_provider'),
         })
         return result
+
+    def create_batch(self, *, domains, dns_provider=None, account_id=None,
+                     ca_provider=None, ca_account_id=None, challenge_type=None,
+                     user=None, ip_address=None, audit_ctx=None):
+        """Create a certificate per domain; register them in one write.
+
+        Each domain goes through ``prepare_create`` and ``_issue_create``, the
+        same steps as a single create: normalisation, the scope check and its
+        audit record, the settings defaults, the account the caller named, the
+        success/failure audit and the ``certificate_created`` event. The batch
+        route used to call the manager directly and re-implement a subset of
+        this, and dropped ``account_id`` on the way to issuance (#666, D9).
+
+        One domain's failure does not stop the rest. Per-item messages are
+        fixed strings, never exception text. Returns one result dict per
+        non-empty entry, in order.
+        """
+        results, created = [], []
+        # Request names, a list of strings: not the settings' domain-entry
+        # union, which only domain_entries.py decodes.
+        for requested in domains:
+            raw = requested.strip() if isinstance(requested, str) else ''
+            if not raw:
+                continue
+            # The message a caller sees for a bad name, stated from the
+            # validator rather than from an exception's text.
+            ok, reason = validate_domain(raw)
+            if not ok:
+                results.append({'domain': raw, 'success': False,
+                                'message': f'Invalid domain: {reason}'})
+                continue
+            try:
+                prepared = self.prepare_create(
+                    domain=raw, dns_provider=dns_provider, account_id=account_id,
+                    ca_provider=ca_provider, ca_account_id=ca_account_id,
+                    challenge_type=challenge_type, user=user,
+                    ip_address=ip_address, audit_ctx=audit_ctx)
+            except DomainOutOfScope:
+                results.append({'domain': reason, 'success': False,
+                                'message': 'API key not authorized for this domain'})
+                continue
+            except ValueError as e:
+                logger.info("Batch create rejected %s: %s", _scrub_log(reason), e)
+                results.append({'domain': reason, 'success': False,
+                                'message': 'Invalid certificate request'})
+                continue
+            try:
+                self._issue_create(prepared, register=False)
+            except Exception as e:
+                logger.warning("Batch create failed for %s: %s", _scrub_log(reason),
+                               str(e).replace('\n', ' ').replace('\r', ' '))
+                results.append({'domain': reason, 'success': False,
+                                'message': 'Certificate creation failed'})
+                continue
+            created.append(prepared)
+            results.append({'domain': reason, 'success': True,
+                            'message': 'Certificate created'})
+
+        if created:
+            mutators = [_add_domain_entry(p) for p in created]
+
+            def _register_all(s):
+                for add in mutators:
+                    add(s)
+
+            try:
+                self._settings.update(_register_all, 'certificate_created')
+            except Exception as e:
+                # The certificates exist; losing the tracking would drop them
+                # out of the renewal loop in silence. Said loudly instead.
+                logger.error(
+                    "Batch certificates created but registering them for renewal "
+                    "failed (%d domains may not auto-renew): %s", len(created), e)
+        return results
 
 
     # ------------------------------------------------------------------
@@ -434,6 +526,27 @@ class CertificateService:
                             '(no scheme, path, whitespace, or wildcard)')
                     metadata['deployment_host'] = host
 
+            # Notes and tags (#1043), under the same absent-versus-null rule as
+            # the probe keys: absent leaves them alone, null (or an empty note
+            # or list) removes them. They are validated in cert_labels, which the
+            # deploy-hook path also reads from, so the two cannot disagree on
+            # what a tag is.
+            if 'notes' in changes:
+                notes = changes['notes']
+                notes = normalize_notes(notes) if notes is not None else ''
+                if notes:
+                    metadata['notes'] = notes
+                else:
+                    metadata.pop('notes', None)
+
+            if 'tags' in changes:
+                tags = changes['tags']
+                tags = normalize_tags(tags) if tags is not None else []
+                if tags:
+                    metadata['tags'] = tags
+                else:
+                    metadata.pop('tags', None)
+
             # write_metadata, not _save_metadata: this is the one call site
             # whose outcome reaches a person, and the boolean threw the reason
             # away. "Failed to update metadata for domain: X" was produced by
@@ -461,9 +574,16 @@ class CertificateService:
             # callback anywhere acquires a domain lock, so the reverse order
             # does not exist and this cannot deadlock. Anything that adds one
             # would have to take the domain lock first.
-            self._settings.update(
-                lambda s: self._write_domain_provider(s, domain, changes),
-                'dns_provider_change')
+            #
+            # Only when a DNS field actually changed. Every settings save takes
+            # a backup and counts against retention, so a note or a tag edit,
+            # which has nothing to mirror, must not write settings.json at all:
+            # tagging fifty certificates would otherwise leave fifty backups
+            # named for a DNS provider change that never happened.
+            if changes.get('dns_provider') or changes.get('account_id'):
+                self._settings.update(
+                    lambda s: self._write_domain_provider(s, domain, changes),
+                    'dns_provider_change')
 
         return metadata, old_dns_provider
 
@@ -529,6 +649,27 @@ class CertificateService:
                 self._enforce_scope(name, scope_action, user, ip_address)
         return csr_names
 
+    def keyless_domains(self, user=None):
+        """The certificates whose lineage lost every private key (#966).
+
+        The same test the renewal path uses to answer REISSUE_REQUIRED, so
+        "what needs reissuing" and "what renewal refuses" cannot disagree.
+        Filtered to the caller's scope before anything is attempted, so a
+        scoped key neither sees nor probes another tenant's domains.
+        """
+        from .certificates import CertificateManager
+        from .constants import iter_cert_domain_dirs
+
+        scope = (user or {}).get('allowed_domains')
+        found = []
+        for domain_dir in iter_cert_domain_dirs(self._certs.cert_dir):
+            domain = domain_dir.name
+            if not self._auth.domain_matches_scope(domain, scope):
+                continue
+            if CertificateManager._lineage_lost_its_key(domain_dir, domain):
+                found.append(domain)
+        return sorted(found)
+
     def prepare_reissue(self, *, domain, san_domains=None, dns_provider=None,
                         account_id=None, ca_provider=None, challenge_type=None,
                         domain_alias=None, alias_dns_provider=None,
@@ -568,6 +709,8 @@ class CertificateService:
             )
 
         metadata = self._certs._load_metadata(domain)
+        dns_provider_was_named = dns_provider is not None
+        dns_account_was_named = account_id is not None
 
         # Whether the caller NAMED a SAN set, recorded before inheritance
         # rewrites it. With a CSR the distinction is the whole thing: naming
@@ -640,7 +783,14 @@ class CertificateService:
             ca_provider = settings.get('default_ca', 'letsencrypt')
         if not challenge_type:
             challenge_type = settings.get('challenge_type', 'dns-01')
-        if challenge_type != 'http-01' and not dns_provider:
+        if challenge_type == 'prevalidated':
+            if ca_provider != 'sectigo':
+                raise ValueError('Prevalidated ACME is available only for Sectigo')
+            if (dns_provider_was_named and dns_provider) or (dns_account_was_named and account_id) or domain_alias:
+                raise ValueError('Prevalidated ACME does not use DNS providers, accounts or aliases')
+            dns_provider = None
+            account_id = None
+        if challenge_type not in ('http-01', 'prevalidated') and not dns_provider:
             dns_provider = settings.get('dns_provider')
             if not dns_provider:
                 raise ValueError('No DNS provider specified')
@@ -651,6 +801,7 @@ class CertificateService:
             'dns_provider': dns_provider,
             'account_id': account_id,
             'ca_provider': ca_provider,
+            'ca_account_id': metadata.get('ca_account_id') if ca_provider == metadata.get('ca_provider') else None,
             'domain_alias': domain_alias,
             'alias_dns_provider': alias_dns_provider,
             'san_domains': san_domains,
@@ -679,6 +830,7 @@ class CertificateService:
                 dns_provider=prepared['dns_provider'],
                 account_id=prepared['account_id'],
                 ca_provider=prepared['ca_provider'],
+                ca_account_id=prepared.get('ca_account_id'),
                 domain_alias=prepared['domain_alias'],
                 alias_dns_provider=prepared['alias_dns_provider'],
                 san_domains=prepared['san_domains'],
@@ -691,19 +843,32 @@ class CertificateService:
             )
 
             # Idempotent: repairs the settings entry if it ever went missing.
-            resolved_dns_provider = prepared['dns_provider'] or prepared['_settings_dns_provider']
+            resolved_dns_provider = (None if prepared['challenge_type'] == 'prevalidated' else
+                                     prepared['dns_provider'] or prepared['_settings_dns_provider'])
             self._settings.update(
                 _make_add_domain(domain, resolved_dns_provider, prepared['account_id']),
                 'certificate_reissued',
             )
         except Exception as e:
             self._audit_emit(audit_ctx, 'reissue', domain, 'failure', error=e)
+            # The same rule as issue_renew: a busy domain is a queue and a
+            # missing certificate is a 404, neither pages anyone. Published
+            # HERE and nowhere else: the sync route and the async executor
+            # each kept their own copy, which is how create and renew came to
+            # announce themselves twice (tests/test_one_issuance_one_event.py).
+            from .certificates import DomainOperationInProgress
+            if not isinstance(e, (DomainOperationInProgress, FileNotFoundError)):
+                self._publish('certificate_failed',
+                              {'domain': domain, 'error': str(e)})
             raise
         self._audit_emit(audit_ctx, 'reissue', domain, 'success', details={
             'ca_provider': prepared.get('ca_provider'),
             'challenge_type': prepared.get('challenge_type'),
             'san_count': len(prepared.get('san_domains') or []),
         })
+        # A reissue refreshes the domain's certificate: consumers (deploy
+        # hooks, notifications) react exactly as they do for a renewal.
+        self._publish('certificate_renewed', {'domain': domain})
         return result
 
     def renew(self, *, domain, force=False, user=None, ip_address=None, audit_ctx=None):
@@ -736,6 +901,7 @@ class CertificateService:
         """
         domain = prepared['domain']
         audit_ctx = prepared.get('_audit_ctx')
+        started = time.monotonic()
         try:
             result = self._certs.renew_certificate(domain, force=force)
         except Exception as e:
@@ -745,10 +911,15 @@ class CertificateService:
             # publishing `certificate_failed` for either would page someone
             # for a queue. Only what the CA or the configuration refused,
             # and what broke inside CertMate, is an event.
-            from .certificates import DomainOperationInProgress
+            from .certificates import DomainOperationInProgress, ReissueRequired
             if not isinstance(e, (DomainOperationInProgress, FileNotFoundError)):
                 self._publish('certificate_failed',
                               {'domain': domain, 'error': str(e)})
+            # The metric follows the sweep's rule: a certificate that needs a
+            # reissue did not fail to renew, renewal was never the remedy.
+            if not isinstance(e, (DomainOperationInProgress, FileNotFoundError,
+                                  ReissueRequired)):
+                self._record_renewal(domain, False, started, e)
             raise
         self._audit_emit(audit_ctx, 'renew', domain, 'success',
                          details={'force': bool(force)})
@@ -757,7 +928,35 @@ class CertificateService:
         # behaviour for older manager results without the flag.
         if bool(result.get('renewed', True)):
             self._publish('certificate_renewed', {'domain': domain})
+            self._record_renewal(domain, True, started)
         return result
+
+    def _record_renewal(self, domain, success, started, error=None):
+        """Feed the renewal metrics for a renewal run on request (#666 D7).
+
+        They were fed by the nightly sweep only, so a renewal an operator ran
+        by hand, including the one the CA refused for a rate limit, left no
+        trace in Prometheus. The sweep calls the manager directly and records
+        its own, so nothing is counted twice.
+        """
+        # Telemetry must not turn a renewal that happened into an error: the
+        # metadata read is the one step here that can raise (the recorder
+        # swallows its own), and without it the label is 'unknown'.
+        try:
+            metadata = self._certs._load_metadata(domain) or {}
+        except OSError:
+            metadata = {}
+        self._certs._record_renewal_metrics(
+            domain, metadata, success, time.monotonic() - started, error=error)
+
+
+def _add_domain_entry(prepared):
+    """The settings entry a prepared create registers, as one mutator."""
+    return _make_add_domain(
+        prepared['domain'],
+        (None if prepared['challenge_type'] == 'prevalidated' else
+         prepared['dns_provider'] or prepared['_settings_dns_provider']),
+        prepared['account_id'])
 
 
 def _make_add_domain(domain, dns_provider, account_id):

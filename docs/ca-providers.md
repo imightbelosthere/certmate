@@ -136,6 +136,17 @@ Select an account using `ca_account_id` on the certificate creation API; if
 omitted, CertMate uses `default_ca_accounts.sectigo` or the first configured account.
 Renewal reuses the recorded CA account. DNS-01 (including Custom Script) and
 HTTP-01 remain available; SCM may already have authorized the requested domain.
+For an SCM account that already authorizes **every** requested name, select
+**Sectigo → Sectigo (already authorized in SCM)** as the certificate challenge
+type. CertMate does not configure DNS or HTTP validation in that mode, and a
+wildcard can be requested if that SCM account/profile authorizes it. Certbot
+uses its manual authenticator with a non-publishing hook only to satisfy its
+non-interactive requirement: when the CA returns valid ACME authorizations,
+the hook is never called. If SCM returns a pending authorization, the hook
+publishes no validation material, so CertMate cannot satisfy it in this mode.
+Use DNS-01 or HTTP-01 when the names are not already authorized. Before
+renewal, the same account must still be authorized in SCM.
+This mode is available only when Sectigo is selected explicitly as the CA.
 Existing Sectigo configurations under Private CA continue to work unchanged.
 
 ### Private CA
@@ -168,10 +179,11 @@ The Private CA entry is also the generic escape hatch for any ACME CA without a 
 
 1. Navigate to **Settings**
 2. Scroll to **Certificate Authority (CA) Providers**
-3. Select your default CA provider
+3. Click **Add CA Account**, choose the CA and name the account (letters,
+   digits, dots, dashes and underscores)
 4. Configure the required fields
 5. Click **Test CA Connection** to check the fields
-6. Save settings
+6. Click **Save Account**
 
 **Test CA Connection** only contacts the CA for a Private CA: it fetches the
 ACME directory URL (using the CA certificate, if one is given). For every other
@@ -181,14 +193,22 @@ passing test does not prove the credentials work. The first issuance does.
 
 ### Account email
 
-The email certbot registers the ACME account with is the global `email`
-setting, whichever CA issues the certificate. Saving settings in the web
-interface copies the email from the **default** CA's section into that setting;
-the email fields of the other CA sections are stored but not passed to
-certbot. Issuance fails with `Email not configured` when the global setting is
-empty.
+Certbot uses the email of the selected CA account for new issuance, falling
+back to the global `email` setting when that account has none. The global email
+remains required for issuance. Changing an account's email does not update an
+ACME account already registered by Certbot; use `certbot update_account` for
+that contact change.
 
 ### Default vs. Per-Certificate CA
+
+Settings → CA Providers lists CA accounts (for example, two Let's Encrypt
+emails or two Sectigo SCM accounts). **Add CA Account** opens the account form;
+**Edit** reopens it. Select **Default for this CA** on one account per provider;
+**Make global default** also chooses the provider used for new certificates.
+Existing single-account configurations are retained as the `default` account
+when another account is added. Deleting an account leaves its other CA accounts
+intact; switch the default or reissue certificates using that account before
+deleting it.
 
 Set a default CA for all new certificates. Override it per-certificate during creation:
 

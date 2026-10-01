@@ -1,6 +1,6 @@
 # CertMate Certificats Clients - Guide d'utilisation
 
-<!-- CERTMATE-TRANSLATED-FROM c9f680a52f9eca05 -->
+<!-- CERTMATE-TRANSLATED-FROM f31f91fe8af58072 -->
 
 ## Vue d'ensemble
 
@@ -390,8 +390,10 @@ Le seuil de 30 jours est l'avis de CertMate, et c'est le meme avis pour chaque
 certificat et chaque CA. Depuis la [RFC 9773](https://www.rfc-editor.org/rfc/rfc9773.html)
 une CA peut publier le sien, par certificat : un endpoint `renewalInfo` qui
 repond par une fenetre pendant laquelle elle souhaite voir ce certificat
-remplace. Let's Encrypt en expose un en production ; step-ca aussi, pour une
-CA privee.
+remplace. Let's Encrypt en expose un, en production et en staging. step-ca pas
+encore (0.30.2, mesure ; voir smallstep/certificates#2162) : sur une step-ca
+privee, seul le seuil decide, et le panneau du certificat indique que la CA ne
+publie pas de fenetre.
 
 Le balayage de renouvellement TLS le demande. Pour chaque certificat que le
 seuil n'a **pas** deja declare echu, CertMate recupere la fenetre de la CA et
@@ -416,6 +418,17 @@ en meme temps.
 Le resume du balayage les compte comme `ari_advanced`, pour qu'un
 renouvellement que votre configuration n'explique pas reste attribuable.
 
+Le panneau de detail du certificat affiche, sous **CA renewal window**, ce que
+la CA a dit lors du dernier balayage : la fenetre, l'instant a l'interieur
+auquel CertMate renouvelle, et le lien d'explication de la CA quand elle en
+donne un. Sans fenetre, il indique de quelle absence il s'agit : la CA n'en
+publie pas, la CA n'a pas repondu lors du dernier controle, ou le certificat
+ne peut pas etre nomme dans ARI. Le meme enregistrement est renvoye comme
+`renewal_info` par `GET /api/certificates/<domain>`. Il est lu depuis ce que
+le balayage a conserve, donc ouvrir le tableau de bord n'envoie jamais de
+requete a la CA. Juste apres un renouvellement, il affiche "Not checked yet"
+jusqu'a ce que le balayage suivant interroge la CA sur le nouveau certificat.
+
 Mettez `"ari_enabled": false` dans `settings.json` pour le desactiver ; il est
 actif par defaut et coute une GET non authentifiee par certificat et par
 balayage, plus une par CA et par heure pour le directory.
@@ -425,6 +438,33 @@ au-dela de votre seuil. C'est la moitie qui compte pour les certificats de
 courte duree, ou une regle fixe de 30 jours n'a aucun sens face a un
 certificat de 6 jours — elle arrivera avec la prise en charge des profils dont
 ces certificats ont besoin.
+
+### Un seuil au-dela de 30 jours
+
+certbot a sa propre barriere de renouvellement : sans etre force, il ne
+renouvelle que dans les 30 derniers jours avant l'expiration. Avant la 2.40,
+CertMate l'appelait sans le forcer, donc un `renewal_threshold_days` de 45 se
+comportait comme 30, et le balayage comptait l'ecart comme `skipped_not_due`
+chaque nuit.
+
+Quand le seuil, et seulement le seuil, declare un certificat a renouveler
+alors que certbot refuserait, CertMate force desormais le renouvellement, comme
+il le faisait deja pour une fenetre publiee par la CA. Dans les 30 derniers
+jours rien ne change. Deux garde-fous l'accompagnent :
+
+- **Au plus `early_renewals_per_sweep` par balayage** (10 par defaut, entre 1
+  et 50). Relever le seuil sur un grand parc repartit les renouvellements
+  anticipes sur plusieurs nuits au lieu d'envoyer toutes les commandes a la CA
+  en une seule. Le resume du balayage les compte comme `early_forced`, et ceux
+  laisses au balayage suivant comme `early_deferred`.
+- **Un certificat emis il y a moins de 7 jours n'est jamais force.** Un seuil
+  egal ou superieur a la duree de vie du certificat le declarerait sinon
+  toujours a renouveler. Avec ce garde-fou, cela coute au plus un
+  renouvellement par semaine, pas un par nuit.
+
+Un certificat qui demande de l'attention pour une autre raison, une cle servie
+absente ou qui ne correspond pas, n'est pas force : il est repare depuis sa
+lignee sans nouvelle cle.
 
 ### Activation du renouvellement automatique
 

@@ -188,7 +188,9 @@ def create_storage_resources(api, models, ctx: ApiContext) -> dict:
 
     class StorageBackendTest(Resource):
         @api.doc(security='Bearer')
-        @ctx.auth.require_role('operator')
+        # Admin, like the save it supports: the request carries a whole
+        # configuration and the server connects with it.
+        @ctx.auth.require_role('admin')
         @api.expect(models['storage_test_config_model'])
         def post(self):
             """Test storage backend connection"""
@@ -228,8 +230,12 @@ def create_storage_resources(api, models, ctx: ApiContext) -> dict:
                     else:
                         return {'error': 'Invalid backend type'}, 400
 
-                    # Test by trying to list certificates (should not fail for auth issues)
-                    domains = test_backend.list_certificates()
+                    # S3 and Secrets Manager public list_certificates() turn
+                    # failures into [] for callers. The Test button must not
+                    # report IAM/STS permission failures as an empty store.
+                    domains = (test_backend._list_certificates_attempt()
+                               if backend_type in ('s3_compatible', 'aws_secrets_manager')
+                               else test_backend.list_certificates())
 
                     # When the Azure Key Vault backend is configured to write
                     # Certificate objects, the Service Principal also needs

@@ -1,6 +1,6 @@
 # Proveedores DNS
 
-<!-- CERTMATE-TRANSLATED-FROM 9b103696fbd47ac1 -->
+<!-- CERTMATE-TRANSLATED-FROM 4dcc9496784670bc -->
 
 CertMate soporta una amplia gama de proveedores DNS para los desafíos Let's Encrypt DNS-01 mediante plugins de certbot individuales. La lista completa se encuentra en la tabla a continuación.
 
@@ -12,7 +12,7 @@ CertMate soporta una amplia gama de proveedores DNS para los desafíos Let's Enc
 |---|---|---|---|
 | **Cloudflare** | `certbot-dns-cloudflare` | Token API | Cloud principal |
 | **AWS Route53** | `certbot-dns-route53` | Access Key, Secret Key | Cloud principal |
-| **Azure DNS** | `certbot-dns-azure` | Service Principal | Cloud principal |
+| **Azure DNS** | Hook propio de CertMate (`azure-mgmt-dns`) | Service Principal | Cloud principal |
 | **Google Cloud DNS** | `certbot-dns-google` | Service Account JSON | Cloud principal |
 | **PowerDNS** | `certbot-dns-powerdns` | URL API, Clave API | Empresa |
 | **DNS Made Easy** | `certbot-dns-dnsmadeeasy` | Clave API, Secret Key | Empresa |
@@ -114,6 +114,8 @@ curl -X POST http://localhost:8000/api/settings \
   }
 }
 ```
+
+Azure DNS no se resuelve con un plugin de certbot: CertMate escribe el registro del desafío por sí mismo con el SDK de Azure, usando el mismo service principal. El principal necesita permiso para leer y escribir registros TXT en la zona (el rol `DNS Zone Contributor` sobre el grupo de recursos lo cubre). Los certificados emitidos antes mediante `certbot-dns-azure` pasan a este método en su próxima renovación; no hay nada que cambiar. La espera antes de la validación es el ajuste de propagación del proveedor (180 segundos por defecto).
 
 ### Google Cloud DNS
 
@@ -374,7 +376,9 @@ Los wildcards como `*.mybox.duckdns.org` están soportados con el mismo token. D
 
 ### Script personalizado (trae tu propio proveedor)
 
-Para proveedores DNS sin plugin de certbot — Oracle Cloud (OCI), DNS interno, APIs de appliance — apunta CertMate a tus propios scripts y los ejecutará a través del modo `--manual` de certbot. No se requiere instalación de plugin alguno.
+Para proveedores DNS sin plugin de certbot — Oracle Cloud (OCI), Total Uptime, Netriplex, DNS interno, APIs de appliance — apunta CertMate a tus propios scripts y los ejecutará a través del modo `--manual` de certbot. No se requiere instalación de plugin alguno.
+
+**[Script DNS personalizado](../custom-dns-script.md)** es la guía completa: las reglas sobre las rutas y por qué son estrictas, el entorno exacto con el que se invoca tu script, el caso comodín más ápice, qué usa la renovación y un ejemplo resuelto. *(en inglés)*
 
 ```json
 {
@@ -431,7 +435,7 @@ Requisitos y modelo de confianza:
 - Las rutas deben ser **absolutas**, los archivos deben existir, ser **ejecutables**, no tener permisos de escritura para todos los usuarios **ni para el grupo** (`chmod 755` o más estricto), y no contener espacios ni metacaracteres de shell (certbot ejecuta los hooks a través del shell). Un hook con `chmod 775` — un modo corriente para un script propiedad de un grupo de despliegue — se rechaza: cualquier miembro de ese grupo podría reescribir lo que CertMate está a punto de ejecutar. Se validan en el momento de la emisión y mediante el endpoint API de prueba (`POST /api/web/certificates/test-provider`)
 - Los scripts se ejecutan con los privilegios de CertMate — el mismo modelo de confianza que los deploy hooks: solo los administradores pueden configurarlos; tratalos como parte de tu despliegue
 - El ajuste `dns_propagation_seconds` por proveedor se exporta a los scripts como `CERTMATE_DNS_PROPAGATION_SECONDS` (un campo `propagation_seconds` a nivel de cuenta tiene prioridad sobre él)
-- Las renovaciones replican las rutas de los hooks desde la configuración de renovación de certbot: mantén los scripts en una ruta estable (si los mueves, vuelve a emitir el certificado)
+- Las renovaciones usan las rutas de los hooks configuradas ahora, igual que la emisión: si mueves un script, actualiza su ruta en Ajustes y la siguiente renovación la usará
 - Los certificados wildcard funcionan correctamente (el hook recibe cada registro de validación)
 
 ---

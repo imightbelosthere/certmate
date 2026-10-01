@@ -4,6 +4,43 @@ This guide covers all methods of installing and deploying CertMate.
 
 ---
 
+## Linux server with systemd
+
+The recommended way on a Linux host without Docker. Verified on Debian 12, Ubuntu 24.04 and Rocky Linux 9; it uses `apt` or `dnf`, so Fedora, RHEL and Alma Linux follow the same path.
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/fabriziosalmi/certmate/main/deploy/install.sh | sudo sh
+```
+
+What it does:
+
+- installs `curl`, `tar`, `gzip` and `openssl` only if they are missing;
+- downloads the latest release into `/opt/certmate`, owned by root and read-only to the service;
+- fetches a standalone Python 3.12 with [uv](https://docs.astral.sh/uv/) into `/opt/certmate` and installs `requirements.lock`, the same pinned set the container image is built from. The system Python is not used, which is why distributions that ship an older Python, such as Debian 12 and RHEL 9, work too;
+- creates the `certmate` system user, which owns only `certificates`, `data`, `backups`, `logs` and `letsencrypt`;
+- writes `/etc/certmate/certmate.env` with a generated `API_BEARER_TOKEN`, `SECRET_KEY` and `CERTMATE_BACKUP_PASSPHRASE`, only if the file does not exist;
+- installs and starts the `certmate` systemd service, listening on `127.0.0.1:8000`.
+
+Open `http://127.0.0.1:8000`. The first page creates the administrator account and asks for the token: `sudo grep API_BEARER_TOKEN /etc/certmate/certmate.env`.
+
+- **A specific version:** `curl -fsSL …/install.sh | sudo sh -s -- --version X.Y.Z`. Releases up to v2.42.0 predate the installer and are refused.
+- **Upgrade:** run the same command again. The code and the virtualenv are replaced; certificates, data, backups and `certmate.env` stay.
+- **Listen elsewhere:** set `CERTMATE_BIND` in `/etc/certmate/certmate.env` (for example `0.0.0.0:8000`, or keep loopback behind a reverse proxy and set `BEHIND_PROXY=true`), then `sudo systemctl restart certmate`.
+- **Logs:** `journalctl -u certmate`.
+- **SELinux:** the installer has not yet been verified with SELinux enforcing. If the service does not start on such a host, the journal will say why; please report it.
+
+---
+
+## A cloud VM with cloud-init
+
+For a fresh VM on any provider that accepts user data (Hetzner, DigitalOcean, AWS, Azure, GCP, OpenStack, Proxmox): paste [`deploy/cloud-init/certmate.yaml`](../deploy/cloud-init/certmate.yaml) into the VM's "user data" or "cloud-init" field when you create it ([raw file](https://raw.githubusercontent.com/fabriziosalmi/certmate/main/deploy/cloud-init/certmate.yaml)). It installs Docker, downloads the [production compose bundle](docker.md#production-with-docker-compose), generates the secrets on the VM into `/srv/certmate/.env` (mode 600, never in the user data) and starts CertMate.
+
+CertMate listens on `127.0.0.1:8000` inside the VM. Reach it through an SSH tunnel, `ssh -L 8000:127.0.0.1:8000 <user>@<vm>`, then open `http://127.0.0.1:8000`. The first page creates the administrator account and asks for the token: `sudo grep API_BEARER_TOKEN /srv/certmate/.env`.
+
+Verified on the Ubuntu 24.04 cloud image: cloud-init finishes `done`, CertMate is healthy a few minutes after boot, and it comes back after a reboot.
+
+---
+
 ## Prerequisites
 
 - Python 3.12
@@ -55,11 +92,7 @@ python app.py
 
 ### Using Docker Compose (Recommended)
 
-```bash
-git clone https://github.com/fabriziosalmi/certmate.git
-cd certmate
-docker-compose up -d
-```
+Download the production bundle and start it: one file, the published image, no clone and no build. The commands and what each setting does are in [Docker: Production with Docker Compose](docker.md#production-with-docker-compose).
 
 ### Using Docker Build
 
@@ -508,16 +541,17 @@ pip install -r requirements-aws.txt        # Route53, on top of either
 ```
 
 > This page used to publish its own pinned list, and it had drifted to
-> `certbot==4.1.1` in all five languages while the project is pinned to
-> `2.10.0` — the 5.x migration is still a plan (issue #103), not a release.
+> `certbot==4.1.1` in all five languages while the project was pinned to
+> `2.10.0`. The project now runs certbot `5.8.0` (issue #103).
 >
 > Correcting those numbers is not enough, which is why the list is gone rather
 > than fixed. What holds the stack together is not the plugin versions but
-> `cryptography`, `pyopenssl`, `josepy` and `acme` holding each other in place:
-> newer pyOpenSSL drops `OpenSSL.crypto.X509Extension`, which `acme` evaluates
-> at import. Assembled by hand, certbot dies before it can issue anything —
-> measured four times, adding one pin at a time. See SECURITY.md, "Known
-> dependency constraint".
+> certbot, `acme`, `josepy`, the official plugins, `cryptography` and
+> `pyopenssl` agreeing with each other: certbot and `acme` 5.8.0 need
+> `cryptography>=47`, and pyOpenSSL 26.4.0 needs `>=49,<51`. Assembled by hand,
+> one pin lands outside that window; the file CertMate ships is the set that is
+> resolved, built and booted in CI. See SECURITY.md, "Known dependency
+> constraint".
 >
 > `certbot-dns-powerdns` needs its own environment: it requires
 > `dns-lexicon<=3.5.6` while the Linode, OVH, RFC2136, DNSMadeEasy and NS1

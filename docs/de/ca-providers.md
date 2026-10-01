@@ -2,7 +2,7 @@
 
 <!-- CERTMATE-TRANSLATED-FROM 4a4fcc10de4a1e4b -->
 <!-- CERTMATE-STALE-TRANSLATION -->
-> **Diese Übersetzung ist nicht aktuell.** Die englische Fassung ([`docs/ca-providers.md`](../ca-providers.md)) ist maßgeblich. Sie beschreibt auch den neuen Sectigo-ACME-Anbieter mit kontospezifischen HTTPS-Verzeichnis-URLs und EAB-Zugangsdaten.
+> **Diese Übersetzung ist nicht aktuell.** Die englische Fassung ([`docs/ca-providers.md`](../ca-providers.md)) ist maßgeblich. Sie beschreibt auch Sectigo ACME mit kontospezifischen HTTPS-Verzeichnis-URLs, EAB-Zugangsdaten und einem Modus für bereits in SCM autorisierte Namen ohne DNS- oder HTTP-Challenge.
 
 CertMate unterstützt mehrere Zertifizierungsstellen-Anbieter, sodass Sie die für Ihre Anforderungen am besten geeignete CA auswählen können.
 
@@ -95,10 +95,11 @@ Der Private-CA-Eintrag ist auch der generische Ausweg für jede ACME-CA ohne ded
 
 1. Navigieren Sie zu **Einstellungen**
 2. Scrollen Sie zu **Zertifizierungsstellen (CA) Anbieter**
-3. Wählen Sie Ihren Standard-CA-Anbieter aus
+3. Klicken Sie auf **Add CA Account**, wählen Sie die CA und benennen Sie das
+   Konto (Buchstaben, Ziffern, Punkte, Binde- und Unterstriche)
 4. Konfigurieren Sie die erforderlichen Felder
 5. Klicken Sie auf **CA-Verbindung testen**, um die Verbindung zu prüfen
-6. Einstellungen speichern
+6. Klicken Sie auf **Save Account**
 
 ### Standard-CA vs. CA pro Zertifikat
 

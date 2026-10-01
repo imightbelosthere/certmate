@@ -3,7 +3,7 @@
 <!-- CERTMATE-TRANSLATED-FROM 646f409a30787dbd -->
 <!-- CERTMATE-STALE-TRANSLATION -->
 
-> Questa traduzione non è aggiornata. Consulta la [versione inglese](../ca-providers.md) per il nuovo provider Sectigo ACME, gli URL HTTPS delle directory per account e le credenziali EAB.
+> Questa traduzione non è aggiornata. Consulta la [versione inglese](../ca-providers.md) per Sectigo ACME, gli URL HTTPS e le credenziali EAB per account e la modalità per nomi già autorizzati in SCM senza challenge DNS o HTTP.
 
 CertMate supporta diversi fornitori di Certificate Authority, consentendoti di scegliere la CA più adatta alle tue esigenze.
 
@@ -139,10 +139,11 @@ La voce CA Privata e anche la via d'uscita generica per qualsiasi CA ACME priva 
 
 1. Vai su **Impostazioni**
 2. Scorri fino a **Fornitori di Certificate Authority (CA)**
-3. Seleziona il fornitore CA predefinito
+3. Clicca su **Add CA Account**, scegli la CA e dai un nome all'account
+   (lettere, cifre, punti, trattini e trattini bassi)
 4. Configura i campi obbligatori
 5. Clicca su **Testa connessione CA** per controllare i campi
-6. Salva le impostazioni
+6. Clicca su **Save Account**
 
 **Testa connessione CA** contatta la CA solo per una CA Privata: scarica l'URL
 della directory ACME (usando il certificato CA, se indicato). Per tutte le altre
@@ -153,12 +154,11 @@ emissione.
 
 ### Email dell'account
 
-L'email con cui certbot registra l'account ACME e l'impostazione globale
-`email`, qualunque sia la CA che emette il certificato. Salvando le impostazioni
-dall'interfaccia web, l'email della sezione della CA **predefinita** viene
-copiata in quell'impostazione; i campi email delle sezioni delle altre CA
-vengono salvati ma non passati a certbot. L'emissione fallisce con
-`Email not configured` quando l'impostazione globale e vuota.
+Per una nuova emissione certbot usa l'email dell'account CA selezionato, e
+ripiega sull'impostazione globale `email` quando l'account non ne ha una.
+L'email globale resta obbligatoria per l'emissione. Cambiare l'email di un
+account non aggiorna un account ACME gia registrato da certbot: per cambiare
+quel contatto usa `certbot update_account`.
 
 ### CA predefinita vs. CA per certificato
 

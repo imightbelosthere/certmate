@@ -1,6 +1,7 @@
 import logging
 import re
 from functools import partial, wraps
+from pathlib import Path
 
 from flask import request, jsonify
 
@@ -68,6 +69,29 @@ def bootstrap_only(auth_manager, audit_logger, operation, resource_type,
     return decorator
 
 
+def _is_bootstrap_admin(auth_manager, role):
+    """Is this request creating the instance's first admin, in setup mode?"""
+    return (role == 'admin' and auth_manager.is_setup_mode()
+            and not auth_manager.list_users())
+
+
+def _close_setup_with(auth_manager, audit_logger, username, body, bootstrap_admin):
+    """Enable local auth together with the first admin, and say so in *body*.
+
+    Setup used to take two requests (create the admin, then enable local
+    auth), and an instance whose second request never came stayed open to
+    anyone as admin while its operator believed it had one.
+    """
+    if not bootstrap_admin or not auth_manager.enable_local_auth(True):
+        return
+    body['local_auth_enabled'] = True
+    if audit_logger:
+        audit_logger.log_auth_config_changed(
+            local_auth_enabled_before=False, local_auth_enabled_after=True,
+            user=username, ip_address=request.remote_addr,
+            confirm_unauthenticated=False)
+
+
 def _confirm_setup_key(auth_manager, audit_logger, key_id):
     """PATCH /api/keys/<id> {"confirmed": true}: vouch for a key created
     while the instance was in setup mode, clearing its review flag."""
@@ -95,6 +119,239 @@ def _confirm_setup_key(auth_manager, audit_logger, key_id):
             user=user.get('username'), ip_address=request.remote_addr,
         )
     return jsonify({'message': msg, 'key_id': key_id})
+
+
+# A CA account ID is chosen by the operator and ends up in the URL, in
+# certificate metadata and in log lines ("Using CA account: <id>"), so a new
+# one is held to a plain charset. IDs that already exist are still accepted
+# for edit and delete, so an account named before this rule is not stranded.
+_CA_ACCOUNT_ID_RE = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]{0,63}')
+_CA_ACCOUNT_FIELDS = frozenset({'name', 'email', 'acme_url', 'eab_kid', 'eab_hmac', 'ca_cert'})
+
+
+def _ca_accounts_of(settings, provider):
+    existing = (settings.get('ca_providers') or {}).get(provider) or {}
+    if isinstance(existing.get('accounts'), dict):
+        return existing['accounts']
+    return {'default': existing} if existing else {}
+
+
+def _as_accounts(settings, provider):
+    """Convert the provider entry to the accounts shape, in place, and return
+    its accounts. The flat keys MOVE into the default account: left beside
+    `accounts` they would be a credential copy nothing reads or rotates."""
+    configured = settings.setdefault('ca_providers', {}).setdefault(provider, {})
+    if not isinstance(configured.get('accounts'), dict):
+        legacy = {k: v for k, v in configured.items() if k != 'accounts'}
+        if not legacy and provider == 'letsencrypt' and settings.get('email'):
+            legacy = {'email': settings['email']}
+        configured.clear()
+        configured['accounts'] = {'default': legacy} if legacy else {}
+    else:
+        for key in [k for k in configured if k != 'accounts']:
+            del configured[key]
+    return configured['accounts']
+
+
+def _audit_ca_account(audit_logger, operation, provider, account_id, status,
+                      fields=None, error=None):
+    if not audit_logger:
+        return
+    user = getattr(request, 'current_user', None) or {}
+    # Field NAMES only: the values include the EAB secret.
+    details = {'fields': sorted(fields)} if fields else None
+    audit_logger.log_operation(
+        operation=operation, resource_type='ca_provider',
+        resource_id=f"{provider}:{account_id}", status=status,
+        details=details, user=user.get('username'),
+        ip_address=request.remote_addr, error=error,
+    )
+
+
+def _ca_account_in_use(managers, settings_manager, settings, provider, account_id):
+    service = managers.get('cert_service')
+    if not service:
+        return False
+    domains = {entry_domain(entry) for entry in settings.get('domains') or []}
+    cert_dir = getattr(getattr(settings_manager, 'file_ops', None), 'cert_dir', None)
+    if isinstance(cert_dir, Path) and cert_dir.is_dir():
+        domains.update(path.name for path in iter_cert_domain_dirs(cert_dir))
+    for domain in domains:
+        metadata = service.read_metadata(domain) if domain else {}
+        if (metadata.get('ca_provider') == provider and
+                (metadata.get('ca_account_id') or 'default') == account_id):
+            return True
+    return False
+
+
+def _delete_ca_account(managers, settings_manager, audit_logger, settings,
+                       accounts, provider, account_id):
+    if account_id not in accounts:
+        return jsonify({'error': 'CA account not found'}), 404
+    chosen = (settings.get('default_ca_accounts') or {}).get(provider) or (
+        'default' if 'default' in accounts else next(iter(accounts)))
+    if provider == settings.get('default_ca', 'letsencrypt') and account_id == chosen:
+        return jsonify({'error': 'Choose another default CA account before deleting this one'}), 409
+    if _ca_account_in_use(managers, settings_manager, settings, provider, account_id):
+        return jsonify({'error': 'Reissue or delete certificates using this account first'}), 409
+
+    def remove_account(s):
+        remaining = _as_accounts(s, provider)
+        remaining.pop(account_id, None)
+        defaults = s.get('default_ca_accounts') or {}
+        if not remaining:
+            s['ca_providers'].pop(provider, None)
+            defaults.pop(provider, None)
+        elif defaults.get(provider) == account_id:
+            defaults[provider] = next(iter(remaining))
+
+    if not settings_manager.update(remove_account, 'ca_account_deleted'):
+        _audit_ca_account(audit_logger, 'delete_ca_account', provider, account_id,
+                          'failure', error='settings write failed')
+        return jsonify({'error': 'Failed to delete CA account'}), 500
+    _audit_ca_account(audit_logger, 'delete_ca_account', provider, account_id, 'success')
+    return jsonify({'message': 'CA account deleted'})
+
+
+def _save_ca_account(settings_manager, audit_logger, accounts,
+                     ca_manager, provider, account_id):
+    from modules.core.settings import _strip_masked_values
+    from modules.core.utils import validate_email
+
+    creating = account_id not in accounts
+    if request.args.get('create') == '1' and not creating:
+        return jsonify({'error': 'CA account already exists; use Edit'}), 409
+    if creating and not _CA_ACCOUNT_ID_RE.fullmatch(account_id):
+        return jsonify({'error': 'Account name must be 1-64 letters, digits, dots, '
+                                 'dashes or underscores, starting with a letter or digit'}), 400
+    raw = request.get_json(silent=True) or {}
+    if not isinstance(raw, dict) or set(raw) - _CA_ACCOUNT_FIELDS:
+        return jsonify({'error': 'Invalid CA account configuration'}), 400
+    submitted = _strip_masked_values(raw)
+    config = {**accounts.get(account_id, {}), **submitted}
+    if not config.get('email') or not validate_email(config['email'])[0]:
+        return jsonify({'error': 'A valid CA account email is required'}), 400
+    valid, reason = ca_manager.validate_ca_configuration(provider, config)
+    if not valid:
+        return jsonify({'error': reason}), 400
+
+    def save_account(s):
+        _as_accounts(s, provider)[account_id] = config
+
+    operation = 'create_ca_account' if creating else 'update_ca_account'
+    if not settings_manager.update(save_account, 'ca_account_saved'):
+        _audit_ca_account(audit_logger, operation, provider, account_id,
+                          'failure', error='settings write failed')
+        return jsonify({'error': 'Failed to save CA account'}), 500
+    _audit_ca_account(audit_logger, operation, provider, account_id, 'success',
+                      fields=submitted)
+    return jsonify({'message': 'CA account saved'})
+
+
+def _ca_provider_account(managers, settings_manager, audit_logger, provider, account_id):
+    """POST (create/edit) or DELETE one account of a CA provider."""
+    from modules.core.ca_manager import CAManager
+
+    ca_manager = managers.get('ca') or CAManager(settings_manager)
+    if (provider not in ca_manager.ca_providers or not account_id or len(account_id) > 100
+            or account_id in ('__proto__', 'constructor', 'prototype')):
+        return jsonify({'error': 'Invalid CA provider or account ID'}), 400
+    settings = settings_manager.load_settings() or {}
+    accounts = _ca_accounts_of(settings, provider)
+    if request.method == 'DELETE':
+        return _delete_ca_account(managers, settings_manager, audit_logger,
+                                  settings, accounts, provider, account_id)
+    return _save_ca_account(settings_manager, audit_logger, accounts,
+                            ca_manager, provider, account_id)
+
+
+def _stamp_key_delivery_consent(deploy_manager, audit_logger, data):
+    """Record, on the server, who confirmed where a webhook target sends the private key.
+
+    A webhook target whose template names the key sends it to the host in its URL.
+    The client only ACKNOWLEDGES that host (`acknowledge_key_delivery_to`); the
+    consent itself, with who and when, is written here and never read from the
+    request, so a client cannot confirm for itself. Returns ``(data, None)`` or
+    ``(None, reason)``.
+    """
+    if not isinstance(data, dict) or not isinstance(data.get('targets'), list):
+        return data, None
+    from modules.core.deploy_target_webhook import stamp_consent
+    actor = getattr(request, 'current_user', None) or {}
+    previous = (deploy_manager.get_config() or {}).get('targets') or []
+    targets, error = stamp_consent(data['targets'], previous, actor.get('username') or 'unknown')
+    if error:
+        return None, error
+    before = {(t.get('id'), (t.get('delivery_consent') or {}).get('at'))
+              for t in previous if isinstance(t, dict)}
+    if audit_logger:
+        for target in targets:
+            consent = target.get('delivery_consent') if isinstance(target, dict) else None
+            if consent and (target.get('id'), consent.get('at')) not in before:
+                audit_logger.log_operation(
+                    operation='confirm_key_delivery', resource_type='deploy_target',
+                    resource_id=str(target.get('id')), status='success',
+                    details={'host': consent.get('host'), 'target': target.get('name')},
+                    user=actor.get('username'), ip_address=request.remote_addr)
+    return dict(data, targets=targets), None
+
+
+def _save_deploy_config(deploy_manager, audit_logger):
+    """POST /api/deploy/config: confirm key delivery, validate, save, audit."""
+    data, err = _stamp_key_delivery_consent(deploy_manager, audit_logger, request.json or {})
+    if err:
+        return jsonify({'error': err}), 400
+    ok, err = deploy_manager.save_config(data)
+    if ok:
+        if audit_logger:
+            actor = getattr(request, 'current_user', {}) or {}
+            # Hook commands themselves are NEVER logged (would leak
+            # secrets + risk log-injection). We record that the
+            # configuration was touched, by whom, from where.
+            audit_logger.log_deploy_hook_changed(
+                scope='global',
+                hook_id='config',
+                operation='update',
+                user=actor.get('username'),
+                ip_address=request.remote_addr,
+            )
+        return jsonify({'message': 'Deploy configuration saved'})
+    # Surface the specific reason (issue #102) so users see *why*
+    # a hook was rejected rather than a generic save failure.
+    return jsonify({'error': err or 'Invalid configuration or save failed'}), 400
+
+
+def _register_target_preview_route(app, auth_manager, deploy_manager):
+    @app.route('/api/deploy/targets/preview', methods=['POST'])
+    @auth_manager.require_role('admin')
+    def api_deploy_target_preview():
+        """Render what a webhook target would send. Reads no file and sends nothing."""
+        if not deploy_manager:
+            return jsonify({'error': 'Deploy manager not available'}), 503
+        from modules.core.deploy_target_webhook import (
+            TARGET_WEBHOOK, WebhookTarget, _url_host, validate_webhook_target)
+        target = request.get_json(silent=True)
+        if not isinstance(target, dict) or target.get('type') != TARGET_WEBHOOK:
+            return jsonify({'error': 'send a target of type "webhook"'}), 400
+        target = dict(target, config=dict(target.get('config') or {}))
+        target['config'].pop('acknowledge_key_delivery_to', None)
+        # Validated as if the destination were confirmed: a preview is how an
+        # operator sees what they are about to confirm.
+        ok, error = validate_webhook_target(dict(
+            target, delivery_consent={'host': _url_host(target['config'].get('url'))}))
+        if not ok:
+            return jsonify({'error': error}), 400
+        return jsonify(WebhookTarget(target).preview(
+            domain=str(request.args.get('domain') or 'example.com')[:253]))
+
+
+def _register_ca_account_route(app, auth_manager, managers, settings_manager, audit_logger):
+    @app.route('/api/web/settings/ca-providers/<string:provider>/accounts/<string:account_id>',
+               methods=['POST', 'DELETE'])
+    @auth_manager.require_role('admin')
+    def ca_provider_account(provider, account_id):
+        return _ca_provider_account(managers, settings_manager, audit_logger,
+                                    provider, account_id)
 
 
 def register_settings_routes(app, managers, require_web_auth, auth_manager,
@@ -189,6 +446,9 @@ def register_settings_routes(app, managers, require_web_auth, auth_manager,
         except Exception as e:
             logger.error(f"Failed to load settings: {e}")
             return jsonify({'error': 'Failed to load settings'}), 500
+
+    _register_ca_account_route(app, auth_manager, managers, settings_manager, audit_logger)
+    _register_target_preview_route(app, auth_manager, deploy_manager)
 
     @app.route('/api/settings', methods=['POST'])
     @app.route('/api/web/settings', methods=['POST'])
@@ -312,6 +572,7 @@ def register_settings_routes(app, managers, require_web_auth, auth_manager,
                 'error': 'Password must be at least 12 characters and include a digit and a symbol'
             }), 400
 
+        bootstrap_admin = _is_bootstrap_admin(auth_manager, role)
         success, msg = auth_manager.create_user(username, password, role)
         if success:
             if audit_logger:
@@ -322,7 +583,10 @@ def register_settings_routes(app, managers, require_web_auth, auth_manager,
                     user=actor.get('username'),
                     ip_address=request.remote_addr,
                 )
-            return jsonify({'message': 'User created'}), 201
+            body = {'message': 'User created'}
+            _close_setup_with(auth_manager, audit_logger, username, body,
+                              bootstrap_admin)
+            return jsonify(body), 201
         if 'already exists' in msg.lower():
             return jsonify({'error': msg}), 409
         return jsonify({'error': msg}), 500
@@ -716,27 +980,7 @@ def register_settings_routes(app, managers, require_web_auth, auth_manager,
                 return jsonify({'error': 'Failed to get deploy config'}), 500
 
         try:
-            data = request.json or {}
-            ok, err = deploy_manager.save_config(data)
-            if ok:
-                if audit_logger:
-                    actor = getattr(request, 'current_user', {}) or {}
-                    # Hook commands themselves are NEVER logged (would leak
-                    # secrets + risk log-injection). We record that the
-                    # configuration was touched, by whom, from where.
-                    audit_logger.log_deploy_hook_changed(
-                        scope='global',
-                        hook_id='config',
-                        operation='update',
-                        user=actor.get('username'),
-                        ip_address=request.remote_addr,
-                    )
-                return jsonify({'message': 'Deploy configuration saved'})
-            # Surface the specific reason (issue #102) so users see *why*
-            # a hook was rejected rather than a generic save failure.
-            return jsonify({
-                'error': err or 'Invalid configuration or save failed'
-            }), 400
+            return _save_deploy_config(deploy_manager, audit_logger)
         except Exception as e:
             logger.error(f"Failed to save deploy config: {e}")
             return jsonify({'error': 'Failed to save deploy config'}), 500

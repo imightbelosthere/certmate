@@ -208,27 +208,31 @@ class AuditLogger:
             self._chain_dir.mkdir(parents=True, exist_ok=True)
             if not self.audit_chain_file.exists():
                 return
+            # One read, and the size recorded is the size of what was read.
+            # A separate stat() afterwards measured a file another process may
+            # have appended to in between: the cached head then described the
+            # old file while the size described the new one, the staleness
+            # check in _refresh_if_another_writer_appended matched, and the
+            # next append reused a seq (#1000).
+            with open(self.audit_chain_file, 'rb') as f:
+                data = f.read()
             last_good = None
-            with open(self.audit_chain_file, 'r', encoding='utf-8') as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        rec = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue  # skip a corrupt/truncated line
-                    if not isinstance(rec, dict):
-                        continue  # a non-object line is not a valid record
-                    if isinstance(rec.get('seq'), int) and rec.get('hash'):
-                        last_good = rec
+            for raw in data.decode('utf-8', errors='replace').splitlines():
+                line = raw.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue  # skip a corrupt/truncated line
+                if not isinstance(rec, dict):
+                    continue  # a non-object line is not a valid record
+                if isinstance(rec.get('seq'), int) and rec.get('hash'):
+                    last_good = rec
             if last_good is not None:
                 self._next_seq = last_good['seq'] + 1
                 self._last_hash = last_good['hash']
-            try:
-                self._chain_size = self.audit_chain_file.stat().st_size
-            except OSError:
-                self._chain_size = 0
+            self._chain_size = len(data)
         except Exception as e:
             # Recovery runs inside AuditLogger.__init__, which the factory calls
             # unguarded — it must NEVER abort app startup (that would take the
@@ -1064,7 +1068,8 @@ class AuditLogger:
             # different answers, and only one of them is safe to act on.
             return {'entries': [], 'complete': False, 'error': str(e)}
 
-        return {'entries': found[-limit:], 'complete': complete}
+        # Newest first, like `get_recent_entries` — see the note there.
+        return {'entries': found[-limit:][::-1], 'complete': complete}
 
     @staticmethod
     def _parse_entries(raw: bytes, partial_first: bool) -> list:
@@ -1152,7 +1157,14 @@ class AuditLogger:
             entries = self._parse_entries(
                 b''.join(reversed(blocks)), partial_first=remaining > 0)
 
-            return entries[-limit:]
+            # `[-limit:]` picks the right WINDOW — the most recent entries,
+            # not the first ones — and `[::-1]` puts the newest at the front,
+            # which is what both this method's docstring and the one on
+            # `search_entries` have always claimed. The reversal was missing,
+            # so /activity opened on the oldest thing that ever happened: on a
+            # seventeen-day log the first six rows were from seventeen days
+            # ago (#941).
+            return entries[-limit:][::-1]
 
         except Exception as e:
             logger.error(f"Error reading audit logs: {e}")
