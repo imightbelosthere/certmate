@@ -470,6 +470,191 @@ METADATA_SCHEMA_VERSION = 1
 #                                   new value of an existing request field, and
 #                                   a new field on a response.
 #
+#   Route53 DNS accounts            two optional fields on the account (#1071):
+#                                   `auth_mode` (`access_keys`, the default, or
+#                                   `iam_role`, which uses the AWS credential
+#                                   chain of the host and needs no stored keys)
+#                                   and `assume_role_arn`. They are read and
+#                                   written wherever a Route53 account is, so
+#                                   the two access-key fields are no longer
+#                                   needed for an account in `iam_role` mode.
+#                                   2.35, MINOR: two new optional request
+#                                   fields and the matching fields on a
+#                                   response. Merged without the number moving,
+#                                   because nothing compared a model with it;
+#                                   tests/test_the_contract_moves_with_the_
+#                                   models.py does now.
+#
+#   Inventory: list and crypto    `superseded` on every certificate of
+#   report (#1044)                  GET /api/inventory and in its summary, and
+#                                   an optional `include_superseded` query
+#                                   parameter on it and on
+#                                   GET /api/inventory/crypto-report. A
+#                                   certificate is superseded when every
+#                                   endpoint it was seen on has since been
+#                                   seen serving a different one. The default
+#                                   answer is unchanged (everything, now with
+#                                   the flag); `include_superseded=false`
+#                                   leaves them out of the list, the summary
+#                                   and the report. 2.36, MINOR: a new response
+#                                   field and a new optional parameter. Neither
+#                                   operation has a response schema in the
+#                                   OpenAPI document, so no gate sees the
+#                                   field: this entry and the number are by hand.
+#
+#   Answers that were wrong        seven answers now say what they mean (#1105:
+#                                   found by calling every route). DELETE
+#                                   /api/dns/<provider>/accounts/<id> answers
+#                                   404, not 500, for an account that does not
+#                                   exist (#1106). POST
+#                                   /api/deploy/test/<hook_id> answers 200 for a
+#                                   hook that ran, pass or fail, where it
+#                                   answered 404 for every hook that existed,
+#                                   with `success: true` in the body (#1107); a
+#                                   hook that does not exist stays a 404. POST
+#                                   /api/client-certs/<id>/renew and /revoke
+#                                   answer 404, not 400, for a certificate that
+#                                   does not exist (#1111). GET /api/backups
+#                                   sends `size` and `created` on each entry,
+#                                   declared by the model and always null; POST
+#                                   /api/certificates/<domain>/renew sends
+#                                   `duration` and `dns_provider`, also always
+#                                   null; the model declares `certificate_match`
+#                                   as the boolean it is sent as (#1108). 2.37,
+#                                   MINOR, by decision: three status codes change
+#                                   for an existing condition, which the rule
+#                                   below calls MAJOR. The answers they replace
+#                                   were a 500, a 404 on a success and a 400 for
+#                                   a missing resource, none of them one a caller
+#                                   can have been asked to depend on, so the
+#                                   number moves by a MINOR and this line is for
+#                                   whoever did branch on them. (#1089, the same
+#                                   kind of change, moved nothing.)
+#
+#
+#   Inventory configuration        POST /api/inventory/config is applied
+#                                   entirely or not at all: every section
+#                                   (discovery, ct_monitoring,
+#                                   domain_registration, domain_health,
+#                                   dns_resolver) is validated before any is
+#                                   saved, where a refused section answered 400
+#                                   after the sections ahead of it had been saved
+#                                   (#1109). A field of the wrong type (null
+#                                   where a number goes, a number or a string
+#                                   where a list goes) is a 400 that names the
+#                                   field, where it was a 500. 2.38, MINOR, on
+#                                   the same terms as 2.37: the status code of an
+#                                   existing condition changes (a 500 for a body
+#                                   the caller got wrong), and the answers it
+#                                   replaces were not ones a caller can have
+#                                   depended on.
+#
+#
+#   CRL information                GET /api/crl/download/info sends `issuer` as
+#                                   the name in the form RFC 4514 gives
+#                                   (`CN=CertMate CA,O=CertMate,C=CH`), where it
+#                                   sent the Python representation of the name
+#                                   object (`<Name(CN=CertMate
+#                                   CA,O=CertMate,C=CH)>`: a library's debug
+#                                   text) (#1111). The content is the same,
+#                                   without the wrapper, and it is the form
+#                                   docs/api.md already showed and the
+#                                   inventory's `issuer` already uses. 2.39,
+#                                   MINOR, on the terms of 2.37: a value changes
+#                                   for an existing field, and nothing in the
+#                                   repository (dashboard, clients, tests) read
+#                                   it.
+#
+#   When a certificate renews      GET /api/certificates and
+#                                   /api/certificates/<domain> carry `renews_at`,
+#                                   the instant the renewal sweep renews the
+#                                   certificate at (#393), and `needs_renewal` is
+#                                   true from that instant, decided by one rule
+#                                   (modules/core/renewal_policy.py): the
+#                                   threshold where it is at most half the
+#                                   lifetime, the lifetime rule where it is not,
+#                                   the CA's recorded ARI window within a floor.
+#                                   It used to be `days_left <= threshold`, which
+#                                   said "due" up to a night before anything
+#                                   happened for a 90-day certificate and up to
+#                                   two weeks before for a 45-day one, while
+#                                   certbot's own gate decided. 2.40, MINOR: a
+#                                   new field, and `needs_renewal` keeps its
+#                                   documented meaning (whether the certificate
+#                                   needs renewing) and now matches what the
+#                                   sweep does; for a 90-day certificate the
+#                                   renewal happens when it did.
+#
+#   ACME profiles                  POST /api/certificates/create and
+#                                   /api/certificates/<domain>/reissue accept
+#                                   `acme_profile` (#395), the profile to ask
+#                                   the CA for ('tlsserver', 'shortlived' on
+#                                   Let's Encrypt), required at issuance and
+#                                   preferred at renewal; the certificate's
+#                                   answer carries `acme_profile` and
+#                                   `acme_profile_withdrawn_at` (a renewal found
+#                                   the CA no longer offers it). A CA account
+#                                   can name a default (`acme_profile`, through
+#                                   the dashboard's account route). 2.41, MINOR:
+#                                   an optional request field and two response
+#                                   fields.
+#
+#   One form for date-times        Every date-time in an answer is ISO 8601 UTC
+#                                   with a `Z` (#1127): 39 fields had no offset
+#                                   (UTC, written naive so the files on disk keep
+#                                   their form, which a caller read as local
+#                                   time) and 5 had `+00:00`; the answers are
+#                                   rewritten on the way out
+#                                   (modules/api/timestamps.py), the files are
+#                                   not. A certificate's `expires_at` is new;
+#                                   `expiry_date` keeps its own form and is
+#                                   deprecated (#1114). A backup listed without
+#                                   metadata had its `created` in the host's
+#                                   local time; it is UTC. 2.42, MINOR, declared
+#                                   with the maintainer: the instants do not
+#                                   change, only how they are written, and the
+#                                   release notes say so for a client that
+#                                   compares the strings.
+#
+#   A key restricted with `allowed_domains`, and a request without the role
+#                                   A key that carries `allowed_domains` is
+#                                   answered 403 DOMAIN_OUT_OF_SCOPE on a
+#                                   certificate that covers a name outside its
+#                                   scope, or whose names cannot be read, and
+#                                   the list leaves that certificate out
+#                                   (#1158, shipped in v2.48.2 with this number
+#                                   unmoved; #1163). The client-certificate
+#                                   routes, the backup routes and the inventory
+#                                   configuration answer it 403 (#1166, #1167).
+#                                   POST /api/certificates/<domain>/reissue
+#                                   answers it 403, not 404, for a name outside
+#                                   its scope that has no certificate (#1167).
+#                                   /metrics answers it with the series about
+#                                   its own domains (#1171). A key stored with
+#                                   the admin role and `allowed_domains` acts
+#                                   as operator, and GET /api/keys reports that
+#                                   role (#1168). A request with no credentials
+#                                   or below the role is answered 401 or 403
+#                                   before its body is validated, where seven
+#                                   routes answered 400 about the body (#1172).
+#                                   POST /api/certificates/deployment-status/
+#                                   browser keeps `method`, `source` and
+#                                   `checked_at` only in the form the dashboard
+#                                   sends them (#1173). 2.43. New answers to
+#                                   existing requests, which the rule below
+#                                   calls MAJOR; counted as the security fixes
+#                                   they are (2.7, 2.31, 2.32).
+#                                   A key that carries `allowed_domains` is
+#                                   answered 403 DOMAIN_OUT_OF_SCOPE by GET
+#                                   /api/settings, GET /api/settings/
+#                                   dns-providers and GET /api/storage/info,
+#                                   which are the instance's, and the inventory
+#                                   gives it a certificate only when its scope
+#                                   covers every name of it, where one name was
+#                                   enough (#1184). The cache statistics give
+#                                   it the entries its scope covers (#1181).
+#                                   2.44. Counted as 2.43 was.
+#
 # Bump the MINOR when the surface grows in a way a caller can ignore: a new
 # endpoint, a new field on a response, a new optional request field. Bump the
 # MAJOR when something a caller may depend on goes away or changes meaning: an
@@ -480,16 +665,21 @@ METADATA_SCHEMA_VERSION = 1
 # rather than removing. It is announced with the Deprecation and Sunset headers
 # (see modules/api/deprecation.py) and the removal is what bumps the major.
 #
-# WHAT CHECKS THIS, AND WHAT DOES NOT. tests/test_the_contract_moves_with_the_
-# surface.py compares a snapshot of the ROUTES against the tree, so it catches
-# an endpoint appearing or going away and nothing else. The rule above has six
-# clauses and that gate sees two. A new field on a response, a field removed or
-# retyped, a request field becoming required, a status code changing for an
-# existing condition: all of those can ship with this number unmoved, and one
-# already did — `url_hint` above went out in 2.19. If you are changing what a
-# response CONTAINS rather than which responses exist, this comment is the only
-# thing that will stop you, so read the rule and move the number yourself.
-API_CONTRACT_VERSION = '2.34'
+# WHAT CHECKS THIS, AND WHAT DOES NOT. Three snapshots, each recorded at the
+# version it names. tests/test_the_contract_moves_with_the_surface.py compares the
+# ROUTES; tests/test_the_contract_moves_with_the_models.py the STRUCTURE of the
+# OpenAPI document (models, enums, parameters, status codes);
+# tests/test_the_contract_moves_with_the_routes.py CALLS 108 of the 111 routes on
+# the real app, sealed from the network, and compares the fields, types and status
+# codes of the ANSWER, which is the only thing that sees the 62 operations the
+# document declares without a schema (#1105) and the 42 it does not describe. It
+# refuses a server error and an answer whose status and body disagree. Each
+# difference is printed with the way the version has to move. Nothing sees the
+# REQUEST side (handlers and docs/api.md), a list that is empty in the plan (the
+# snapshot lists these), a route with no 2xx answer (listed with its reason), the
+# dashboard's /api/web/ calls, or a change of MEANING with the structure
+# unchanged: for those, read the rule and move the number yourself.
+API_CONTRACT_VERSION = '2.44'
 
 # Protocols the deployment probe can speak. A domain fact, not an API one: the
 # service validates against it and modules/api/tls_probe drives it (#672 — it
@@ -507,18 +697,3 @@ DEFAULT_CACHE_TTL = 300
 # could only misdescribe them. They stay next to the algorithm that reads
 # them.
 
-
-def get_domain_name(domain_config):
-    """Extract domain name from either string or dict format.
-    
-    Args:
-        domain_config: Either a string domain name or a dict with 'domain' key
-        
-    Returns:
-        str or None: The domain name, or None if not found
-    """
-    if isinstance(domain_config, str):
-        return domain_config
-    elif isinstance(domain_config, dict):
-        return domain_config.get('domain')
-    return None

@@ -20,6 +20,7 @@ Todos los endpoints de la API requieren autenticación mediante Bearer token.
 
 ### Formato del encabezado
 
+<!-- illustration: the header every authenticated request carries -->
 ```
 Authorization: Bearer TU_TOKEN
 ```
@@ -50,9 +51,10 @@ Los endpoints de la API tienen límites de tasa para prevenir abusos:
 
 Cuando se supera el límite de tasa, recibirás:
 
-```
-HTTP 429 Too Many Requests
+`HTTP 429 Too Many Requests`
 
+<!-- response: GET /api/health 429 -->
+```json
 {
  "error": "Rate limit exceeded",
  "message": "Too many requests. Please try again later.",
@@ -73,6 +75,7 @@ HTTP 429 Too Many Requests
 Crea un nuevo certificado de cliente.
 
 **Solicitud**:
+<!-- request: POST /api/client-certs/create -->
 ```json
 {
  "common_name": "user@example.com",
@@ -97,15 +100,45 @@ Crea un nuevo certificado de cliente.
 - `notes` (opcional) — Notas adicionales
 
 **Respuesta** (201 Created):
+<!-- response: POST /api/client-certs/create 201 -->
 ```json
 {
- "identifier": "cert-abc123",
- "common_name": "user@example.com",
- "serial_number": "12345678901234567890",
- "created_at": "2024-10-30T18:00:00Z",
- "expires_at": "2025-10-30T18:00:00Z",
- "cert_usage": "api-mtls",
- "status": "active"
+  "identifier": "user-example.com-3f9c2a71",
+  "paths": {
+    "certificate": "/app/data/certs/client/api/user-example.com-3f9c2a71/user-example.com-3f9c2a71.crt",
+    "private_key": "/app/data/certs/client/api/user-example.com-3f9c2a71/user-example.com-3f9c2a71.key",
+    "csr": "/app/data/certs/client/api/user-example.com-3f9c2a71/user-example.com-3f9c2a71.csr",
+    "metadata": "/app/data/certs/client/api/user-example.com-3f9c2a71/metadata.json"
+  },
+  "metadata": {
+    "type": "client",
+    "identifier": "user-example.com-3f9c2a71",
+    "common_name": "user@example.com",
+    "email": "user@example.com",
+    "organization": "ACME Corp",
+    "organizational_unit": "Engineering",
+    "cert_usage": "api-mtls",
+    "key_usage": [
+      "digitalSignature",
+      "keyEncipherment"
+    ],
+    "extended_key_usage": [
+      "clientAuth"
+    ],
+    "created_at": "2026-10-03T09:14:02.481217Z",
+    "expires_at": "2027-10-03T09:14:02.481222Z",
+    "days_valid": 365,
+    "serial_number": "106344602611902843865865504921679461731856720169",
+    "renewal_enabled": true,
+    "renewal_threshold_days": 30,
+    "csr_required": false,
+    "ca_used": "internal",
+    "revoked": false,
+    "revoked_at": null,
+    "reason_revoked": null,
+    "crl_entry_serial": null,
+    "notes": "Production certificate"
+  }
 }
 ```
 
@@ -137,30 +170,101 @@ Lista todos los certificados de cliente con filtrado opcional.
 - `search` (opcional) — Buscar en el nombre común
 
 **Respuesta** (200 OK):
+<!-- response: GET /api/client-certs 200 -->
 ```json
 {
- "certificates": [{
- "identifier": "cert-001",
- "common_name": "user1@example.com",
- "organization": "ACME Corp",
- "cert_usage": "api-mtls",
- "created_at": "2024-10-30T18:00:00Z",
- "expires_at": "2025-10-30T18:00:00Z",
- "revoked": false,
- "status": "active"
- },
- {
- "identifier": "cert-002",
- "common_name": "user2@example.com",
- "organization": "ACME Corp",
- "cert_usage": "vpn",
- "created_at": "2024-10-29T18:00:00Z",
- "expires_at": "2025-10-29T18:00:00Z",
- "revoked": true,
- "status": "revoked"
- }
- ],
- "total": 2
+  "certificates": [
+    {
+      "type": "client",
+      "identifier": "user-example.com-8d41e0b6",
+      "common_name": "user@example.com",
+      "email": "user@example.com",
+      "organization": "ACME Corp",
+      "organizational_unit": "Engineering",
+      "cert_usage": "api-mtls",
+      "key_usage": [
+        "digitalSignature",
+        "keyEncipherment"
+      ],
+      "extended_key_usage": [
+        "clientAuth"
+      ],
+      "created_at": "2027-09-04T02:00:11.904130Z",
+      "expires_at": "2028-09-03T02:00:11.904134Z",
+      "days_valid": 365,
+      "serial_number": "38880296300846741349714468885652733141547560996",
+      "renewal_enabled": true,
+      "renewal_threshold_days": 30,
+      "csr_required": false,
+      "ca_used": "internal",
+      "revoked": false,
+      "revoked_at": null,
+      "reason_revoked": null,
+      "crl_entry_serial": null,
+      "notes": "Renewal of user-example.com-3f9c2a71"
+    },
+    {
+      "type": "client",
+      "identifier": "user-example.com-3f9c2a71",
+      "common_name": "user@example.com",
+      "email": "user@example.com",
+      "organization": "ACME Corp",
+      "organizational_unit": "Engineering",
+      "cert_usage": "api-mtls",
+      "key_usage": [
+        "digitalSignature",
+        "keyEncipherment"
+      ],
+      "extended_key_usage": [
+        "clientAuth"
+      ],
+      "created_at": "2026-10-03T09:14:02.481217Z",
+      "expires_at": "2027-10-03T09:14:02.481222Z",
+      "days_valid": 365,
+      "serial_number": "106344602611902843865865504921679461731856720169",
+      "renewal_enabled": false,
+      "renewal_threshold_days": 30,
+      "csr_required": false,
+      "ca_used": "internal",
+      "revoked": false,
+      "revoked_at": null,
+      "reason_revoked": null,
+      "crl_entry_serial": null,
+      "notes": "Production certificate",
+      "superseded_by": "user-example.com-8d41e0b6",
+      "superseded_at": "2027-09-04T02:00:11.912558Z"
+    },
+    {
+      "type": "client",
+      "identifier": "laptop-17-c02e94d5",
+      "common_name": "laptop-17",
+      "email": "",
+      "organization": "ACME Corp",
+      "organizational_unit": "IT",
+      "cert_usage": "vpn",
+      "key_usage": [
+        "digitalSignature",
+        "keyEncipherment"
+      ],
+      "extended_key_usage": [
+        "clientAuth"
+      ],
+      "created_at": "2026-08-12T15:41:27.118346Z",
+      "expires_at": "2027-08-12T15:41:27.118350Z",
+      "days_valid": 365,
+      "serial_number": "571206345791062948120556172980012647738192614",
+      "renewal_enabled": true,
+      "renewal_threshold_days": 30,
+      "csr_required": false,
+      "ca_used": "internal",
+      "revoked": true,
+      "revoked_at": "2026-09-30T08:02:51.733905Z",
+      "reason_revoked": "key_compromise",
+      "crl_entry_serial": null,
+      "notes": ""
+    }
+  ],
+  "total": 3
 }
 ```
 
@@ -192,34 +296,44 @@ curl "http://localhost:8000/api/client-certs?search=user1" \
 Obtiene los metadatos completos de un certificado.
 
 **Respuesta** (200 OK):
+<!-- response: GET /api/client-certs/<identifier> 200 -->
 ```json
 {
- "type": "client_certificate",
- "identifier": "cert-001",
- "common_name": "user@example.com",
- "email": "user@example.com",
- "organization": "ACME Corp",
- "organizational_unit": "Engineering",
- "serial_number": "12345678901234567890",
- "created_at": "2024-10-30T18:00:00Z",
- "expires_at": "2025-10-30T18:00:00Z",
- "cert_usage": "api-mtls",
- "notes": "Production certificate",
- "revocation": {
- "revoked": false,
- "revoked_at": null,
- "reason_revoked": null
- },
- "renewal": {
- "renewal_enabled": true,
- "renewal_threshold_days": 30
- }
+  "type": "client",
+  "identifier": "user-example.com-3f9c2a71",
+  "common_name": "user@example.com",
+  "email": "user@example.com",
+  "organization": "ACME Corp",
+  "organizational_unit": "Engineering",
+  "cert_usage": "api-mtls",
+  "key_usage": [
+    "digitalSignature",
+    "keyEncipherment"
+  ],
+  "extended_key_usage": [
+    "clientAuth"
+  ],
+  "created_at": "2026-10-03T09:14:02.481217Z",
+  "expires_at": "2027-10-03T09:14:02.481222Z",
+  "days_valid": 365,
+  "serial_number": "106344602611902843865865504921679461731856720169",
+  "renewal_enabled": false,
+  "renewal_threshold_days": 30,
+  "csr_required": false,
+  "ca_used": "internal",
+  "revoked": false,
+  "revoked_at": null,
+  "reason_revoked": null,
+  "crl_entry_serial": null,
+  "notes": "Production certificate",
+  "superseded_by": "user-example.com-8d41e0b6",
+  "superseded_at": "2027-09-04T02:00:11.912558Z"
 }
 ```
 
 **Ejemplo**:
 ```bash
-curl http://localhost:8000/api/client-certs/cert-001 \
+curl http://localhost:8000/api/client-certs/user-example.com-3f9c2a71 \
  -H "Authorization: Bearer TOKEN"
 ```
 
@@ -242,17 +356,17 @@ Descarga el certificado, la clave privada o el archivo CSR.
 **Ejemplos**:
 ```bash
 # Descargar el certificado
-curl http://localhost:8000/api/client-certs/cert-001/download/crt \
+curl http://localhost:8000/api/client-certs/user-example.com-3f9c2a71/download/crt \
  -H "Authorization: Bearer TOKEN" \
  -o certificate.crt
 
 # Descargar la clave privada
-curl http://localhost:8000/api/client-certs/cert-001/download/key \
+curl http://localhost:8000/api/client-certs/user-example.com-3f9c2a71/download/key \
  -H "Authorization: Bearer TOKEN" \
  -o private.key
 
 # Descargar el CSR
-curl http://localhost:8000/api/client-certs/cert-001/download/csr \
+curl http://localhost:8000/api/client-certs/user-example.com-3f9c2a71/download/csr \
  -H "Authorization: Bearer TOKEN" \
  -o request.csr
 ```
@@ -266,6 +380,7 @@ curl http://localhost:8000/api/client-certs/cert-001/download/csr \
 Revoca un certificado con un motivo opcional.
 
 **Solicitud** (opcional):
+<!-- request: POST /api/client-certs/<identifier>/revoke -->
 ```json
 {
  "reason": "compromised"
@@ -273,17 +388,16 @@ Revoca un certificado con un motivo opcional.
 ```
 
 **Respuesta** (200 OK):
+<!-- response: POST /api/client-certs/<identifier>/revoke 200 -->
 ```json
 {
- "message": "Certificate revoked: cert-001",
- "revoked_at": "2024-10-30T18:15:00Z",
- "reason": "compromised"
+  "message": "Certificate revoked: user-example.com-3f9c2a71"
 }
 ```
 
 **Ejemplo**:
 ```bash
-curl -X POST http://localhost:8000/api/client-certs/cert-001/revoke \
+curl -X POST http://localhost:8000/api/client-certs/user-example.com-3f9c2a71/revoke \
  -H "Authorization: Bearer TOKEN" \
  -H "Content-Type: application/json" \
  -d '{
@@ -300,20 +414,51 @@ curl -X POST http://localhost:8000/api/client-certs/cert-001/revoke \
 Renueva un certificado (mismo CN, nuevo número de serie).
 
 **Respuesta** (201 Created):
+<!-- response: POST /api/client-certs/<identifier>/renew 201 -->
 ```json
 {
- "identifier": "cert-001-renewed",
- "common_name": "user@example.com",
- "serial_number": "98765432109876543210",
- "created_at": "2024-10-30T18:20:00Z",
- "expires_at": "2025-10-30T18:20:00Z",
- "status": "active"
+  "identifier": "user-example.com-8d41e0b6",
+  "paths": {
+    "certificate": "/app/data/certs/client/api/user-example.com-8d41e0b6/user-example.com-8d41e0b6.crt",
+    "private_key": "/app/data/certs/client/api/user-example.com-8d41e0b6/user-example.com-8d41e0b6.key",
+    "csr": "/app/data/certs/client/api/user-example.com-8d41e0b6/user-example.com-8d41e0b6.csr",
+    "metadata": "/app/data/certs/client/api/user-example.com-8d41e0b6/metadata.json"
+  },
+  "metadata": {
+    "type": "client",
+    "identifier": "user-example.com-8d41e0b6",
+    "common_name": "user@example.com",
+    "email": "user@example.com",
+    "organization": "ACME Corp",
+    "organizational_unit": "Engineering",
+    "cert_usage": "api-mtls",
+    "key_usage": [
+      "digitalSignature",
+      "keyEncipherment"
+    ],
+    "extended_key_usage": [
+      "clientAuth"
+    ],
+    "created_at": "2027-09-04T02:00:11.904130Z",
+    "expires_at": "2028-09-03T02:00:11.904134Z",
+    "days_valid": 365,
+    "serial_number": "38880296300846741349714468885652733141547560996",
+    "renewal_enabled": true,
+    "renewal_threshold_days": 30,
+    "csr_required": false,
+    "ca_used": "internal",
+    "revoked": false,
+    "revoked_at": null,
+    "reason_revoked": null,
+    "crl_entry_serial": null,
+    "notes": "Renewal of user-example.com-3f9c2a71"
+  }
 }
 ```
 
 **Ejemplo**:
 ```bash
-curl -X POST http://localhost:8000/api/client-certs/cert-001/renew \
+curl -X POST http://localhost:8000/api/client-certs/user-example.com-3f9c2a71/renew \
  -H "Authorization: Bearer TOKEN"
 ```
 
@@ -326,19 +471,22 @@ curl -X POST http://localhost:8000/api/client-certs/cert-001/renew \
 Obtiene estadísticas de uso de los certificados.
 
 **Respuesta** (200 OK):
+<!-- response: GET /api/client-certs/stats 200 -->
 ```json
 {
- "total": 100,
- "active": 85,
- "revoked": 15,
- "expiring_soon": 8,
- "by_usage": {
- "api-mtls": 60,
- "vpn": 35,
- "other": 5
- },
- "created_count": 100,
- "renewal_enabled": 92
+  "total": 100,
+  "active": 85,
+  "revoked": 15,
+  "by_usage": {
+    "api-mtls": 60,
+    "vpn": 35,
+    "custom-application": 5
+  },
+  "by_organization": {
+    "ACME Corp": 92,
+    "ACME Labs": 8
+  },
+  "ca_status": "active"
 }
 ```
 
@@ -357,36 +505,65 @@ curl http://localhost:8000/api/client-certs/stats \
 Crea múltiples certificados a partir de datos CSV en una sola solicitud.
 
 **Solicitud**:
+<!-- request: POST /api/client-certs/batch -->
 ```json
 {
- "headers": ["common_name", "email", "organization", "cert_usage", "days_valid"],
- "rows": [["user1@example.com", "user1@example.com", "ACME Corp", "api-mtls", "365"],
- ["user2@example.com", "user2@example.com", "ACME Corp", "vpn", "365"],
- ["user3@example.com", "user3@example.com", "ACME Corp", "api-mtls", "365"]
- ]
+  "headers": [
+    "common_name",
+    "email",
+    "organization",
+    "cert_usage",
+    "days_valid"
+  ],
+  "rows": [
+    [
+      "user1@example.com",
+      "user1@example.com",
+      "ACME Corp",
+      "api-mtls",
+      "365"
+    ],
+    [
+      "user2@example.com",
+      "user2@example.com",
+      "ACME Corp",
+      "vpn",
+      "365"
+    ],
+    [
+      "",
+      "nobody@example.com",
+      "ACME Corp",
+      "api-mtls",
+      "365"
+    ]
+  ]
 }
 ```
 
 **Respuesta** (201 Created):
+<!-- response: POST /api/client-certs/batch 201 -->
 ```json
 {
- "total": 3,
- "successful": 3,
- "failed": 0,
- "errors": [],
- "certificates": [{
- "identifier": "cert-batch-001",
- "common_name": "user1@example.com"
- },
- {
- "identifier": "cert-batch-002",
- "common_name": "user2@example.com"
- },
- {
- "identifier": "cert-batch-003",
- "common_name": "user3@example.com"
- }
- ]
+  "total": 3,
+  "successful": 2,
+  "failed": 1,
+  "errors": [
+    {
+      "row": 4,
+      "error": "Common name is required"
+    }
+  ],
+  "certificates": [
+    {
+      "identifier": "user1-example.com-0b7d13e9",
+      "common_name": "user1@example.com"
+    },
+    {
+      "identifier": "user2-example.com-e5a28f40",
+      "common_name": "user2@example.com"
+    }
+  ]
 }
 ```
 
@@ -414,6 +591,7 @@ curl -X POST http://localhost:8000/api/client-certs/batch \
 Consulta el estado de un certificado mediante OCSP.
 
 **Respuesta** (200 OK):
+<!-- response: GET /api/ocsp/status/<serial_number> 200 -->
 ```json
 {
  "response_status": "successful",
@@ -464,6 +642,7 @@ curl http://localhost:8000/api/crl/download/info \
 ```
 
 **Respuesta de información de la CRL**:
+<!-- response: GET /api/crl/download/info 200 -->
 ```json
 {
  "status": "available",
@@ -532,6 +711,7 @@ curl "http://localhost:8000/api/certificates/example.com/download?format=json" \
 Edita la configuración de un certificado y lo reemite en su lugar — permite ampliar o eliminar entradas SAN sin necesidad de eliminar y volver a crear. Los campos omitidos conservan los valores con los que se emitió el certificado (leídos desde sus metadatos), por lo que la configuración de DNS/alias/CA no es necesario volver a introducirla. El certificado actual sigue sirviéndose hasta que la reemisión tenga éxito. La forma de la clave se preserva salvo cambio explícito (no se envían indicadores de clave y certbot conserva la clave de la cadena de certificados).
 
 **Cuerpo de la solicitud** (todos los campos son opcionales):
+<!-- request: POST /api/certificates/<domain>/reissue -->
 ```json
 {
   "san_domains": ["www.example.com", "api.example.com"],
@@ -564,6 +744,7 @@ curl -X POST http://localhost:8000/api/certificates/example.com/reissue \
 
 ### Formato de respuesta de error
 
+<!-- illustration: the error envelope every route uses -->
 ```json
 {
  "error": "Error message",
@@ -609,6 +790,7 @@ Las operaciones del ciclo de vida de los certificados y los cambios de configura
 
 El log de auditoría se escribe en `logs/audit/certificate_audit.log`. Cada línea es una línea de log Python estándar cuyo mensaje es la entrada de auditoría en JSON:
 
+<!-- illustration: a line of the audit log file -->
 ```
 2026-06-15 18:00:00 - certmate.audit - INFO - {"timestamp": "...", ...}
 ```
@@ -621,6 +803,7 @@ tail -f logs/audit/certificate_audit.log
 
 ### Estructura de la entrada
 
+<!-- illustration: an entry of the audit log file -->
 ```json
 {
   "timestamp": "2026-06-15T18:00:00.000000+00:00",
@@ -660,8 +843,20 @@ Junto al log legible por humanos, cada entrada se añade a una **cadena de hash*
 
 **Verificación desde la API:** `GET /api/audit/verify` (admin) devuelve el resultado del verificador y HTTP `200` cuando está íntegra o `409` cuando está rota:
 
+<!-- response: GET /api/audit/verify 200 -->
 ```json
-{"ok": true, "count": 128, "first_seq": 0, "last_seq": 127, "head_hash": "5ee1…", "reason": "intact"}
+{
+  "ok": true,
+  "count": 128,
+  "first_seq": 0,
+  "last_seq": 127,
+  "head_hash": "5ee1c0d9a8f46b02e7c3d51f9a20b8e4c6f7d3a1b9e05c28d4f6a7b3e1c9d02f",
+  "error_seq": null,
+  "reason": "intact",
+  "checkpoint_verified": true,
+  "checkpoint_seq": 99,
+  "checkpoint_reason": "consistent with signed checkpoint at seq 99"
+}
 ```
 
 **Verificación fuera del servidor:** el verificador autónomo solo depende de la biblioteca estándar de Python, por lo que un auditor puede ejecutarlo sin instalar ni confiar en CertMate:
@@ -697,6 +892,7 @@ El verificador comprueba la estructura de la cadena, que el manifiesto coincide 
 
 Para la autenticación de clientes de API mediante TLS mutuo.
 
+<!-- illustration: a value of cert_usage -->
 ```
 cert_usage: "api-mtls"
 ```
@@ -705,6 +901,7 @@ cert_usage: "api-mtls"
 
 Para la autenticación de clientes VPN.
 
+<!-- illustration: a value of cert_usage -->
 ```
 cert_usage: "vpn"
 ```
@@ -713,6 +910,7 @@ cert_usage: "vpn"
 
 Puedes usar cualquier cadena de texto como tipo de uso personalizado:
 
+<!-- illustration: a value of cert_usage -->
 ```
 cert_usage: "custom-application"
 ```

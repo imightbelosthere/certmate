@@ -37,7 +37,7 @@
 CertMate is the open-source core of a small, focused toolset:
 
 - **[certmate-tools](https://github.com/fabriziosalmi/certmate-tools)** — free, privacy-first, client-side TLS / certificate / ACME diagnostics (runs entirely in your browser).
-- **[certmate-agent](https://github.com/fabriziosalmi/certmate-agent)** — conversational assistant: a local LLM mapped 1:1 to CertMate's REST API, with RAG over the docs.
+- **[certmate-agent](https://github.com/fabriziosalmi/certmate-agent)** — conversational assistant over the docs.
 - **[nis2-public](https://github.com/fabriziosalmi/nis2-public)** — NIS2 continuous posture management & remediation.
 
 **Enterprise / high-scale** — multi-tenant, mTLS, white-label and NIS2-aligned deployments are available through *CertMate-ng* (source-available, BSL 1.1, EU-built). For access or a deployment discussion, email **fabrizio.salmi@gmail.com**.
@@ -114,7 +114,7 @@ Full tool reference, attribution model and safety notes: **[docs/mcp.md](docs/mc
 
 CertMate solves the complexity of SSL certificate management in modern distributed architectures. Whether you're running a single application or managing certificates across multiple datacenters, CertMate provides:
 
-- **Zero-Downtime Automation** - Certificates renew automatically 30 days before expiry, with deploy hooks to reload services
+- **Zero-Downtime Automation** - Certificates renew automatically (30 days before expiry by default; earlier in the life of a certificate that lives under 60 days — see [when a certificate renews](docs/guide.md#when-a-certificate-renews)), with deploy hooks to reload services
 - **Multi-Cloud Support** - Cloudflare, AWS, Azure, GCP, Akamai Edge DNS, Hetzner, Porkbun, GoDaddy and the rest — [docs/dns-providers.md](docs/dns-providers.md) has the full list
 - **Enterprise-Ready** - RBAC, scoped API keys, Docker, Kubernetes, REST API, and monitoring built-in
 - **Simple Integration** - One-URL certificate downloads for easy automation
@@ -146,7 +146,7 @@ CertMate solves the complexity of SSL certificate management in modern distribut
 - **Wildcard Support** - Single certificate for `*.example.com` and `example.com`
 - **Multi-Domain Certificates** - SAN certificates for multiple domains
 - **DNS Alias via CNAME Delegation** - Delegate ACME DNS validation to an alternative domain using standard CNAME records
-- **Automatic Renewal** - Smart renewal 30 days before expiry
+- **Automatic Renewal** - One rule for every lifetime, and the CA's renewal window (ARI) can move it; each certificate says when it renews (`renews_at`)
 - **Certificate Validation** - Real-time SSL certificate status checking
 - **Per-Certificate CA Selection** - Choose different CAs for different certificates
 - **Zombie Certificate Scanner** - multi-threaded probe that asks whether the names in your managed certificates still resolve and answer, so a domain you have let go is visible before its renewals start failing
@@ -375,17 +375,17 @@ Choose the installation method that best fits your environment:
 ### Docker (Recommended)
 Isolated, reproducible, and the way CertMate is tested and released. Run **one**
 container (see the single-instance note above); give it more CPU and memory
-rather than more replicas. **Published images cover two architectures**: AMD64 (Intel/AMD) and ARM64 (Apple Silicon, ARM servers). ARM v7 (32-bit Raspberry Pi) is not published; build it yourself with `./build-multiplatform.sh --platforms linux/arm/v7`.
+rather than more replicas. **Published images cover two architectures**: AMD64 (Intel/AMD) and ARM64 (Apple Silicon, ARM servers). ARM v7 (32-bit Raspberry Pi) is not published; build it yourself with `docker buildx build --platform linux/arm/v7 -t YOUR_DOCKERHUB_USERNAME/certmate:armv7 --push .` (see [Docker](docs/docker.md#manual-docker-buildx)).
 
 The production Compose bundle is one file that runs the published image; the [Quick Start](#quick-start-with-docker) above shows the commands. To build the image yourself instead, clone the repository and run `docker compose up -d` with its root `docker-compose.yml`, after preparing its bind-mounted directories as its comments describe.
 
 **Multi-Platform Support:**
 ```bash
-# Build for multiple architectures (ARM64 + AMD64)
-./build-multiplatform.sh
+# Build for multiple architectures (ARM64 + AMD64); add --push to publish the result
+docker buildx build --platform linux/amd64,linux/arm64 -t YOUR_DOCKERHUB_USERNAME/certmate:latest .
 
 # Build and push to Docker Hub for all platforms
-./build-multiplatform.sh -r YOUR_DOCKERHUB_USERNAME -p
+docker buildx build --platform linux/amd64,linux/arm64 -t YOUR_DOCKERHUB_USERNAME/certmate:latest --push .
 
 # Use pre-built multi-platform image (bound to localhost; put it behind a
 # reverse proxy and enable authentication before exposing it externally)
@@ -1727,7 +1727,7 @@ certmate/
 #### Authentication & Authorization
 - **Role-Based Access Control**: Assign viewer, operator, or admin roles to each user
 - **Scoped API Keys**: Create API keys with specific role permissions and optional expiration
-- **Per-Domain Scoping (`allowed_domains`)**: Restrict a scoped API key to a list of domain patterns. Supports exact (`example.com`) and wildcard (`*.example.com`) forms; the wildcard matches subdomains only, not the apex. Out-of-scope requests return `403 DOMAIN_OUT_OF_SCOPE` and are recorded in the audit log. Leave the field empty for unrestricted access (legacy behavior).
+- **Per-Domain Scoping (`allowed_domains`)**: Restrict a scoped API key to a list of domain patterns. Supports exact (`example.com`) and wildcard (`*.example.com`) forms; the wildcard matches subdomains only, not the apex. An operation on an existing certificate needs every name the certificate covers to be in scope, as creating it does. Client certificates, backups and the inventory configuration belong to the instance, not to a domain, so a key restricted this way cannot use those routes; `/metrics` answers it with the series about its own domains only. An admin key cannot be restricted to domains: creating one is refused, and one stored by an earlier release acts as an operator within its domains. Out-of-scope requests return `403 DOMAIN_OUT_OF_SCOPE` and are recorded in the audit log. Leave the field empty for unrestricted access (legacy behavior).
 - **HMAC-SHA256 Token Hashing**: API tokens are hashed with a server-side HMAC secret, preventing offline brute-force even if the settings file is leaked (backward compatible with pre-2.2.6 SHA-256 hashes)
 - **Strong Bearer Tokens**: Use cryptographically secure tokens (32+ characters)
 - **Token Rotation**: Regularly rotate API tokens and revoke unused keys
@@ -2489,23 +2489,19 @@ We love contributions! CertMate is an open-source project and we welcome:
 git clone https://github.com/fabriziosalmi/certmate.git
 cd certmate
 
-# Create development environment
-python3 -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt
-pip install -r requirements-test.txt
+# Create the development environment (.venv, from requirements.lock + the test requirements)
+make setup
+source .venv/bin/activate
 
-# Lint, format, and security-scan (the same tools CI runs)
-make lint
-make format
-make security
-
-# Run tests
-pytest
+# Lint, security-scan and test: the checks CI gates on (`make help` lists the rest)
+make check
 
 # Start development server
 python app.py
 ```
+
+A bare `pytest` is not the way to run the suite: it includes the Playwright `ui` tests, which
+need Docker. `make test` runs the selection [CONTRIBUTING.md](CONTRIBUTING.md) documents.
 
 ### Contribution Guidelines
 

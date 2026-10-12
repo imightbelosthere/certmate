@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Optional
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
-from flask import Flask, jsonify, request
+from flask import Flask, g, jsonify, request
 from flask_cors import CORS
 from flask_restx import Api, Namespace
 
@@ -1604,6 +1604,9 @@ def setup_api_contract_headers(app):
         return response
 
     apply_deprecation_headers(app)
+    # One form for every date-time an answer carries (#1127): modules/api/timestamps.py.
+    from modules.api.timestamps import apply_timestamp_form
+    apply_timestamp_form(app)
 
 
 def setup_correlation_ids(app):
@@ -1667,7 +1670,24 @@ def setup_correlation_ids(app):
                 logger.debug("Could not release the request log context")
 
 
+def _script_nonce():
+    """The value this response's inline scripts carry, made the first time it is asked for.
+
+    One per request and never reused: a script is the page's own when it
+    carries it, and an injected one cannot know it. Made on demand so that a
+    response that renders no template (the API, a file) and an error raised
+    before any hook ran are served the same way.
+    """
+    if 'csp_nonce' not in g:
+        g.csp_nonce = secrets.token_urlsafe(18)
+    return g.csp_nonce
+
+
 def setup_security_headers(app):
+    @app.context_processor
+    def nonce_for_templates():
+        return {'csp_nonce': _script_nonce()}
+
     @app.after_request
     def add_security_headers(response):
         response.headers['X-Frame-Options'] = 'SAMEORIGIN'
@@ -1677,10 +1697,16 @@ def setup_security_headers(app):
         if 'Content-Security-Policy' not in response.headers:
             response.headers['Content-Security-Policy'] = (
                 "default-src 'self'; "
-                # Alpine.js v3 requires 'unsafe-eval' (uses new Function() for expression
-                # evaluation). Removing it breaks the UI. The risk is mitigated by
-                # 'unsafe-inline' already being required for inline <script> blocks.
-                # To eliminate unsafe-eval, migrate to the @alpinejs/csp build.
+                # No 'unsafe-eval' and no 'unsafe-inline' for scripts (#314).
+                #
+                # Alpine is the `@alpinejs/csp` build, which parses an
+                # expression itself where the standard build compiles it with
+                # `new Function()`, and reaches nothing outside the component it
+                # is evaluated in. No markup carries an event handler: a control
+                # names an action (static/js/certmate.js). And the <script>
+                # blocks written into the templates carry this response's
+                # nonce, which is how the browser tells them from one that was
+                # injected.
                 #
                 # ReDoc and its Montserrat/Roboto fonts used to require a CDN
                 # script-src/style-src/font-src whitelist. v2.4.15 self-hosts the
@@ -1697,7 +1723,7 @@ def setup_security_headers(app):
                 # and makes no third-party request. Worth knowing that the
                 # air-gap property there rests on the CSP, not on the bundle
                 # being clean: loosening img-src would reintroduce the egress.
-                "script-src 'self' 'unsafe-inline' 'unsafe-eval'; "
+                f"script-src 'self' 'nonce-{_script_nonce()}'; "
                 "style-src 'self' 'unsafe-inline'; "
                 "font-src 'self'; "
                 "img-src 'self' data:; "
@@ -1719,6 +1745,50 @@ def setup_security_headers(app):
         if is_https or hsts_enabled:
             response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains; preload'
         return response
+
+
+def _role_required_before_validation(view_class, verb):
+    """The role a flask-restx method asks for, if its body is validated.
+
+    None when the method declares no request model (nothing is validated, so
+    nothing runs ahead of its own role check) or no `require_role`.
+    """
+    method = getattr(view_class, verb.lower(), None)
+    if method is None or not getattr(method, '__apidoc__', {}).get('expect'):
+        return None
+    markers = [getattr(method, '_certmate_protection', None)]
+    markers += [getattr(decorator, '_certmate_protection', None)
+                for decorator in getattr(view_class, 'method_decorators', None) or []]
+    for marker in markers:
+        if marker and marker.startswith('require_role:'):
+            return marker.split(':', 1)[1]
+    return None
+
+
+def setup_authorization_before_validation(app, container: AppContainer):
+    """Who is asking is settled before what they sent is read.
+
+    flask-restx validates a request's body against the route's model before it
+    calls the method, and the role check is a decorator on the method. So a
+    request with no credentials was answered about its body ("'domain' is a
+    required property") by a route that would have refused it either way. Here
+    the same check the decorator makes (`AuthManager.authorize`) runs first,
+    for the methods that have both a model and a role. The decorator still
+    runs afterwards; this only moves the refusal ahead of the validation.
+    """
+    from flask import request as flask_request
+    auth = container.managers.get('auth')
+    if auth is None:
+        return
+
+    @app.before_request
+    def authorize_before_validation():
+        view = app.view_functions.get(flask_request.endpoint)
+        view_class = getattr(view, 'view_class', None)
+        if view_class is None:
+            return None
+        role = _role_required_before_validation(view_class, flask_request.method)
+        return auth.authorize(role) if role else None
 
 
 def setup_rate_limiting(app, container: AppContainer):
@@ -1863,6 +1933,17 @@ def create_app(test_config=None):
                     "them, and they are still valid. Review them in Settings -> API "
                     "Keys: confirm the ones you made, revoke the rest.",
                     unreviewed_setup_keys=len(unreviewed))
+            restricted_admins = _auth.restricted_admin_keys()
+            if restricted_admins:
+                # Named by their key name, never by token. Not on /health: this
+                # is for whoever reads the instance's own log.
+                logger.warning(
+                    f"{len(restricted_admins)} API key(s) are stored with the admin "
+                    "role and allowed_domains. An admin key cannot be restricted to "
+                    "domains, so each acts as an operator within its domains. Replace "
+                    "them with an operator key (restricted) or an admin key "
+                    "(unrestricted): " + ", ".join(restricted_admins),
+                    restricted_admin_keys=len(restricted_admins))
     except Exception as e:
         logger.debug(f"Setup-mode startup check failed: {e}")
 
@@ -1896,6 +1977,8 @@ def create_app(test_config=None):
     setup_correlation_ids(app)
     setup_api_contract_headers(app)
     setup_rate_limiting(app, container)
+    # After the rate limit, so a flood of unauthenticated requests is still counted.
+    setup_authorization_before_validation(app, container)
     setup_slow_request_logging(app, container)
 
     # Make the app instance available to background APScheduler jobs before

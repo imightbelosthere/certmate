@@ -12,6 +12,7 @@ from pathlib import Path
 from .utils import utc_now
 from . import audit_chain
 from . import audit_signing
+from .structured_logging import PLAIN_DATEFMT, PLAIN_FORMAT, PlainLineFormatter
 from typing import Optional, Dict, Any
 
 logger = logging.getLogger(__name__)
@@ -77,6 +78,18 @@ def _unlock_file(fh) -> None:
         pass
 
 
+
+def _request_attribution():
+    """The actor and trigger of the authenticated identity behind the current request, or None
+    outside a request or without one (a failed login, the scheduler, a CLI). Derived from
+    `request.current_user` only, like audit_context_from_request, so a client header can never
+    set the kind. Does not raise: audit_context_from_request catches what it could."""
+    from flask import has_request_context, request
+    if not has_request_context() or not getattr(request, 'current_user', None):
+        return None
+    from .audit_context import audit_context_from_request
+    return audit_context_from_request()
+
 class AuditLogger:
     """Centralized audit logging for certificate operations."""
 
@@ -138,12 +151,11 @@ class AuditLogger:
                 backupCount=backup_count,
                 encoding='utf-8',
             )
+            # The audit message is JSON, which escapes its own line breaks;
+            # the plain formatter is used anyway so this format has one
+            # definition (structured_logging.PlainLineFormatter).
             self.file_handler.setFormatter(
-                logging.Formatter(
-                    '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-                    datefmt='%Y-%m-%d %H:%M:%S'
-                )
-            )
+                PlainLineFormatter(PLAIN_FORMAT, datefmt=PLAIN_DATEFMT))
         except OSError as e:
             # Previously this raised out of __init__, which the factory calls
             # unguarded — an unwritable logs directory took the whole
@@ -575,8 +587,11 @@ class AuditLogger:
                 ``{'kind': 'agent'|'user'|'api_token'|'scheduler'|'system',
                 'id': <api_key_id>, 'label': <username>, 'token_prefix': ...,
                 'agent_session': <client-supplied claim>}``. When omitted, a
-                ``{'kind': 'system', 'label': user}`` actor is synthesised so
-                existing call sites keep working and the field is always present.
+                actor is taken from the request this runs in, when there is one
+                with an authenticated identity (most call sites pass none: 63 did,
+                and every action they recorded read as `system`); otherwise a
+                ``{'kind': 'system', 'label': user}`` actor is synthesised so the
+                field is always present.
             trigger: Structured cause of the action, e.g.
                 ``{'cause': 'manual'|'api'|'agent'|'scheduled_renewal'|'event',
                 'job_id': <scheduler job id>}``. Defaults to ``{'cause': 'event'}``.
@@ -588,6 +603,13 @@ class AuditLogger:
         as an informational claim and never sets ``kind`` on its own.
         """
         try:
+            if actor is None or trigger is None:
+                attributed = _request_attribution()
+                if attributed is not None:
+                    actor = actor or attributed['actor']
+                    trigger = trigger or attributed['trigger']
+                    user = user or attributed.get('user')
+                    ip_address = ip_address or attributed.get('ip')
             audit_entry = {
                 'timestamp': utc_now().isoformat(),
                 'operation': operation,
@@ -739,26 +761,6 @@ class AuditLogger:
             },
             user=user,
             ip_address=ip_address
-        )
-
-    def log_error(
-        self,
-        operation: str,
-        resource_type: str,
-        resource_id: str,
-        error_message: str,
-        user: Optional[str] = None,
-        ip_address: Optional[str] = None
-    ) -> None:
-        """Log operation error."""
-        self.log_operation(
-            operation=operation,
-            resource_type=resource_type,
-            resource_id=resource_id,
-            status='failure',
-            user=user,
-            ip_address=ip_address,
-            error=error_message
         )
 
     # ---- Configuration & access-control mutations ----
@@ -950,24 +952,6 @@ class AuditLogger:
             resource_id=f"{scope}:{hook_id}",
             status='success',
             details={'scope': scope},
-            user=user,
-            ip_address=ip_address,
-        )
-
-    def log_ca_provider_changed(
-        self,
-        old: Optional[str],
-        new: Optional[str],
-        user: Optional[str] = None,
-        ip_address: Optional[str] = None,
-    ) -> None:
-        """Log a change to the active CA provider."""
-        self.log_operation(
-            operation='update',
-            resource_type='ca_provider',
-            resource_id='active',
-            status='success',
-            details={'before': old, 'after': new},
             user=user,
             ip_address=ip_address,
         )

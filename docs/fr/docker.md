@@ -1,6 +1,6 @@
 # Construction et déploiement Docker
 
-<!-- CERTMATE-TRANSLATED-FROM 875370d723412467 -->
+<!-- CERTMATE-TRANSLATED-FROM e7c97bf8776edb69 -->
 
 Ce guide couvre la construction, le déploiement et l'exécution de CertMate dans Docker — incluant le support multi-plateforme pour ARM et AMD64.
 
@@ -149,7 +149,7 @@ docker run -d --name certmate \
 | `API_BEARER_TOKEN_FILE` | Non | Chemin vers un fichier contenant le token bearer API (prioritaire sur `API_BEARER_TOKEN`) |
 | `CERTMATE_LOG_LEVEL` | Non | `INFO` (défaut), `DEBUG`, `WARNING`, `ERROR` |
 | `CERTMATE_BACKUP_PASSPHRASE` | Non | Quand défini, sauvegardes chiffrées au repos (`.zip.enc`, PBKDF2-SHA256 + Fernet) |
-| `CLOUDFLARE_TOKEN` | Non | Token API du compte DNS Cloudflare par défaut. Cloudflare est le seul fournisseur DNS lu depuis l'environnement : Route53 et les autres se configurent dans Paramètres → Fournisseurs DNS ou via l'API, et définir `AWS_ACCESS_KEY_ID` dans le conteneur n'a aucun effet |
+| `CLOUDFLARE_TOKEN` | Non | Token API du compte DNS Cloudflare par défaut. Route53 utilise les identifiants configurés dans Paramètres → Fournisseurs DNS, sauf si le compte choisit explicitement le mode IAM : Certbot utilise alors la chaîne d'identification AWS du conteneur (y compris les rôles IAM). |
 
 Voir le [Guide d'installation](./installation.md#variables-denvironnement) pour la liste complète.
 
@@ -252,25 +252,6 @@ CertMate supporte les images Docker multi-plateforme pour les architectures ARM 
 | `linux/arm/v7` | ARM 32-bit v7 | Raspberry Pi 3+ |
 | `linux/arm/v6` | ARM 32-bit v6 | Raspberry Pi 1, Zero |
 
-### Scripts de construction
-
-```bash
-# Construire pour la plateforme courante uniquement
-./build-docker.sh
-
-# Construire pour plusieurs plateformes (ARM64 + AMD64)
-./build-docker.sh -m
-
-# Construire et pousser vers Docker Hub
-./build-docker.sh -m -p -r VOTRE_UTILISATEUR_DOCKERHUB
-
-# Script dédié multi-plateforme
-./build-multiplatform.sh -r UTILISATEUR -v v1.0.0 -p
-
-# Construire pour Raspberry Pi
-./build-multiplatform.sh --platforms linux/arm/v7 -r UTILISATEUR -p
-```
-
 ### Docker Buildx manuel
 
 ```bash
@@ -284,6 +265,16 @@ docker buildx build --platform linux/amd64,linux/arm64 \
 # Construire et pousser
 docker buildx build --platform linux/amd64,linux/arm64 \
   -t UTILISATEUR/certmate:latest --push .
+
+# Construire pour la plateforme courante uniquement
+docker build -t certmate:latest .
+
+# Étiqueter une version et la pousser
+docker buildx build --platform linux/amd64,linux/arm64 \
+  -t UTILISATEUR/certmate:v1.0.0 -t UTILISATEUR/certmate:latest --push .
+
+# Raspberry Pi 3+ (linux/arm/v7, non publiée)
+docker buildx build --platform linux/arm/v7 -t UTILISATEUR/certmate:armv7 --push .
 ```
 
 ### Prérequis pour le multi-plateforme

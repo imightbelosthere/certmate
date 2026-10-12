@@ -1,4 +1,4 @@
-"""The prevalidated challenge appears only with an explicit Sectigo CA choice."""
+"""The prevalidated challenge is available when the effective CA is Sectigo."""
 
 import subprocess
 from pathlib import Path
@@ -19,7 +19,7 @@ const challenge = {
 const ca = {value: 'sectigo'};
 const dns = {style: {display: ''}};
 const form = {addEventListener() {}};
-global.CertMate = {escapeHtml: s => s};
+global.CertMate = {globalActions() {}, actions() {}, escapeHtml: s => s};
 global.window = {};
 global.setInterval = () => 0;
 global.document = {

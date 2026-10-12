@@ -78,6 +78,20 @@ class DNSManager:
         """
         if not isinstance(acc_config, dict):
             return False
+        if provider == 'route53':
+            if acc_config.get('auth_mode') == 'iam_role':
+                from .storage_backends import _aws_storage_auth
+                try:
+                    _aws_storage_auth(acc_config, 'Route53 DNS')
+                    return True
+                except ValueError:
+                    return False
+            if acc_config.get('auth_mode') not in (None, '', 'access_keys'):
+                return False
+            if acc_config.get('assume_role_arn'):
+                from .storage_backends import _valid_aws_role_arn
+                if not _valid_aws_role_arn(str(acc_config['assume_role_arn']).strip()):
+                    return False
         required = _DNS_PROVIDER_CREDENTIALS.get(provider)
         if required:
             # ALL required fields must be present — the same rule test_provider()
@@ -103,6 +117,14 @@ class DNSManager:
             provider, account_id=account_id, settings=settings)
         if config is None:
             return None, None
+        if provider == 'route53' and config.get('auth_mode') == 'iam_role':
+            # Old access keys/references can remain after switching to IAM.
+            # They are unused; resolving a removed secret would block the
+            # AWS credential chain before certbot ever runs.
+            unused = {'access_key_id', 'secret_access_key',
+                      'access_key_id_file', 'secret_access_key_file',
+                      'access_key_id_env', 'secret_access_key_env'}
+            config = {key: value for key, value in config.items() if key not in unused}
         try:
             return resolve(config), used_account_id
         except SecretReferenceError as exc:
@@ -433,6 +455,18 @@ class DNSManager:
         """Alias for delete_dns_account with consistent naming"""
         return self.delete_dns_account(provider, account_id, settings)
 
+    def has_account(self, provider, account_id):
+        """Does *provider* have an account called *account_id*?
+
+        `delete_dns_account` answers False both when there is no such account and when the
+        settings could not be written, so a caller that must tell "not found" (a 404) from
+        "could not save" (a 500) asks this first (#1106).
+        """
+        settings = self.settings_manager.migrate_dns_providers_to_multi_account(
+            self.settings_manager.load_settings())
+        accounts = (settings.get('dns_providers', {}).get(provider) or {}).get('accounts') or {}
+        return account_id in accounts
+
     def test_provider(self, provider, config):
         """Validate a DNS provider configuration payload.
 
@@ -450,6 +484,19 @@ class DNSManager:
 
             required = _DNS_PROVIDER_CREDENTIALS.get(provider, [])
             config = config if isinstance(config, dict) else {}
+            if provider == 'route53' and config.get('auth_mode') == 'iam_role':
+                from .storage_backends import _aws_storage_auth
+                try:
+                    _aws_storage_auth(config, 'Route53 DNS')
+                except ValueError as exc:
+                    return False, str(exc)
+                return True, 'Route53 will use the AWS credential chain (offline validation only)'
+            if provider == 'route53' and config.get('auth_mode') not in (None, '', 'access_keys'):
+                return False, 'Route53 DNS auth_mode must be access_keys or iam_role'
+            if provider == 'route53' and config.get('assume_role_arn'):
+                from .storage_backends import _valid_aws_role_arn
+                if not _valid_aws_role_arn(str(config['assume_role_arn']).strip()):
+                    return False, 'assume_role_arn must be an IAM role ARN'
             # has_value, so a field supplied as `<field>_file` / `<field>_env`
             # passes. The reference is not followed: this is a shape check, and
             # it is reached from a button in the UI.

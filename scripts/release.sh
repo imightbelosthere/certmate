@@ -7,14 +7,15 @@
 # explicit, logged override for non-issuance patches only).
 #
 # Usage:
-#   scripts/release.sh prepare X.Y.Z [--skip-real-cert "reason"] [--dry-run]
+#   scripts/release.sh prepare X.Y.Z [--skip-real-cert "reason"] [--allow-stale-base "reason"] [--dry-run]
 #       Validate + run every gate, then (unless --dry-run) branch off main,
 #       bump the version, commit, push and open the release PR.
 #   scripts/release.sh publish X.Y.Z
 #       After that PR is merged to main: tag vX.Y.Z and create the GH release
 #       from docs/releases/vX.Y.Z.md. Run this only once CI is green.
 #
-# Gates (prepare): flake8 (syntax/undefined), bandit, unit+integration suite,
+# Gates (prepare): flake8 (syntax/undefined), the three budgets (complexity, exceptions, ruff),
+# bandit, unit+integration suite,
 # UI (Playwright), real-cert E2E (LE staging via Cloudflare from .env), Docker
 # build. The unit suite includes the version-consistency and CI-marker-coverage
 # guards. Docker must be running for the UI and real-cert gates.
@@ -97,16 +98,17 @@ version_gt() {  # $1 > $2 ?
 
 # --- prepare ------------------------------------------------------------------
 cmd_prepare() {
-  local version="" skip_reason="" dry=0
+  local version="" skip_reason="" stale_base_reason="" dry=0
   version="${1:-}"; shift || true
   while [ $# -gt 0 ]; do
     case "$1" in
       --skip-real-cert) skip_reason="${2:-}"; shift 2 || die "--skip-real-cert needs a reason";;
+      --allow-stale-base) stale_base_reason="${2:-}"; [ -n "$stale_base_reason" ] || die "--allow-stale-base needs a reason"; shift 2;;
       --dry-run) dry=1; shift;;
       *) die "unknown flag: $1";;
     esac
   done
-  [ -n "$version" ] || die "usage: release.sh prepare X.Y.Z [--skip-real-cert \"reason\"] [--dry-run]"
+  [ -n "$version" ] || die "usage: release.sh prepare X.Y.Z [--skip-real-cert \"reason\"] [--allow-stale-base \"reason\"] [--dry-run]"
   semver_ok "$version" || die "not a semver X.Y.Z: $version"
 
   info "Preconditions"
@@ -176,6 +178,14 @@ $(echo "$changed" | grep -E "$SENSITIVE_RE" | sed 's/^/  /')"
 
   gate "flake8 (syntax, undefined names, dead code, bare excepts)" bash -c '
     "'"$PY"'" -m flake8 . --count --select=E9,F63,F7,F82,F811,F632,E711,E712,E713,E714,F401,F841,E722 --show-source --statistics'
+  # The checks ci.yml's lint step runs after flake8. They were not here, so a release that passed
+  # prepare could still open a release PR whose CI failed on a budget; tests/test_the_makefile_runs_
+  # what_ci_runs.py now fails when a check CI runs is missing from this list.
+  gate "budgets (complexity, broad exceptions, ruff, mypy)" bash -c '
+    "'"$PY"'" scripts/check_complexity_budget.py &&
+    "'"$PY"'" scripts/check_exception_budget.py &&
+    "'"$PY"'" scripts/check_ruff_budget.py &&
+    "'"$PY"'" scripts/check_mypy_budget.py'
   gate "bandit (medium+)" bash -c '"'"$PY"'" -m bandit -r modules/ app.py --severity-level medium -q'
   gate "unit + integration suite (incl. version + marker-coverage guards)" \
     "$PY" -m pytest -q -m "not ui and not e2e" -p no:cacheprovider
@@ -188,9 +198,16 @@ $(echo "$changed" | grep -E "$SENSITIVE_RE" | sed 's/^/  /')"
       CERTMATE_E2E_CA_PROVIDER=letsencrypt_staging "'"$PY"'" -m pytest -q -m e2e \
         tests/test_health_ready_e2e.py tests/test_cert_lifecycle.py tests/test_async_issuance_e2e.py \
         tests/test_ari_staging_e2e.py tests/test_renewal_uses_todays_settings_e2e.py \
-        tests/test_ca_account_email_e2e.py \
+        tests/test_ca_account_email_e2e.py tests/test_acme_profiles_e2e.py \
         -p no:cacheprovider'
   fi
+  # The Dockerfile pins its base by digest and nothing moves the pin, so the image a release
+  # ships can be a month of Debian fixes behind its own base (#403: 308 findings, 254 on the
+  # current digest). Fails when the pin is behind the tag AND older than two weeks; the fix is
+  # `scripts/check_base_image.py --update`. The override is logged, like --skip-real-cert.
+  local base_args=()
+  [ -z "$stale_base_reason" ] || base_args=(--allow-stale "$stale_base_reason")
+  gate "base image digest (not left behind its tag)" "$PY" scripts/check_base_image.py ${base_args[@]+"${base_args[@]}"}
   gate "Docker build" docker build -t certmate:release-check .
 
   echo; info "ALL GATES PASSED for v$version"

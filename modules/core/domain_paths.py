@@ -75,7 +75,11 @@ def is_path_safe_segment(value):
     identifiers go through it too: same rule, same consequence, different kind
     of name.
     """
-    if not value:
+    # '.' is a segment that names its parent: `cert_dir / '.' / 'metadata.json'`
+    # is `cert_dir / 'metadata.json'`. No caller can deliver it today (the
+    # domain validators refuse it first), but this is the rule the metadata
+    # write relies on, so it says so itself.
+    if not value or value == '.':
         return False
     return not any(bad in value for bad in _PATH_UNSAFE)
 
@@ -101,7 +105,7 @@ def validate_domain_path(domain, cert_base_dir):
         return None, 'Invalid domain name'
     if not DOMAIN_RE.match(domain):
         return None, 'Invalid domain format'
-    cert_dir = Path(cert_base_dir) / domain
+    cert_dir = certificate_dir(cert_base_dir, domain)
     try:
         resolved = cert_dir.resolve()
         base_resolved = Path(cert_base_dir).resolve()
@@ -111,3 +115,47 @@ def validate_domain_path(domain, cert_base_dir):
     except (OSError, ValueError):
         return None, 'Invalid domain path'
     return cert_dir, None
+
+
+# --- Where a certificate lives on disk (#854, step 1: #1146) ----------------
+#
+# A server certificate is identified by a NAME, and every path below is built
+# from it here and nowhere else. Today the name is the domain, for every
+# certificate that exists: the directory, `metadata.json`'s domain, certbot's
+# lineage (`live/<name>`, `archive/<name>`, `renewal/<name>.conf`) and the
+# settings entry are the same string, measured on a real install. So these are
+# plain joins and nothing changes.
+#
+# They exist so that the day the name can differ from the domain (a public and
+# a private certificate for one hostname, #854) there is one place that knows
+# the layout, rather than sixty that each assumed it. These do NOT validate:
+# callers validate with `validate_domain_path` first, as before.
+# tests/test_certificate_paths_have_one_home.py refuses a path built from the
+# name anywhere else.
+
+def certificate_dir(cert_base_dir, name):
+    """The certificate's own directory: `<cert_dir>/<name>`."""
+    return Path(cert_base_dir) / name
+
+
+def certificate_file(cert_base_dir, name, filename):
+    """A file in the certificate's directory (`cert.pem`, `metadata.json`, ...)."""
+    return certificate_dir(cert_base_dir, name) / filename
+
+
+def lineage_live_dir(certificate_directory, name):
+    """certbot's `live/<name>` inside the certificate's own config dir.
+
+    certbot names the lineage after `--cert-name`, which CertMate always passes
+    as the name, wildcards included (`live/*.example.com`)."""
+    return Path(certificate_directory) / 'live' / name
+
+
+def lineage_archive_dir(certificate_directory, name):
+    """certbot's `archive/<name>`."""
+    return Path(certificate_directory) / 'archive' / name
+
+
+def renewal_conf(certificate_directory, name):
+    """certbot's `renewal/<name>.conf`."""
+    return Path(certificate_directory) / 'renewal' / f'{name}.conf'

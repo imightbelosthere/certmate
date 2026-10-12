@@ -14,7 +14,7 @@ import threading
 import uuid
 import time
 from functools import wraps
-from flask import request
+from flask import jsonify, request
 from datetime import datetime, timezone
 from .structured_logging import scrub_log_value
 from .utils import utc_now
@@ -172,6 +172,55 @@ class BearerTokenFileUnreadable(Exception):
         self.path = path
         self.cause = cause
         super().__init__(f"{path}: {cause}")
+
+
+def domain_restricted_refusal(audit_logger, resource_type, what):
+    """Why the current request is refused on a route that is not about a domain, or None.
+
+    `allowed_domains` restricts an API key to domains. Some things belong to
+    the instance and are filed under no domain: client certificates, backups.
+    Nothing in them can be matched against that restriction, so a restricted
+    key has no claim on them and is refused, rather than treated as
+    unrestricted. Sessions and keys without `allowed_domains` get None.
+
+    One home for the rule, its log line and its audit entry; each API group
+    answers in its own envelope with the sentence returned. Reads
+    `request.current_user`, so it runs after the role check that sets it.
+    """
+    user = getattr(request, 'current_user', None)
+    if not isinstance(user, dict) or user.get('allowed_domains') is None:
+        return None
+    # The route is in the audit entry below; the log line carries the caller.
+    logger.warning(
+        "Scope denial: user=%s is restricted to domains; %s refused",
+        scrub_log_value(user.get('username')), scrub_log_value(what))
+    if audit_logger:
+        audit_logger.log_authz_denied(
+            operation=request.method.lower(),
+            resource_type=resource_type,
+            resource_id=request.path,
+            reason=f'key restricted to domains has no access to {what}',
+            user=user.get('username'),
+            ip_address=request.remote_addr,
+        )
+    return f'This API key is restricted to domains and cannot be used for {what}'
+
+
+def not_for_domain_restricted_keys(audit_logger, resource_type, what):
+    """A decorator for a dashboard route about something the instance owns.
+
+    `domain_restricted_refusal` in the dashboard's envelope. Placed under
+    `require_role`, which sets the caller.
+    """
+    def decorator(fn):
+        @wraps(fn)
+        def wrapped(*args, **kwargs):
+            refusal = domain_restricted_refusal(audit_logger, resource_type, what)
+            if refusal:
+                return jsonify({'error': refusal, 'code': 'DOMAIN_OUT_OF_SCOPE'}), 403
+            return fn(*args, **kwargs)
+        return wrapped
+    return decorator
 
 
 class AuthManager:
@@ -417,6 +466,38 @@ class AuthManager:
                     return True
         return False
 
+    @classmethod
+    def effective_key_role(cls, role, allowed_domains):
+        """The role an API key acts with, given what is stored for it.
+
+        An admin key restricted to domains is a contradiction: admin reaches
+        what belongs to the instance (settings, users, keys, storage, backups),
+        and none of that can be matched against a domain. Such a key can no
+        longer be created, but one created before that rule is still on disk.
+        It acts as an operator, with its `allowed_domains`: the restriction its
+        owner asked for is the part that is kept, and it holds everywhere,
+        including on routes written after this.
+
+        Decided here, where the caller's identity is built, so that no route
+        has to remember it.
+        """
+        role = cls._normalize_role(role)
+        if role == 'admin' and allowed_domains is not None:
+            return 'operator'
+        return role
+
+    def restricted_admin_keys(self):
+        """Names of live keys stored as admin with `allowed_domains`, which
+        therefore act as operator (`effective_key_role`). For the startup log."""
+        now = utc_now()
+        return sorted(
+            str(data.get('name') or key_id)
+            for key_id, data in self._get_api_keys().items()
+            if not data.get('revoked')
+            and not self._api_key_expired(data, now, key_id=key_id)
+            and self._normalize_role(data.get('role', 'viewer')) == 'admin'
+            and data.get('allowed_domains') is not None)
+
     def user_can_access_domain(self, user, domain):
         """Return True if the request's current_user is allowed to operate on
         *domain* according to its scoped key's allowed_domains.
@@ -566,6 +647,12 @@ class AuthManager:
             scoped_domains, scope_err = self._normalize_allowed_domains(allowed_domains)
             if scope_err:
                 return False, scope_err
+            if normalized_role == 'admin' and scoped_domains is not None:
+                # Refused where the key is written, not only by the route that
+                # asks for it: see `effective_key_role` for why the two cannot
+                # go together.
+                return False, ('Admin keys cannot be domain-scoped; use the '
+                               'operator role for scoped access')
 
             normalized_expiry, expiry_err = self._normalize_expires_at(expires_at)
             if expiry_err:
@@ -628,7 +715,10 @@ class AuthManager:
             is_expired = self._api_key_expired(data, now, key_id=key_id)
             result[key_id] = {
                 'name': data.get('name'),
-                'role': data.get('role'),
+                # The role it acts with, which is what a reader of this list
+                # needs: an admin key restricted to domains acts as operator.
+                'role': self.effective_key_role(
+                    data.get('role', 'viewer'), data.get('allowed_domains')),
                 'token_prefix': data.get('token_prefix'),
                 'created_at': data.get('created_at'),
                 'created_by': data.get('created_by'),
@@ -810,7 +900,8 @@ class AuthManager:
                             _warn_once_about_last_used(e)
                     return {
                         'username': 'api_key:' + key_data.get('name', key_id),
-                        'role': self._normalize_role(key_data.get('role', 'viewer')),
+                        'role': self.effective_key_role(
+                            key_data.get('role', 'viewer'), key_data.get('allowed_domains')),
                         'allowed_domains': key_data.get('allowed_domains'),
                         'api_key_id': key_id,
                         # Stable, non-secret identifiers for audit attribution.
@@ -1598,6 +1689,20 @@ class AuthManager:
             return None, ({'error': 'Authentication failed',
                            'code': 'AUTH_ERROR'}, 401)
 
+    def optional_identity(self):
+        """The caller's identity when the request carries valid credentials,
+        otherwise None. Never refuses: for routes that are public but say
+        more to a caller who has signed in (the health endpoints).
+
+        Setup mode is no identity here. Every request is served as admin
+        then, which identifies nobody, so it must not unlock what an
+        anonymous caller is not shown.
+        """
+        if self.is_setup_mode():
+            return None
+        user, error = self._authenticate_request()
+        return user if error is None else None
+
     def _is_browser_html_request(self):
         """True when the current request looks like a browser asking for HTML.
 
@@ -1723,54 +1828,9 @@ class AuthManager:
         def decorator(f):
             @wraps(f)
             def decorated_function(*args, **kwargs):
-                user, err = self._authenticate_request()
-                if err is not None:
-                    # When a browser hits an HTML page route without a
-                    # session, return a 302 to /login?next=<path> instead
-                    # of the API-style 401 JSON. Without this the user
-                    # sees a bare {"code":"AUTH_HEADER_MISSING",…} body
-                    # in the browser tab — disorienting because the
-                    # adjacent dashboard route (`/`) already redirects
-                    # cleanly via its hand-rolled flow. /api/ paths and
-                    # non-HTML clients keep getting the JSON response.
-                    if self._is_browser_html_request():
-                        from flask import redirect, url_for
-                        return redirect(url_for('login_page', next=request.path))
-                    return err
-
-                # current_user is set here only after auth is known to
-                # have succeeded; downstream code that reads it can trust
-                # the value is fresh from this request, not a leftover.
-                request.current_user = user
-
-                user_level = ROLE_HIERARCHY.get(user.get('role'), -1)
-                required_level = ROLE_HIERARCHY.get(min_role, 999)
-                if user_level < required_level:
-                    # Audit + log every role denial so privilege-enumeration
-                    # attempts surface in the audit trail instead of vanishing
-                    # behind a silent 403 (2026-05-12 API auth audit, F-2).
-                    self._log_rbac_denial(
-                        user=user,
-                        required_role=min_role,
-                        endpoint=request.path,
-                    )
-                    # A browser navigating to a role-gated HTML page (e.g. an
-                    # operator opening /settings) should land on a styled page
-                    # inside the app chrome — with the nav still present so they
-                    # can move to a tab they can use — instead of a bare JSON
-                    # body they can only escape with the back button (#256).
-                    # /api/ paths and non-HTML clients keep the machine-readable
-                    # 403 so programmatic callers are unaffected.
-                    if self._is_browser_html_request():
-                        from flask import render_template
-                        return render_template(
-                            '403.html',
-                            required_role=min_role,
-                            current_role=user.get('role'),
-                        ), 403
-                    return {'error': f'{min_role} privileges required',
-                            'code': 'INSUFFICIENT_ROLE'}, 403
-
+                denial = self.authorize(min_role)
+                if denial is not None:
+                    return denial
                 return f(*args, **kwargs)
             decorated_function._certmate_protection = f'require_role:{min_role}'
             return decorated_function
@@ -1781,6 +1841,64 @@ class AuthManager:
         # Resource class without instantiating or calling anything.
         decorator._certmate_protection = f'require_role:{min_role}'
         return decorator
+
+    def authorize(self, min_role):
+        """Authenticate the request and check it has *min_role*.
+
+        Returns None when it does, having set `request.current_user`, or the
+        response that refuses it. What `require_role` does, as a call: the
+        decorator uses it, and so does the check that runs before a request's
+        body is validated (`authorize_before_validation` in the factory), so
+        the two cannot answer differently.
+        """
+        user, err = self._authenticate_request()
+        if err is not None:
+            # When a browser hits an HTML page route without a
+            # session, return a 302 to /login?next=<path> instead
+            # of the API-style 401 JSON. Without this the user
+            # sees a bare {"code":"AUTH_HEADER_MISSING",…} body
+            # in the browser tab — disorienting because the
+            # adjacent dashboard route (`/`) already redirects
+            # cleanly via its hand-rolled flow. /api/ paths and
+            # non-HTML clients keep getting the JSON response.
+            if self._is_browser_html_request():
+                from flask import redirect, url_for
+                return redirect(url_for('login_page', next=request.path))
+            return err
+
+        # current_user is set here only after auth is known to
+        # have succeeded; downstream code that reads it can trust
+        # the value is fresh from this request, not a leftover.
+        request.current_user = user
+
+        user_level = ROLE_HIERARCHY.get(user.get('role'), -1)
+        required_level = ROLE_HIERARCHY.get(min_role, 999)
+        if user_level < required_level:
+            # Audit + log every role denial so privilege-enumeration
+            # attempts surface in the audit trail instead of vanishing
+            # behind a silent 403 (2026-05-12 API auth audit, F-2).
+            self._log_rbac_denial(
+                user=user,
+                required_role=min_role,
+                endpoint=request.path,
+            )
+            # A browser navigating to a role-gated HTML page (e.g. an
+            # operator opening /settings) should land on a styled page
+            # inside the app chrome — with the nav still present so they
+            # can move to a tab they can use — instead of a bare JSON
+            # body they can only escape with the back button (#256).
+            # /api/ paths and non-HTML clients keep the machine-readable
+            # 403 so programmatic callers are unaffected.
+            if self._is_browser_html_request():
+                from flask import render_template
+                return render_template(
+                    '403.html',
+                    required_role=min_role,
+                    current_role=user.get('role'),
+                ), 403
+            return {'error': f'{min_role} privileges required',
+                    'code': 'INSUFFICIENT_ROLE'}, 403
+        return None
 
     def _log_rbac_denial(self, user, required_role, endpoint):
         """Record an RBAC role-level denial.
@@ -1802,9 +1920,13 @@ class AuthManager:
             # everything else it knows.
             ip = None
 
+        # The endpoint is the request's own path and the user's name and role come
+        # from a record an administrator can edit: every value is scrubbed, as
+        # in the scope denial above, so none of them can end the line.
         logger.warning(
             "RBAC denial: user=%s role=%s required=%s endpoint=%s ip=%s",
-            username, actual_role, required_role, endpoint, ip,
+            scrub_log_value(username), scrub_log_value(actual_role), scrub_log_value(required_role),
+            scrub_log_value(endpoint), scrub_log_value(ip),
         )
 
         if self._audit_logger is not None:
@@ -1820,19 +1942,6 @@ class AuthManager:
             except Exception as e:
                 logger.debug(f"Failed to write RBAC denial audit entry: {e}")
 
-    def require_admin(self, f):
-        """Decorator to require admin role (backward compat wrapper)."""
-        return self.require_role('admin')(f)
-
     def validate_api_token(self, token):
         """Validate API token against legacy token and scoped keys."""
         return self.authenticate_api_token(token) is not None
-
-    def get_current_token(self):
-        """Get the current API bearer token from settings"""
-        try:
-            settings = self.settings_manager.load_settings()
-            return settings.get('api_bearer_token')
-        except Exception as e:
-            logger.error(f"Error getting current token: {e}")
-            return None

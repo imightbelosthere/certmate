@@ -4,6 +4,42 @@ One file per release, in [docs/releases/](docs/releases/). This page is
 generated from them by `scripts/build_release_index.py`; edit the release file,
 not this list.
 
+## v2.48.5 (a second SMTP recipient can be typed, and the places that take a name ask about it)
+
+[Read the notes](docs/releases/v2.48.5.md)
+
+## v2.48.4 (scripts run only with the page's nonce, and three more places a key restricted to domains is held to them)
+
+[Read the notes](docs/releases/v2.48.4.md)
+
+## v2.48.3 (what a key restricted to domains can reach, and pip 26.2.1)
+
+[Read the notes](docs/releases/v2.48.3.md)
+
+## v2.48.2 (scoped keys and every name of a certificate, one DNS-01 validation per record, and hashed dependencies)
+
+[Read the notes](docs/releases/v2.48.2.md)
+
+## v2.48.1 (DNS aliases on Akamai Edge DNS, one log record per line, and health checks that keep their reasons)
+
+[Read the notes](docs/releases/v2.48.1.md)
+
+## v2.48.0 (when a certificate renews, which kind it is, and one form for every date)
+
+[Read the notes](docs/releases/v2.48.0.md)
+
+## v2.47.1 (a base image a month newer, and a release that will not ship an old one)
+
+[Read the notes](docs/releases/v2.47.1.md)
+
+## v2.47.0 (Route 53 with an IAM role, a quieter inventory, and the API's answers under test)
+
+[Read the notes](docs/releases/v2.47.0.md)
+
+## v2.46.0 (certbot 5.8, and Azure DNS without a plugin)
+
+[Read the notes](docs/releases/v2.46.0.md)
+
 ## v2.45.2 (Azure DNS issues and renews again)
 
 [Read the notes](docs/releases/v2.45.2.md)

@@ -1,6 +1,9 @@
 import logging
 
+from functools import wraps
+
 from flask import request, jsonify
+from modules.core.auth import domain_restricted_refusal
 from modules.core.request_fields import json_booleans
 
 logger = logging.getLogger(__name__)
@@ -11,8 +14,20 @@ def register_backup_cache_routes(app, managers, require_web_auth,
                                  cache_manager):
     """Register backup and cache related routes"""
 
+    def not_for_restricted_keys(fn):
+        # The dashboard's twins of the backup API, held to the same rule: a key
+        # restricted to domains has no claim on a backup of the whole instance.
+        @wraps(fn)
+        def wrapped(*args, **kwargs):
+            refusal = domain_restricted_refusal(managers.get('audit'), 'backup', 'backups')
+            if refusal:
+                return jsonify({'error': refusal, 'code': 'DOMAIN_OUT_OF_SCOPE'}), 403
+            return fn(*args, **kwargs)
+        return wrapped
+
     @app.route('/api/web/backups', methods=['GET'])
     @auth_manager.require_role('admin')
+    @not_for_restricted_keys
     def list_backups_web():
         """List all backups"""
         try:
@@ -27,6 +42,7 @@ def register_backup_cache_routes(app, managers, require_web_auth,
 
     @app.route('/api/web/backups/create', methods=['POST'])
     @auth_manager.require_role('admin')
+    @not_for_restricted_keys
     @json_booleans(include_secrets=False)
     def create_backup_web():
         """Create a new backup.
@@ -76,10 +92,14 @@ def register_backup_cache_routes(app, managers, require_web_auth,
     @app.route('/api/web/cache/stats', methods=['GET'])
     @auth_manager.require_role('viewer')
     def cache_stats_web():
-        """Get cache statistics"""
+        """Get cache statistics, held to the rule of the API's twin: a key
+        restricted to domains gets the entries for certificates its scope covers."""
         try:
-            stats = cache_manager.get_cache_stats()
-            return jsonify(stats)
+            scope = (getattr(request, 'current_user', None) or {}).get('allowed_domains')
+            visible = None if scope is None else (
+                lambda domain: managers['certificates'].every_name_matches(
+                    domain, lambda name: auth_manager.domain_matches_scope(name, scope)))
+            return jsonify(cache_manager.get_cache_stats(visible))
         except Exception as e:
             logger.error("Failed to get cache stats: %s", e)
             return jsonify({'error': 'Failed to get cache stats'}), 500

@@ -33,12 +33,28 @@ archive that was requested.
 An absent field still falls back to its documented default; only a value that
 is present and not a boolean is an error.
 
+## Date-times
+
+Every date-time in an answer is ISO 8601 in UTC with a `Z`:
+`2026-10-02T22:26:14.669591Z`, or without the fraction when it has none. Since API
+contract **2.42** ([#1127](https://github.com/fabriziosalmi/certmate/issues/1127)).
+Before it, most had no offset at all (`2026-10-02T22:26:14.669591`, which both
+`datetime.fromisoformat()` and `new Date()` read as local time) and a few had
+`+00:00`, sometimes in the same answer. The instants did not change, only how
+they are written; a client that appended a `Z` itself must stop doing so.
+
+One field keeps its own form: a certificate's `expiry_date`,
+`2026-11-30 09:17:11` (UTC). It is **deprecated**, removed in 3.0
+([#1114](https://github.com/fabriziosalmi/certmate/issues/1114)); `expires_at` is the
+same instant in the form above.
+
 ## Authentication
 
 All API endpoints require Bearer token authentication.
 
 ### Header Format
 
+<!-- illustration: the header every authenticated request carries -->
 ```
 Authorization: Bearer YOUR_TOKEN
 ```
@@ -50,6 +66,44 @@ curl -X GET http://localhost:8000/api/client-certs \
  -H "Authorization: Bearer YOUR_TOKEN" \
  -H "Content-Type: application/json"
 ```
+
+### The role is checked before the body
+
+A request with no credentials is answered `401`, and one below the route's role
+`403 INSUFFICIENT_ROLE`, before its body is validated. Since API contract
+**2.43**; before it, seven routes that validate their body answered such a
+request `400` about the body.
+
+### Keys restricted to domains
+
+An API key can carry `allowed_domains`, a list of exact names and
+`*.example.com` patterns. What such a key is answered, since API contract
+**2.43**:
+
+- **A certificate** is the key's when its scope covers every name the
+  certificate covers: its own, the `san_domains` recorded with it, and the DNS
+  names in the certificate. Otherwise every certificate route answers
+  `403 DOMAIN_OUT_OF_SCOPE` and the list leaves it out. The same when the names
+  cannot be read. Reissue answers `403` for a name outside the scope whether or
+  not a certificate exists for it.
+- **What belongs to the instance** is refused with the same `403`: the
+  client-certificate routes (the CA certificate, the CRL and OCSP stay public),
+  the backup routes, the inventory configuration. Since **2.44** also the
+  settings (`GET /api/settings`), the DNS provider accounts
+  (`GET /api/settings/dns-providers`) and the storage configuration
+  (`GET /api/storage/info`). What the key may know about its own domains it
+  reads from the certificate routes.
+- **The inventory** gives the key a certificate when its scope covers every
+  name of it, the rule of the certificate routes, since **2.44**; before, one
+  name in scope was enough. Registrations and name health are given for the
+  names the scope covers.
+- **The cache statistics** list the entries for certificates the scope covers,
+  and `total_entries` counts those, since **2.44**.
+- **`/metrics`** answers with the series about the key's own domains and none of
+  the instance's totals.
+- **An admin key cannot be restricted.** Creating one is refused. One stored by
+  an earlier release acts as an operator within its domains, and
+  `GET /api/keys` reports that role.
 
 ---
 
@@ -76,6 +130,7 @@ The limits are configurable per instance (admin only), so a trusted automation f
 
 The same configuration is available over the API:
 
+<!-- illustration: a sketch of the two rate-limit calls, with elisions; the fields are listed below it -->
 ```
 GET /api/settings/rate-limits
   -> { "enabled": true,
@@ -90,11 +145,10 @@ Each limit is requests per minute (1–100000). Only the endpoint keys returned 
 
 ### Rate Limit Response
 
-When rate limited, you'll receive:
+When rate limited, you'll receive `429 Too Many Requests` with:
 
-```
-HTTP 429 Too Many Requests
-
+<!-- response: GET /api/health 429 -->
+```json
 {
  "error": "Rate limit exceeded",
  "message": "Too many requests. Please try again later.",
@@ -128,16 +182,19 @@ Returns an array of the objects described below, one per managed domain.
 **Response** (200 OK). This example is the real shape, taken from the code
 rather than written by hand:
 
+<!-- response: GET /api/certificates/<domain> 200 -->
 ```json
 {
   "domain": "app.example.com",
   "exists": true,
   "expiry_date": "2026-11-30 09:17:11",
+  "expires_at": "2026-11-30T09:17:11Z",
   "days_left": 74,
   "days_until_expiry": 74,
   "seconds_left": 6479999,
   "expired": false,
   "needs_renewal": false,
+  "renews_at": "2026-11-03T08:41:10Z",
   "private_key_present": true,
   "private_key_state": "present",
   "reissue_required": false,
@@ -152,11 +209,11 @@ rather than written by hand:
   "storage_warning": null,
   "deployment_host": null,
   "notes": null,
-  "tags": [],
+  "tags": ["production"],
   "deployment_port": null,
   "deployment_protocol": null,
-  "created_at": "2026-09-01T10:14:02Z",
-  "renewed_at": "2026-09-14T02:31:55Z",
+  "created_at": "2026-09-01T10:14:02.118402Z",
+  "renewed_at": "2026-09-14T02:31:55.902114Z",
   "renewal_info": {
     "status": "window",
     "checked_at": "2026-09-27T02:00:04Z",
@@ -164,9 +221,15 @@ rather than written by hand:
     "window_end": "2026-11-04T12:29:25Z",
     "renew_at": "2026-11-03T08:41:10Z",
     "explanation_url": null
-  }
+  },
+  "acme_profile": null,
+  "acme_profile_withdrawn_at": null,
+  "auto_renew": true
 }
 ```
+
+Every date-time here is UTC with a `Z` ([Date-times](#date-times)). `expiry_date` keeps
+its own form and is deprecated: `expires_at` is the same instant.
 
 ##### Is it still valid?
 
@@ -212,6 +275,19 @@ produces certificates with no key, which is the case this exists for.
 
 ##### When will it renew?
 
+`renews_at` is the instant the renewal sweep renews the certificate at, and
+`needs_renewal` is true from that instant on (or now, for a key problem). One
+rule decides, the same the sweep acts on: the threshold
+(`renewal_threshold_days`) when it is at most half the lifetime; otherwise a
+third of the lifetime, or half for a certificate that lives under 10 days; or
+the CA's window below, earlier or later, but never with less than a sixth of
+the lifetime left and never past the window's end. For a 90-day certificate
+with the default 30 days that is 30 days before expiry, as always. `renews_at`
+is UTC with a `Z`, `null` when the certificate could not be parsed. Since API
+contract **2.40**; before it, `needs_renewal` was `days_left <= threshold`, which
+could say "due" a night, or for a 45-day certificate two weeks, before the
+sweep renewed.
+
 `renewal_info` is what the CA said, per certificate, through ACME Renewal
 Information ([RFC 9773](https://www.rfc-editor.org/rfc/rfc9773.html)) at the
 last renewal sweep. It is read from a record the sweep keeps beside the
@@ -221,16 +297,31 @@ sweep asks about the new certificate.
 
 | `status` | meaning |
 | :--- | :--- |
-| `window` | The CA suggested a window. `renew_at` is the instant inside it at which the sweep renews this certificate, if the configured threshold has not already. |
+| `window` | The CA suggested a window. `renew_at` is the instant inside it at which the sweep renews this certificate, within the floor above; `renews_at` is that instant once the floor is applied. |
 | `unsupported` | The CA publishes no `renewalInfo`. That does not change from one sweep to the next. |
 | `unavailable` | The CA publishes it, and the last sweep got no usable answer. If this lasts, look at the CA. |
 | `no_identifier` | The certificate has no Authority Key Identifier, so ARI cannot name it. Common on hand-made private-CA certificates. |
 | `disabled` | `ari_enabled` is `false` in settings. Nothing is asked. |
 
 The timestamps are RFC 3339 UTC with a `Z`. `explanation_url` is the page the
-CA attached to the window, when it gave one; only `https` URLs are kept. The
-window can only bring a renewal forward: the threshold stays the backstop.
-Available since API contract **2.23**.
+CA attached to the window, when it gave one; only `https` URLs are kept. Since
+API contract **2.40** the window postpones a renewal as well as bringing one
+forward, within the floor above. Available since API contract **2.23**.
+
+##### Deprecated fields
+
+Six fields of a certificate have always been `null`: `total_issued`, `total_active`,
+`total_expired`, `total_revoked`, `latest_issuance` and `oldest_active_issuance`.
+They were declared when the models were rewritten for 2.2 and nothing has ever
+filled them: CertMate keeps no ledger of issuances for them to summarise, it does not
+revoke public certificates (so `total_revoked` is not something it can know), and the
+date of the latest issuance is `renewed_at`, or `created_at` for a certificate that has
+not been renewed.
+
+They are **deprecated**, and **removed by the next major of the API contract (3.0)**,
+which is tracked in [#1114](https://github.com/fabriziosalmi/certmate/issues/1114). Until then they are
+still sent, as `null`, so nothing that reads them breaks; stop reading them. Deprecating
+does not move the contract version; the removal does.
 
 #### Reissue every certificate that lost its key
 
@@ -242,12 +333,14 @@ for each of them, with the configuration its metadata records, at a pace: at
 most `limit` per call (default 10, at most 50) on the async executor, which
 runs two at a time. Call it again for the rest once the queued jobs finish.
 
+<!-- request: POST /api/certificates/reissue-keyless -->
 ```json
 { "limit": 10 }
 ```
 
 Answers `202` when something was queued, `200` when there was nothing to do:
 
+<!-- response: POST /api/certificates/reissue-keyless 202 -->
 ```json
 {
   "queued": [{"domain": "a.example.com", "job_id": "…", "status_url": "/api/certificates/jobs/…"}],
@@ -270,6 +363,7 @@ off by default, because a reissue changes the key and deploy hooks ship it.
 
 **Endpoint**: `PUT /api/certificates/<domain>/auto-renew` — operator
 
+<!-- request: PUT /api/certificates/<domain>/auto-renew -->
 ```json
 { "enabled": false }
 ```
@@ -284,6 +378,7 @@ stream as `certificate_auto_renew_changed`.
 
 **Endpoint**: `PATCH /api/certificates/<domain>` — operator
 
+<!-- request: PATCH /api/certificates/<domain> -->
 ```json
 {
   "notes": "Order 4711, installed by hand on lb-2",
@@ -333,6 +428,7 @@ With DNS alias mode the `_acme-challenge` record of each name is a CNAME into a
 zone CertMate can write. These check that every CNAME is in place, before the
 order rather than after the CA fails to find the TXT record.
 
+<!-- request: POST /api/certificates/check-dns-alias -->
 ```json
 {
   "domain": "example.com",
@@ -347,6 +443,7 @@ order rather than after the CA fails to find the TXT record.
 `400` when it does not use alias mode. Every name is checked against the
 caller's scope.
 
+<!-- response: POST /api/certificates/check-dns-alias 200 -->
 ```json
 {
   "domain": "example.com",
@@ -379,6 +476,7 @@ CA. A CAA record names the CAs allowed to issue for a domain, and a CA must
 refuse when it is not named — so a record that names a different CA turns
 into a failed order, or a failed renewal weeks later.
 
+<!-- request: POST /api/certificates/check-caa -->
 ```json
 {
   "domain": "example.com",
@@ -394,6 +492,7 @@ outside its scope, as the DNS-alias check does.
 
 **Response** (200 OK):
 
+<!-- response: POST /api/certificates/check-caa 200 -->
 ```json
 {
   "status": "forbidden",
@@ -439,6 +538,7 @@ refuses the CA, the same sentence as `message` is appended to the error.
 The private CA that signs client certificates is generated once, on first
 start, and its subject comes from `client_ca_subject` in settings:
 
+<!-- illustration: the client_ca_subject object of the settings file -->
 ```json
 {
   "client_ca_subject": {
@@ -465,6 +565,7 @@ afterwards is this endpoint.
 
 **Request**:
 
+<!-- request: POST /api/client-certs/ca/reset -->
 ```json
 {
   "confirm": "reset-client-ca",
@@ -496,6 +597,7 @@ OCSP response published for the previous CA can no longer be verified.
 Create a new client certificate.
 
 **Request**:
+<!-- request: POST /api/client-certs/create -->
 ```json
 {
  "common_name": "user@example.com",
@@ -520,17 +622,58 @@ Create a new client certificate.
 - `notes` (optional) - Additional notes
 
 **Response** (201 Created):
+<!-- response: POST /api/client-certs/create 201 -->
 ```json
 {
- "identifier": "cert-abc123",
- "common_name": "user@example.com",
- "serial_number": "12345678901234567890",
- "created_at": "2024-10-30T18:00:00Z",
- "expires_at": "2025-10-30T18:00:00Z",
- "cert_usage": "api-mtls",
- "status": "active"
+  "identifier": "user-example.com-3f9c2a71",
+  "paths": {
+    "certificate": "/app/data/certs/client/api/user-example.com-3f9c2a71/user-example.com-3f9c2a71.crt",
+    "private_key": "/app/data/certs/client/api/user-example.com-3f9c2a71/user-example.com-3f9c2a71.key",
+    "csr": "/app/data/certs/client/api/user-example.com-3f9c2a71/user-example.com-3f9c2a71.csr",
+    "metadata": "/app/data/certs/client/api/user-example.com-3f9c2a71/metadata.json"
+  },
+  "metadata": {
+    "type": "client",
+    "identifier": "user-example.com-3f9c2a71",
+    "common_name": "user@example.com",
+    "email": "user@example.com",
+    "organization": "ACME Corp",
+    "organizational_unit": "Engineering",
+    "cert_usage": "api-mtls",
+    "key_usage": [
+      "digitalSignature",
+      "keyEncipherment"
+    ],
+    "extended_key_usage": [
+      "clientAuth"
+    ],
+    "created_at": "2026-10-03T09:14:02.481217Z",
+    "expires_at": "2027-10-03T09:14:02.481222Z",
+    "days_valid": 365,
+    "serial_number": "106344602611902843865865504921679461731856720169",
+    "renewal_enabled": true,
+    "renewal_threshold_days": 30,
+    "csr_required": false,
+    "ca_used": "internal",
+    "revoked": false,
+    "revoked_at": null,
+    "reason_revoked": null,
+    "crl_entry_serial": null,
+    "notes": "Production certificate"
+  }
 }
 ```
+
+`metadata` is the certificate's record, the same object `GET /api/client-certs/<identifier>`
+answers with. The `identifier` is the common name made safe for a path, and eight hex
+characters. Its dates (`created_at`, `expires_at`, and later `revoked_at` and
+`superseded_at`) are UTC with a `Z`, like every date-time ([Date-times](#date-times)).
+
+`paths` is **deprecated**, and **removed by the next major of the API contract (3.0)**
+([#1114](https://github.com/fabriziosalmi/certmate/issues/1114)). The four entries are where the files
+sit on the server's disk, which a client cannot open; the files themselves come from
+`GET /api/client-certs/<identifier>/download/<type>`. Until then it is still sent; stop
+reading it. `private_key` is `null` when the request set `generate_key` to false.
 
 **Example**:
 ```bash
@@ -560,30 +703,101 @@ List all client certificates with optional filtering.
 - `search` (optional) - Search in common name
 
 **Response** (200 OK):
+<!-- response: GET /api/client-certs 200 -->
 ```json
 {
- "certificates": [{
- "identifier": "cert-001",
- "common_name": "user1@example.com",
- "organization": "ACME Corp",
- "cert_usage": "api-mtls",
- "created_at": "2024-10-30T18:00:00Z",
- "expires_at": "2025-10-30T18:00:00Z",
- "revoked": false,
- "status": "active"
- },
- {
- "identifier": "cert-002",
- "common_name": "user2@example.com",
- "organization": "ACME Corp",
- "cert_usage": "vpn",
- "created_at": "2024-10-29T18:00:00Z",
- "expires_at": "2025-10-29T18:00:00Z",
- "revoked": true,
- "status": "revoked"
- }
- ],
- "total": 2
+  "certificates": [
+    {
+      "type": "client",
+      "identifier": "user-example.com-8d41e0b6",
+      "common_name": "user@example.com",
+      "email": "user@example.com",
+      "organization": "ACME Corp",
+      "organizational_unit": "Engineering",
+      "cert_usage": "api-mtls",
+      "key_usage": [
+        "digitalSignature",
+        "keyEncipherment"
+      ],
+      "extended_key_usage": [
+        "clientAuth"
+      ],
+      "created_at": "2027-09-04T02:00:11.904130Z",
+      "expires_at": "2028-09-03T02:00:11.904134Z",
+      "days_valid": 365,
+      "serial_number": "38880296300846741349714468885652733141547560996",
+      "renewal_enabled": true,
+      "renewal_threshold_days": 30,
+      "csr_required": false,
+      "ca_used": "internal",
+      "revoked": false,
+      "revoked_at": null,
+      "reason_revoked": null,
+      "crl_entry_serial": null,
+      "notes": "Renewal of user-example.com-3f9c2a71"
+    },
+    {
+      "type": "client",
+      "identifier": "user-example.com-3f9c2a71",
+      "common_name": "user@example.com",
+      "email": "user@example.com",
+      "organization": "ACME Corp",
+      "organizational_unit": "Engineering",
+      "cert_usage": "api-mtls",
+      "key_usage": [
+        "digitalSignature",
+        "keyEncipherment"
+      ],
+      "extended_key_usage": [
+        "clientAuth"
+      ],
+      "created_at": "2026-10-03T09:14:02.481217Z",
+      "expires_at": "2027-10-03T09:14:02.481222Z",
+      "days_valid": 365,
+      "serial_number": "106344602611902843865865504921679461731856720169",
+      "renewal_enabled": false,
+      "renewal_threshold_days": 30,
+      "csr_required": false,
+      "ca_used": "internal",
+      "revoked": false,
+      "revoked_at": null,
+      "reason_revoked": null,
+      "crl_entry_serial": null,
+      "notes": "Production certificate",
+      "superseded_by": "user-example.com-8d41e0b6",
+      "superseded_at": "2027-09-04T02:00:11.912558Z"
+    },
+    {
+      "type": "client",
+      "identifier": "laptop-17-c02e94d5",
+      "common_name": "laptop-17",
+      "email": "",
+      "organization": "ACME Corp",
+      "organizational_unit": "IT",
+      "cert_usage": "vpn",
+      "key_usage": [
+        "digitalSignature",
+        "keyEncipherment"
+      ],
+      "extended_key_usage": [
+        "clientAuth"
+      ],
+      "created_at": "2026-08-12T15:41:27.118346Z",
+      "expires_at": "2027-08-12T15:41:27.118350Z",
+      "days_valid": 365,
+      "serial_number": "571206345791062948120556172980012647738192614",
+      "renewal_enabled": true,
+      "renewal_threshold_days": 30,
+      "csr_required": false,
+      "ca_used": "internal",
+      "revoked": true,
+      "revoked_at": "2026-09-30T08:02:51.733905Z",
+      "reason_revoked": "key_compromise",
+      "crl_entry_serial": null,
+      "notes": ""
+    }
+  ],
+  "total": 3
 }
 ```
 
@@ -612,37 +826,56 @@ curl "http://localhost:8000/api/client-certs?search=user1" \
 
 **Endpoint**: `GET /api/client-certs/<identifier>`
 
-Get complete metadata for a certificate.
+Get complete metadata for a certificate. This one was renewed: a certificate a renewal
+replaced carries `superseded_by` (the identifier of its successor) and `superseded_at`,
+and its `renewal_enabled` is `false`, so the renewal sweep never picks it again. A
+certificate that was never replaced has neither field.
+
+`crl_entry_serial` is **deprecated**, and **removed by the next major of the API contract
+(3.0)** ([#1114](https://github.com/fabriziosalmi/certmate/issues/1114)). It is written as `null`
+when the certificate is created and nothing has ever set it, revocation included; the CRL
+lists a revoked certificate by its `serial_number`. Until then it is still sent, as `null`;
+stop reading it.
 
 **Response** (200 OK):
+<!-- response: GET /api/client-certs/<identifier> 200 -->
 ```json
 {
- "type": "client_certificate",
- "identifier": "cert-001",
- "common_name": "user@example.com",
- "email": "user@example.com",
- "organization": "ACME Corp",
- "organizational_unit": "Engineering",
- "serial_number": "12345678901234567890",
- "created_at": "2024-10-30T18:00:00Z",
- "expires_at": "2025-10-30T18:00:00Z",
- "cert_usage": "api-mtls",
- "notes": "Production certificate",
- "revocation": {
- "revoked": false,
- "revoked_at": null,
- "reason_revoked": null
- },
- "renewal": {
- "renewal_enabled": true,
- "renewal_threshold_days": 30
- }
+  "type": "client",
+  "identifier": "user-example.com-3f9c2a71",
+  "common_name": "user@example.com",
+  "email": "user@example.com",
+  "organization": "ACME Corp",
+  "organizational_unit": "Engineering",
+  "cert_usage": "api-mtls",
+  "key_usage": [
+    "digitalSignature",
+    "keyEncipherment"
+  ],
+  "extended_key_usage": [
+    "clientAuth"
+  ],
+  "created_at": "2026-10-03T09:14:02.481217Z",
+  "expires_at": "2027-10-03T09:14:02.481222Z",
+  "days_valid": 365,
+  "serial_number": "106344602611902843865865504921679461731856720169",
+  "renewal_enabled": false,
+  "renewal_threshold_days": 30,
+  "csr_required": false,
+  "ca_used": "internal",
+  "revoked": false,
+  "revoked_at": null,
+  "reason_revoked": null,
+  "crl_entry_serial": null,
+  "notes": "Production certificate",
+  "superseded_by": "user-example.com-8d41e0b6",
+  "superseded_at": "2027-09-04T02:00:11.912558Z"
 }
 ```
 
 **Example**:
 ```bash
-curl http://localhost:8000/api/client-certs/cert-001 \
+curl http://localhost:8000/api/client-certs/user-example.com-3f9c2a71 \
  -H "Authorization: Bearer TOKEN"
 ```
 
@@ -665,17 +898,17 @@ Download certificate, private key, or CSR file.
 **Examples**:
 ```bash
 # Download certificate
-curl http://localhost:8000/api/client-certs/cert-001/download/crt \
+curl http://localhost:8000/api/client-certs/user-example.com-3f9c2a71/download/crt \
  -H "Authorization: Bearer TOKEN" \
  -o certificate.crt
 
 # Download private key
-curl http://localhost:8000/api/client-certs/cert-001/download/key \
+curl http://localhost:8000/api/client-certs/user-example.com-3f9c2a71/download/key \
  -H "Authorization: Bearer TOKEN" \
  -o private.key
 
 # Download CSR
-curl http://localhost:8000/api/client-certs/cert-001/download/csr \
+curl http://localhost:8000/api/client-certs/user-example.com-3f9c2a71/download/csr \
  -H "Authorization: Bearer TOKEN" \
  -o request.csr
 ```
@@ -686,9 +919,14 @@ curl http://localhost:8000/api/client-certs/cert-001/download/csr \
 
 **Endpoint**: `POST /api/client-certs/<identifier>/revoke`
 
-Revoke a certificate with optional reason.
+Revoke a certificate with optional reason (free text; `unspecified` when none is given).
+The answer is a message; the revocation is in the certificate's record (`revoked`,
+`revoked_at`, `reason_revoked` in `GET /api/client-certs/<identifier>`), in the CRL, which
+is regenerated, and in what the OCSP responder answers. A certificate that does not
+exist is a `404` (a `400` before API contract **2.37**).
 
 **Request** (optional):
+<!-- request: POST /api/client-certs/<identifier>/revoke -->
 ```json
 {
  "reason": "compromised"
@@ -696,17 +934,16 @@ Revoke a certificate with optional reason.
 ```
 
 **Response** (200 OK):
+<!-- response: POST /api/client-certs/<identifier>/revoke 200 -->
 ```json
 {
- "message": "Certificate revoked: cert-001",
- "revoked_at": "2024-10-30T18:15:00Z",
- "reason": "compromised"
+  "message": "Certificate revoked: user-example.com-3f9c2a71"
 }
 ```
 
 **Example**:
 ```bash
-curl -X POST http://localhost:8000/api/client-certs/cert-001/revoke \
+curl -X POST http://localhost:8000/api/client-certs/user-example.com-3f9c2a71/revoke \
  -H "Authorization: Bearer TOKEN" \
  -H "Content-Type: application/json" \
  -d '{
@@ -720,23 +957,58 @@ curl -X POST http://localhost:8000/api/client-certs/cert-001/revoke \
 
 **Endpoint**: `POST /api/client-certs/<identifier>/renew`
 
-Renew a certificate (same CN, new serial).
+Renew a certificate: a new certificate, with a new identifier and serial and the same
+subject, usage and validity. The answer has the shape of the create answer, and the old
+certificate is marked as replaced (`superseded_by`, `superseded_at`, `renewal_enabled`
+false; see above). It is not revoked: it stays valid until it expires or is revoked. A
+certificate that does not exist is a `404` (a `400` before API contract **2.37**).
 
 **Response** (201 Created):
+<!-- response: POST /api/client-certs/<identifier>/renew 201 -->
 ```json
 {
- "identifier": "cert-001-renewed",
- "common_name": "user@example.com",
- "serial_number": "98765432109876543210",
- "created_at": "2024-10-30T18:20:00Z",
- "expires_at": "2025-10-30T18:20:00Z",
- "status": "active"
+  "identifier": "user-example.com-8d41e0b6",
+  "paths": {
+    "certificate": "/app/data/certs/client/api/user-example.com-8d41e0b6/user-example.com-8d41e0b6.crt",
+    "private_key": "/app/data/certs/client/api/user-example.com-8d41e0b6/user-example.com-8d41e0b6.key",
+    "csr": "/app/data/certs/client/api/user-example.com-8d41e0b6/user-example.com-8d41e0b6.csr",
+    "metadata": "/app/data/certs/client/api/user-example.com-8d41e0b6/metadata.json"
+  },
+  "metadata": {
+    "type": "client",
+    "identifier": "user-example.com-8d41e0b6",
+    "common_name": "user@example.com",
+    "email": "user@example.com",
+    "organization": "ACME Corp",
+    "organizational_unit": "Engineering",
+    "cert_usage": "api-mtls",
+    "key_usage": [
+      "digitalSignature",
+      "keyEncipherment"
+    ],
+    "extended_key_usage": [
+      "clientAuth"
+    ],
+    "created_at": "2027-09-04T02:00:11.904130Z",
+    "expires_at": "2028-09-03T02:00:11.904134Z",
+    "days_valid": 365,
+    "serial_number": "38880296300846741349714468885652733141547560996",
+    "renewal_enabled": true,
+    "renewal_threshold_days": 30,
+    "csr_required": false,
+    "ca_used": "internal",
+    "revoked": false,
+    "revoked_at": null,
+    "reason_revoked": null,
+    "crl_entry_serial": null,
+    "notes": "Renewal of user-example.com-3f9c2a71"
+  }
 }
 ```
 
 **Example**:
 ```bash
-curl -X POST http://localhost:8000/api/client-certs/cert-001/renew \
+curl -X POST http://localhost:8000/api/client-certs/user-example.com-3f9c2a71/renew \
  -H "Authorization: Bearer TOKEN"
 ```
 
@@ -749,19 +1021,22 @@ curl -X POST http://localhost:8000/api/client-certs/cert-001/renew \
 Get certificate usage statistics.
 
 **Response** (200 OK):
+<!-- response: GET /api/client-certs/stats 200 -->
 ```json
 {
- "total": 100,
- "active": 85,
- "revoked": 15,
- "expiring_soon": 8,
- "by_usage": {
- "api-mtls": 60,
- "vpn": 35,
- "other": 5
- },
- "created_count": 100,
- "renewal_enabled": 92
+  "total": 100,
+  "active": 85,
+  "revoked": 15,
+  "by_usage": {
+    "api-mtls": 60,
+    "vpn": 35,
+    "custom-application": 5
+  },
+  "by_organization": {
+    "ACME Corp": 92,
+    "ACME Labs": 8
+  },
+  "ca_status": "active"
 }
 ```
 
@@ -780,36 +1055,65 @@ curl http://localhost:8000/api/client-certs/stats \
 Create multiple certificates from CSV data in single request.
 
 **Request**:
+<!-- request: POST /api/client-certs/batch -->
 ```json
 {
- "headers": ["common_name", "email", "organization", "cert_usage", "days_valid"],
- "rows": [["user1@example.com", "user1@example.com", "ACME Corp", "api-mtls", "365"],
- ["user2@example.com", "user2@example.com", "ACME Corp", "vpn", "365"],
- ["user3@example.com", "user3@example.com", "ACME Corp", "api-mtls", "365"]
- ]
+  "headers": [
+    "common_name",
+    "email",
+    "organization",
+    "cert_usage",
+    "days_valid"
+  ],
+  "rows": [
+    [
+      "user1@example.com",
+      "user1@example.com",
+      "ACME Corp",
+      "api-mtls",
+      "365"
+    ],
+    [
+      "user2@example.com",
+      "user2@example.com",
+      "ACME Corp",
+      "vpn",
+      "365"
+    ],
+    [
+      "",
+      "nobody@example.com",
+      "ACME Corp",
+      "api-mtls",
+      "365"
+    ]
+  ]
 }
 ```
 
 **Response** (201 Created):
+<!-- response: POST /api/client-certs/batch 201 -->
 ```json
 {
- "total": 3,
- "successful": 3,
- "failed": 0,
- "errors": [],
- "certificates": [{
- "identifier": "cert-batch-001",
- "common_name": "user1@example.com"
- },
- {
- "identifier": "cert-batch-002",
- "common_name": "user2@example.com"
- },
- {
- "identifier": "cert-batch-003",
- "common_name": "user3@example.com"
- }
- ]
+  "total": 3,
+  "successful": 2,
+  "failed": 1,
+  "errors": [
+    {
+      "row": 4,
+      "error": "Common name is required"
+    }
+  ],
+  "certificates": [
+    {
+      "identifier": "user1-example.com-0b7d13e9",
+      "common_name": "user1@example.com"
+    },
+    {
+      "identifier": "user2-example.com-e5a28f40",
+      "common_name": "user2@example.com"
+    }
+  ]
 }
 ```
 
@@ -837,6 +1141,7 @@ curl -X POST http://localhost:8000/api/client-certs/batch \
 Query certificate status via OCSP.
 
 **Response** (200 OK):
+<!-- response: GET /api/ocsp/status/<serial_number> 200 -->
 ```json
 {
  "response_status": "successful",
@@ -916,10 +1221,11 @@ curl http://localhost:8000/api/crl/download/info \
 ```
 
 **CRL Info Response**:
+<!-- response: GET /api/crl/download/info 200 -->
 ```json
 {
  "status": "available",
- "issuer": "CN=CertMate CA, O=CertMate",
+ "issuer": "CN=CertMate CA,OU=Certificate Authority,O=CertMate,ST=Switzerland,C=CH",
  "last_update": "2024-10-30T18:00:00Z",
  "next_update": "2024-10-31T18:00:00Z",
  "revoked_count": 5,
@@ -928,6 +1234,10 @@ curl http://localhost:8000/api/crl/download/info \
  ]
 }
 ```
+
+`issuer` is the name of the CA that signed the list, in the form RFC 4514 gives (the one
+`openssl` and the inventory's `issuer` also use). Before API contract **2.39** it was the
+Python representation of the name, `<Name(CN=CertMate CA,...)>`.
 
 ---
 
@@ -993,6 +1303,7 @@ served until the reissue succeeds. The key shape is preserved unless
 explicitly changed (no key flags are sent and certbot keeps the lineage key).
 
 **Request Body** (all fields optional):
+<!-- request: POST /api/certificates/<domain>/reissue -->
 ```json
 {
   "san_domains": ["www.example.com", "api.example.com"],
@@ -1011,6 +1322,9 @@ explicitly changed (no key flags are sent and certbot keeps the lineage key).
 - the CA account the certificate was issued under is kept when `ca_provider`
   does not change; before 2.29 a reissue used the CA's default account.
 - `key_type`/`key_size`/`elliptic_curve`: omit to keep the existing key shape
+- `acme_profile`: omit to keep the profile the certificate was issued with, `""`
+  for the CA's default, or a profile name; see [ACME profiles](#acme-profiles).
+  Since API contract **2.41**.
 - `async`: defer issuance to a background job (202 + job id, poll `GET /api/certificates/jobs/<job_id>`)
 
 **Response** (200 OK, or 202 Accepted with `async`): message, domain, dns_provider, ca_provider, duration.
@@ -1025,10 +1339,57 @@ curl -X POST http://localhost:8000/api/certificates/example.com/reissue \
  -d '{"san_domains": ["www.example.com", "api.example.com"]}'
 ```
 
+#### ACME profiles
+
+A CA can issue more than one kind of certificate, and lists them in its ACME
+directory (`meta.profiles`). Let's Encrypt offers three, in production and on
+staging:
+
+| profile | lifetime | notes |
+| :--- | :--- | :--- |
+| `classic` | 90 days | the default |
+| `tlsserver` | 45 days | no Common Name |
+| `shortlived` | 160 hours | the only one that can name IP addresses (not yet supported by CertMate, [#1130](https://github.com/fabriziosalmi/certmate/issues/1130)) |
+
+`POST /api/certificates/create` and `POST /api/certificates/<domain>/reissue`
+take `acme_profile`. Omitted, a new certificate uses the default its CA account
+names (`acme_profile` on the account), and a reissue keeps the profile the
+certificate was issued with; `""` asks for the CA's own default. A name that is
+not a profile name is a `400` before anything runs.
+
+The profile is **required at issuance**: a CA that does not offer it refuses the
+order, and the certificate is not issued as something else. It is **preferred at
+renewal**: a CA can withdraw a profile (Let's Encrypt retired `tlsclient` in July
+2026), and a renewal that failed on it would leave the certificate to expire. So
+the renewal asks for the profile, and when the CA no longer lists it the CA
+issues its default; the renewal logs a warning and records
+`acme_profile_withdrawn_at` on the certificate, and the next renewal that finds
+the profile offered again clears it.
+
+The certificate's answer carries `acme_profile` and `acme_profile_withdrawn_at`.
+How long before expiry a 45-day or a 160-hour certificate renews is the rule in
+[When will it renew?](#when-will-it-renew): with the default threshold, 15 days
+and about 3 days. Since API contract **2.41**.
+
+#### Renew a certificate
+
+**Endpoint**: `POST /api/certificates/<domain>/renew` — operator
+
+Renews through certbot, which renews only what is due unless `force` is true.
+
+**Response** (200 OK, or 202 Accepted with `async`): `message`, `domain`, `renewed`
+(`false` when the certificate was not yet due and nothing was replaced), `dns_provider`
+(the provider recorded for the certificate) and `duration` (seconds). The last two were
+always `null` before API contract **2.37**.
+
+**Errors**: 404 when no certificate exists for the domain, 403 scope, 409 operation in
+progress, 422 renewal failed (`RENEWAL_FAILED`, or `REISSUE_REQUIRED` when no private key is left).
+
 ---
 
 ### Log stream (admin, debugging)
 
+<!-- illustration: the request line; the answer is a server-sent event stream, not JSON -->
 ```
 GET /api/web/logs/stream
 ```
@@ -1069,6 +1430,7 @@ It answers `200` when the instance is healthy or degraded, and `500` when it is
 unhealthy, so a liveness check can read the status line alone. The body names
 each subsystem:
 
+<!-- response: GET /api/health 200 -->
 ```json
 {
  "status": "degraded",
@@ -1148,6 +1510,7 @@ path on this site, so it cannot be used as an open redirect.
 
 **Endpoint**: `POST /api/probe` — viewer, since API contract **2.8**
 
+<!-- request: POST /api/probe -->
 ```json
 { "host": "shop.example.com", "port": 443, "server_name": "shop.example.com", "check_revocation": true }
 ```
@@ -1190,7 +1553,20 @@ logs. Discovery is what fills the second half.
 **Endpoint**: `GET /api/inventory` — viewer
 
 Returns managed and discovered certificates with an expiry forecast. Filters:
-`?managed=true|false`, and the usual paging.
+`?managed=true|false`, `?source=`, `?include_superseded=false`, and the usual paging.
+
+Since API contract **2.36** every certificate carries `superseded`, and the summary
+carries a `superseded` count. A certificate is superseded when **every endpoint it
+was seen on has since been seen serving a different certificate**: the old
+certificate of a host that now serves its renewal. One still served on any endpoint
+is never superseded, and neither is one with no endpoint (found in a Certificate
+Transparency log, or issued here and never probed). Nothing is deleted: the inventory
+stays a history, which is how a renewal that was never deployed is caught. By default
+the answer still lists every certificate, with the flag; `?include_superseded=false`
+leaves the superseded ones out of the list **and** of the summary, so the counts
+describe what the list shows, and `summary.superseded` says how many were left out.
+`GET /api/inventory/crypto-report` takes the same `?include_superseded=false`, and
+the dashboard sends it to both, so its readiness cards agree with its list.
 
 Since API contract **2.4** every record carries `revocation`: the last verified
 OCSP/CRL answer for that certificate, as `{status, method, reason, revoked_at,
@@ -1230,6 +1606,14 @@ inventory record as adopted.
 
 Reads and updates discovery and CT-log monitoring settings.
 
+The body may carry any of `discovery`, `ct_monitoring`, `domain_registration`,
+`domain_health` and `dns_resolver`; the ones it leaves out are left alone. **A request
+is applied entirely or not at all**: every section is validated before any is
+saved, and a `400` names the field and has changed nothing. Before API contract
+**2.38** the sections ahead of the one that was refused had already been saved. A
+field of the wrong type (`null` where a number goes, a number or a string where a list
+goes) is a `400` too; it was a `500`.
+
 #### Run discovery now
 
 **Endpoint**: `POST /api/inventory/scan` — admin
@@ -1263,6 +1647,7 @@ When each tracked domain's *registration* expires, from RDAP, or WHOIS where
 the TLD has no RDAP. One row per registrable domain, soonest expiry first; a
 scoped key sees only the domains its scope covers.
 
+<!-- response: GET /api/inventory/domains 200 -->
 ```json
 {
   "domains": [
@@ -1306,6 +1691,7 @@ what its response discloses about the software behind it, and — when it is
 switched on — whether it still accepts TLS 1.0 or 1.1. Worst first, so the
 answer opens on what is wrong; a scoped key sees only its own names.
 
+<!-- response: GET /api/inventory/health 200 -->
 ```json
 {
   "names": [
@@ -1376,10 +1762,11 @@ answer gains a `domain_health` summary. What each check means:
 
 #### Is a newer CertMate out
 
-**Endpoint**: `GET /api/web/update-check` — session, viewer
+**Endpoint**: `GET /api/web/update-check` — viewer (API token or dashboard session)
 
+<!-- response: GET /api/web/update-check 200 -->
 ```json
-{ "status": "outdated", "running": "2.34.0", "latest": "v2.35.0" }
+{ "status": "outdated", "running": "2.34.0", "latest": "v2.35.0", "enabled": true }
 ```
 
 **Off by default, and it stays off until an operator turns it on.**
@@ -1433,6 +1820,12 @@ configured maintenance window opens.
 Runs the hook without a real certificate change, so a broken hook is found
 before a renewal depends on it.
 
+Answers **200** for a hook that ran, whether it passed or not: the body is the run
+record, with `success`, `exit_code`, `stdout`, `stderr` and `error` (null on a pass).
+A hook that is not in the configuration is a **404**, with `reason:
+"hook_missing_from_config"`. Before API contract **2.37** every answer was a 404, the
+run record included.
+
 #### Run a certificate's deploy hooks now
 
 **Endpoint**: `POST /api/certificates/<domain>/deploy` — admin
@@ -1441,8 +1834,33 @@ Runs every enabled hook and deploy target that applies to the domain, with
 `CERTMATE_EVENT=manual`. The `on_events` filter and maintenance windows are
 ignored: pressing the button is the decision to deploy now.
 
+<!-- response: POST /api/certificates/<domain>/deploy 200 excerpt -->
 ```json
-{ "ok": true, "total": 2, "succeeded": 2, "failed": 0, "results": [ ... ] }
+{
+  "ok": true,
+  "total": 1,
+  "succeeded": 1,
+  "failed": 0,
+  "results": [
+    {
+      "run_id": "5b0e6c1a2f7d4c399a610d4c2b7e9f13",
+      "timestamp": "2026-10-03T09:12:44Z",
+      "domain": "shop.example.com",
+      "event": "manual",
+      "hook_id": "reload-nginx",
+      "hook_name": "Reload nginx",
+      "command": "systemctl reload nginx",
+      "status": "success",
+      "success": true,
+      "exit_code": 0,
+      "stdout": "",
+      "stderr": "",
+      "duration_ms": 184,
+      "dry_run": false,
+      "error": null
+    }
+  ]
+}
 ```
 
 It answers **200 even when `ok` is false**, so the summary can be read: deploy
@@ -1484,6 +1902,13 @@ it here. This exists because the server and the browser can see different
 things: a certificate that is fine from inside the network and unreachable
 from outside it is a deployment problem the server alone cannot detect.
 
+A report is kept with the certificate and shown to every user, and the
+read-only role can send one, so its fields are kept only in the form the
+dashboard sends them: `method` and `source` a lower-case label of at most 32
+characters (letters, digits, hyphens), `checked_at` an ISO 8601 date-time.
+A value in another form is replaced by the default (`browser-fallback`,
+`browser`, the server's own time); one that is not text is a `400`.
+
 ### DNS provider accounts
 
 #### List and add accounts
@@ -1507,13 +1932,29 @@ client speaks.
 Deprecating does not move the contract version, which is the point of
 deprecating rather than removing; the removal is what would bump the major.
 
+A **Route53** account takes two optional fields, since API contract **2.35**:
+`auth_mode` (`access_keys`, the default, or `iam_role`) and `assume_role_arn`. In
+`iam_role` mode CertMate uses the AWS credential chain of the host and the two
+access-key fields are not needed; `assume_role_arn` makes it assume that role
+first. Accounts that set neither behave as before. See
+[DNS providers](dns-providers.md#aws-route53).
+
 #### Update or remove an account
 
 **Endpoint**: `PUT /api/dns/<provider>/accounts/<account_id>` — admin
 **Endpoint**: `DELETE /api/dns/<provider>/accounts/<account_id>` — admin
 
 The `/api/dns-providers/accounts/<account_id>` forms of these are deprecated on
-the same terms as the listing above.
+the same terms as the listing above. They carry no provider, so CertMate finds it:
+the account id has to belong to exactly one provider. An id no provider has is a
+`404`. An id several providers have is a `409` that lists them and names the path
+that is not ambiguous, `/api/dns/<provider>/accounts/<account_id>`; every provider
+has an account called `default`, so that one always needs the long form. Neither
+refusal writes anything.
+
+`DELETE /api/dns/<provider>/accounts/<account_id>` is a `404` when that provider has
+no account with that id, and a `500` only when the settings could not be written.
+Before API contract **2.37** both were a `500`.
 
 #### Provider configuration
 
@@ -1604,6 +2045,11 @@ certificate endpoints or use a webhook.
 
 **Endpoint**: `GET /api/cache/stats` — viewer
 
+The deployment checks the instance has cached, one entry per domain. A key
+restricted with `allowed_domains` gets the entries for certificates its scope
+covers, under the rule of the certificate list, and `total_entries` counts
+those.
+
 #### Clear the deployment cache
 
 **Endpoint**: `POST /api/cache/clear` — admin
@@ -1651,6 +2097,7 @@ request.
 
 **Endpoint**: `PATCH /api/keys/<key_id>` — admin, since API contract **2.7**
 
+<!-- request: PATCH /api/keys/<key_id> -->
 ```json
 { "confirmed": true }
 ```
@@ -1736,6 +2183,10 @@ domains that already exist as secrets. It does not re-issue anything.
 
 **Endpoint**: `GET /api/backups` — viewer
 
+Each entry has `filename`, `size` (bytes) and `created`, and the archive's own
+`metadata`. `size` and `created` were declared on the entry and always `null` before
+API contract **2.37**; they were only inside `metadata`.
+
 #### Create one
 
 **Endpoint**: `POST /api/backups/create` — admin
@@ -1780,7 +2231,10 @@ the Prometheus client library is not installed.
 
 The scrape target itself is the separate `/metrics` route, and it is **not**
 public: it carries the same viewer requirement, because its series enumerate
-every managed domain.
+every managed domain. A key restricted with `allowed_domains` gets the series
+about its own domains only: those with a `domain` label its scope covers
+(every name of the certificate, as on the certificate routes), and none of the
+instance's totals.
 
 #### Scan for zombie domains
 
@@ -1816,6 +2270,7 @@ one live SAN makes the certificate `alive` whether or not a probe host is set.
 
 Every failure carries a human-readable `error` and a machine-readable `code`:
 
+<!-- illustration: the error envelope every route uses -->
 ```json
 {
  "error": "Certificate not found for domain: example.com",
@@ -1828,6 +2283,7 @@ the application — an unmatched path, a wrong method, a body over the size limi
 — carry two more fields, `message` (the framework's description) and `status`
 (the numeric status, which is also the status line):
 
+<!-- illustration: the error envelope of a URL no route serves -->
 ```json
 {
  "error": "Not Found",
@@ -1865,7 +2321,7 @@ and may be reworded.
 | `AUTH_HEADER_MISSING` / `INVALID_AUTH_FORMAT` / `INVALID_AUTH_SCHEME` / `INVALID_TOKEN` / `AUTH_ERROR` | 401 | Authentication failed, and which part |
 | `SESSION_REQUIRED` | 401 | The endpoint needs a browser session, not a bearer token |
 | `INSUFFICIENT_ROLE` | 403 | Authenticated, but the role is too low |
-| `DOMAIN_OUT_OF_SCOPE` | 403 | The API key is scoped to other domains |
+| `DOMAIN_OUT_OF_SCOPE` | 403 | The API key is scoped to other domains, or the certificate also covers a name outside the key's scope, or the route is for client certificates, backups or the inventory configuration, which a key restricted to domains cannot use |
 | `PRIVKEY_REQUIRES_OPERATOR` | 403 | Private-key download needs operator or above |
 | `CERTIFICATE_ALREADY_EXISTS` | 409 | A certificate for that domain is already managed |
 | `DOMAIN_OPERATION_IN_PROGRESS` | 409 | Another create/renew holds this domain's lock |
@@ -1929,6 +2385,7 @@ that performed it and the trigger that caused it.
 The audit log is written to `logs/audit/certificate_audit.log`. Each line is a
 standard Python log line whose message is the JSON audit entry:
 
+<!-- illustration: a line of the audit log file -->
 ```
 2026-06-15 18:00:00 - certmate.audit - INFO - {"timestamp": "...", ...}
 ```
@@ -1943,6 +2400,7 @@ tail -f logs/audit/certificate_audit.log
 
 ### Entry shape
 
+<!-- illustration: an entry of the audit log file -->
 ```json
 {
   "timestamp": "2026-06-15T18:00:00.000000+00:00",
@@ -2032,9 +2490,30 @@ detectable and localizable. It is on by default; disable with
 **Verify from the API:** `GET /api/audit/verify` (admin) returns the verifier
 result and HTTP `200` when intact or `409` when broken:
 
+<!-- response: GET /api/audit/verify 200 -->
 ```json
-{"ok": true, "count": 128, "first_seq": 0, "last_seq": 127, "head_hash": "5ee1…", "reason": "intact"}
+{
+  "ok": true,
+  "count": 128,
+  "first_seq": 0,
+  "last_seq": 127,
+  "head_hash": "5ee1c0d9a8f46b02e7c3d51f9a20b8e4c6f7d3a1b9e05c28d4f6a7b3e1c9d02f",
+  "error_seq": null,
+  "reason": "intact",
+  "checkpoint_verified": true,
+  "checkpoint_seq": 99,
+  "checkpoint_reason": "consistent with signed checkpoint at seq 99"
+}
 ```
+
+`checkpoint_*` is the cross-check against the newest signed checkpoint: one is written
+every 100 entries and on every clean stop, so a new instance answers
+`checkpoint_verified: false`, no `checkpoint_seq`, and a `checkpoint_reason` that says
+why (`no checkpoints written yet`). A broken chain has `ok: false`, the offending
+`error_seq`, and a `409`. After a prune the chain starts from a signed anchor that
+attests the entries removed, and the answer also carries `anchored` and `anchor_seq`,
+with `anchor_signature_ok: true` when the anchor's signature verifies (when it does not,
+`ok` is false and `reason` says so).
 
 **Verify off-box:** the standalone verifier depends only on the Python standard
 library, so an auditor can run it without installing or trusting CertMate:
@@ -2102,6 +2581,7 @@ with them.
 
 For API client authentication via mutual TLS.
 
+<!-- illustration: a value of cert_usage -->
 ```
 cert_usage: "api-mtls"
 ```
@@ -2110,6 +2590,7 @@ cert_usage: "api-mtls"
 
 For VPN client authentication.
 
+<!-- illustration: a value of cert_usage -->
 ```
 cert_usage: "vpn"
 ```
@@ -2118,6 +2599,7 @@ cert_usage: "vpn"
 
 You can use any custom usage type string:
 
+<!-- illustration: a value of cert_usage -->
 ```
 cert_usage: "custom-application"
 ```

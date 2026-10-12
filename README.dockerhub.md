@@ -18,8 +18,8 @@
 
 ## Key Features
 
-- **Zero-Downtime Automation** - Auto-renewal 30 days before expiry
-- **23 DNS Providers** - Cloudflare, AWS, Azure, GCP, Hetzner, SOLIDserver, and more
+- **Zero-Downtime Automation** - Auto-renewal, 30 days before expiry by default and earlier for certificates that live under 60 days
+- **DNS Providers** - Cloudflare, AWS, Azure, GCP, Hetzner, SOLIDserver, and the rest: [the full list](https://github.com/fabriziosalmi/certmate/blob/main/docs/dns-providers.md)
 - **Multiple CA Support** - Let's Encrypt, DigiCert ACME, Private CAs
 - **Unified Backups** - Atomic snapshots of settings and certificates
 - **Multiple Storage Backends** - Local, Azure Key Vault, AWS Secrets Manager, Vault, Infisical
@@ -197,7 +197,7 @@ curl http://localhost:8000/health
 # Response
 {
  "status": "healthy",
- "version": "2.45.2",
+ "version": "2.48.5",
  "checks": {
   "cert_dir": "ok",
   "disk_space": "ok",

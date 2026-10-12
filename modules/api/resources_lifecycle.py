@@ -18,7 +18,8 @@ from ..core.certificates import CREATION_FAILED, DomainOperationInProgress
 from ..core.utils import classify_renewal_error
 from .path_validation import validate_domain_path as _validate_domain_path
 from .resource_context import (
-    ApiContext, check_domain_scope, job_accepted, wants_async,
+    ApiContext, check_certificate_scope, check_domain_scope, job_accepted,
+    wants_async,
 )
 
 logger = logging.getLogger(__name__)
@@ -188,6 +189,7 @@ def create_lifecycle_resources(api, models, ctx: ApiContext) -> dict:
                         key_type=data.get('key_type'),
                         key_size=data.get('key_size'),
                         elliptic_curve=data.get('elliptic_curve'),
+                        acme_profile=data.get('acme_profile'),
                         csr_pem=data.get('csr'),
                         user=user,
                         ip_address=request.remote_addr,
@@ -209,6 +211,7 @@ def create_lifecycle_resources(api, models, ctx: ApiContext) -> dict:
                     key_type=data.get('key_type'),
                     key_size=data.get('key_size'),
                     elliptic_curve=data.get('elliptic_curve'),
+                    acme_profile=data.get('acme_profile'),
                     # A CSR the caller generated elsewhere (#599). When given,
                     # CertMate never holds the private key: the names come from
                     # the CSR and the certificate is filed with
@@ -360,6 +363,7 @@ def create_lifecycle_resources(api, models, ctx: ApiContext) -> dict:
                     key_type=data.get('key_type'),
                     key_size=data.get('key_size'),
                     elliptic_curve=data.get('elliptic_curve'),
+                    acme_profile=data.get('acme_profile'),
                     csr_pem=data.get('csr'),
                     user=user,
                     ip_address=request.remote_addr,
@@ -474,7 +478,7 @@ def create_lifecycle_resources(api, models, ctx: ApiContext) -> dict:
 
             Body: {"enabled": true|false}
             """
-            scope_err = _check_domain_scope(domain, 'set_auto_renew')
+            scope_err = check_certificate_scope(ctx, domain, 'set_auto_renew')
             if scope_err:
                 return scope_err
             _, err = _validate_domain_path(domain, ctx.file_ops.cert_dir)

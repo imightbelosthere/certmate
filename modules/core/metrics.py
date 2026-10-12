@@ -10,7 +10,8 @@ from datetime import datetime, timezone
 import logging
 from .domain_entries import entry_domain
 
-from .constants import DEFAULT_RENEWAL_THRESHOLD_DAYS, iter_cert_domain_dirs
+from . import renewal_policy
+from .constants import iter_cert_domain_dirs
 
 
 def _iso_to_epoch(value):
@@ -30,12 +31,17 @@ def _iso_to_epoch(value):
 
 logger = logging.getLogger(__name__)
 
+# renews_at is naive UTC; its epoch seconds without attaching a timezone to it.
+_EPOCH = datetime(1970, 1, 1)
+
 # Prometheus client library
 try:
     from prometheus_client import (
         Counter, Gauge, Histogram, Info, 
         generate_latest, CONTENT_TYPE_LATEST
     )
+    from prometheus_client import REGISTRY
+    from prometheus_client.metrics_core import Metric
     PROMETHEUS_AVAILABLE = True
     logger.info("Prometheus client library loaded successfully")
 except ImportError as e:
@@ -379,10 +385,6 @@ class CertMateMetricsCollector:
             if not all([settings, cert_dir, get_certificate_info]):
                 return
                 
-            # Get configurable renewal threshold (default 30 days for backward compatibility)
-            renewal_threshold_days = settings.get(
-                'renewal_threshold_days', DEFAULT_RENEWAL_THRESHOLD_DAYS)
-                
             domains = settings.get('domains', [])
             total_domains.set(len(domains))
             
@@ -451,7 +453,8 @@ class CertMateMetricsCollector:
                         status = 'missing'
                     elif days_left < 0:
                         status = 'expired'
-                    elif days_left <= renewal_threshold_days:
+                    elif renewal_policy.due(cert_info):
+                        # Due by the instant the sweep renews at (#393).
                         status = 'expiring_soon'
                     else:
                         status = 'valid'
@@ -487,15 +490,22 @@ class CertMateMetricsCollector:
                             certificate_last_renewal.remove(domain, dns_provider)
                         except KeyError:
                             pass
-                    # Next renewal: the scheduler renews once days_left falls
-                    # to the threshold, so this is a real prediction — due
-                    # now when already inside the window.
-                    if days_left is not None:
-                        due_in_days = max(0, days_left - renewal_threshold_days)
+                    # Next renewal: the instant the sweep renews at
+                    # (renewal_policy, #393), which the certificate's answer
+                    # carries; now when it is already due.
+                    renews_at = renewal_policy.parse_instant(cert_info.get('renews_at'))
+                    if renews_at is not None:
                         certificate_next_renewal.labels(
                             domain=domain,
                             dns_provider=dns_provider
-                        ).set(time.time() + due_in_days * 24 * 3600)
+                        ).set(max(time.time(), (renews_at - _EPOCH).total_seconds()))
+                    else:
+                        # No instant (an unparseable certificate): the series goes away rather
+                        # than freezing on the last prediction, as certificate_last_renewal does.
+                        try:
+                            certificate_next_renewal.remove(domain, dns_provider)
+                        except KeyError:
+                            pass
                 else:
                     status_counts['missing'] += 1
             
@@ -653,8 +663,36 @@ metrics_collector = CertMateMetricsCollector()
 # FLASK INTEGRATION FUNCTIONS
 # =============================================
 
-def generate_metrics_response(app_context=None):
-    """Generate Prometheus metrics response."""
+class _DomainView:
+    """The registry, reduced to the series about domains a caller may see.
+
+    For a key restricted with `allowed_domains`. A series is kept when it has
+    a `domain` label and *domain_in_scope* accepts it. Everything else is left
+    out: the totals, the per-provider and per-status counts, the queues and
+    the process's own figures are about the whole instance, and a count of
+    what a caller may not see is still something about it. `generate_latest`
+    asks a registry for `collect()` and nothing more, which is all this has.
+    """
+
+    def __init__(self, registry, domain_in_scope):
+        self._registry, self._in_scope = registry, domain_in_scope
+
+    def collect(self):
+        for family in self._registry.collect():
+            kept = [sample for sample in family.samples
+                    if 'domain' in sample.labels and self._in_scope(sample.labels['domain'])]
+            if kept:
+                view = Metric(family.name, family.documentation, family.type, family.unit)
+                view.samples = kept
+                yield view
+
+
+def generate_metrics_response(app_context=None, domain_in_scope=None):
+    """Generate Prometheus metrics response.
+
+    *domain_in_scope*, when given, is a predicate on a domain: the answer then
+    carries only the series about the domains it accepts (`_DomainView`).
+    """
     if not PROMETHEUS_AVAILABLE:
         return (
             "# Prometheus client library not available\n"
@@ -668,7 +706,10 @@ def generate_metrics_response(app_context=None):
         metrics_collector.collect_all_metrics(app_context)
         
         # Generate Prometheus format
-        metrics_data = generate_latest()
+        if domain_in_scope is None:
+            metrics_data = generate_latest()
+        else:
+            metrics_data = generate_latest(_DomainView(REGISTRY, domain_in_scope))
         
         return (
             metrics_data,
@@ -710,7 +751,3 @@ def get_metrics_summary():
 def is_prometheus_available() -> bool:
     """Check if Prometheus client is available."""
     return PROMETHEUS_AVAILABLE
-
-def get_metrics_collector():
-    """Get the global metrics collector instance."""
-    return metrics_collector

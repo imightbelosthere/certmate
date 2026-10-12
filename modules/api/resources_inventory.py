@@ -19,11 +19,12 @@ import logging
 from ..core.audit_context import audit_context_from_request
 from ..core.cert_service import DomainOutOfScope
 from ..core.certificates import DomainOperationInProgress
-from ..core.inventory_view import build_inventory_view, build_registrations_view
+from ..core.inventory_view import build_inventory_view, build_registrations_view, superseded_fingerprints
 from ..core.utils import ALREADY_RUNNING, utc_now_iso
 from .resource_context import (
     ApiContext,
     check_domain_scope,
+    instance_wide,
     is_record_in_scope,
     scope_filter_records,
 )
@@ -48,6 +49,25 @@ def _config_view(discovery, ct_monitor, registration, health=None, settings=None
     if health is not None:
         view['domain_health'] = health.get_config()
     return view
+
+
+def _check_config_payload(payload, discovery, ct_monitor, registration, health):
+    """Validate every section of a config POST before any of them is written.
+
+    Each section is saved through its own manager, which validates what it is given, so a body with
+    a good `ct_monitoring` and a bad `domain_registration` saved the first and answered 400 for
+    the second: a 400 that had changed the configuration (#1109). Every section is checked here
+    first, with the same code that will save it, so a request is applied entirely or not at all.
+    Raises ValueError.
+    """
+    from ..core.dns_resolver import parse_nameservers
+
+    for section, manager in (('discovery', discovery), ('ct_monitoring', ct_monitor),
+                             ('domain_registration', registration), ('domain_health', health)):
+        if manager is not None and isinstance(payload.get(section), dict):
+            manager.clean_config(payload[section])
+    if isinstance(payload.get('dns_resolver'), dict):
+        parse_nameservers(payload['dns_resolver'].get('nameservers'))
 
 
 def _save_registration_config(registration, payload):
@@ -158,6 +178,24 @@ def _health_response(ctx):
     return {'names': records, 'summary': summary}
 
 
+_FALSY = ('0', 'false', 'no', 'off')
+
+
+def _include_superseded(args):
+    """`?include_superseded`: every certificate unless it is explicitly false (#1044)."""
+    return args.get('include_superseded', '').strip().lower() not in _FALSY
+
+
+def _visible(records, everything, include_superseded):
+    """*records* without the certificates the WHOLE inventory *everything* shows to be superseded,
+    unless they are wanted. Worked out from everything and not from *records*: a newer certificate
+    that a filter or a scope hides still replaced the old one."""
+    if include_superseded:
+        return records
+    gone = superseded_fingerprints(everything)
+    return [record for record in records if record.get('fingerprint') not in gone]
+
+
 def _inventory_health_resource(api, ctx):
     """Build the GET /api/inventory/health resource.
 
@@ -205,6 +243,10 @@ def _inventory_domains_resource(api, ctx):
 def create_inventory_resources(api, models, ctx: ApiContext) -> dict:
     """Build the inventory resources against *ctx*."""
 
+    # What the instance is set to watch (endpoints, CT-log domains, extra
+    # names) is its own configuration, not a record about one domain.
+    not_for_restricted_keys = instance_wide(ctx, 'inventory_config', 'the inventory configuration')
+
     def _check_domain_scope(domain, operation):
         return check_domain_scope(ctx, domain, operation)
 
@@ -215,11 +257,22 @@ def create_inventory_resources(api, models, ctx: ApiContext) -> dict:
         return scope_filter_records(ctx, records)
 
     class InventoryList(Resource):
-        @api.doc(security='Bearer')
+        @api.doc(security='Bearer', params={
+            'managed': {'in': 'query', 'type': 'boolean',
+                        'description': 'Only issued (true) or only discovered (false) certificates'},
+            'source': {'in': 'query', 'type': 'string',
+                       'description': 'Only certificates found by this source'},
+            'include_superseded': {
+                'in': 'query', 'type': 'boolean', 'default': True,
+                'description': 'false leaves out certificates replaced everywhere they were seen; every '
+                               'certificate carries a `superseded` flag either way'},
+        })
         @ctx.auth.require_role('viewer')
         def get(self):
             """List the certificate inventory (issued + discovered) with an
-            expiry forecast. Optional filters: ?managed=true/false, ?source=."""
+            expiry forecast. Optional filters: ?managed=true/false, ?source=,
+            ?include_superseded=false (leaves out certificates that every
+            endpoint has since stopped serving; they are marked either way)."""
             inventory = ctx.managers.get('cert_inventory')
             if inventory is None:
                 return {'error': 'Certificate inventory not available'}, 503
@@ -230,7 +283,12 @@ def create_inventory_resources(api, models, ctx: ApiContext) -> dict:
                     managed_filter = managed.strip().lower() in ('1', 'true', 'yes', 'on')
                 source = request.args.get('source') or None
                 records = inventory.list_all(managed=managed_filter, source=source)
-                return build_inventory_view(_scope_filter_records(records))
+                # Worked out from the WHOLE inventory: a newer certificate that a source or scope
+                # filter hides still replaced the old one.
+                superseded = superseded_fingerprints(inventory.list_all())
+                return build_inventory_view(_scope_filter_records(records),
+                                            include_superseded=_include_superseded(request.args),
+                                            superseded=superseded)
             except Exception as e:
                 logger.error(f"Error listing inventory: {e}")
                 return {'error': 'Failed to list inventory'}, 500
@@ -274,6 +332,7 @@ def create_inventory_resources(api, models, ctx: ApiContext) -> dict:
     class InventoryConfig(Resource):
         @api.doc(security='Bearer')
         @ctx.auth.require_role('viewer')
+        @not_for_restricted_keys
         def get(self):
             """Return discovery + CT-log monitoring configuration."""
             discovery = ctx.managers.get('cert_discovery')
@@ -287,15 +346,17 @@ def create_inventory_resources(api, models, ctx: ApiContext) -> dict:
 
         @api.doc(security='Bearer')
         @ctx.auth.require_role('admin')
+        @not_for_restricted_keys
         def post(self):
             """Update the discovery configuration.
 
             Body may carry a ``discovery``, ``ct_monitoring``,
             ``domain_registration`` and/or ``domain_health`` object; each is
-            validated and persisted by its own manager, and anything it
-            refuses — a bad endpoint spec, a name no registry holds, an extra
-            name that is not a domain — is a 400. Returns the effective
-            configuration after the update.
+            validated by its own manager, every section before any is
+            persisted, and anything refused — a bad endpoint spec, a name no
+            registry holds, an extra name that is not a domain — is a 400 that
+            has changed nothing. Returns the effective configuration after
+            the update.
             """
             discovery = ctx.managers.get('cert_discovery')
             ct_monitor = ctx.managers.get('ct_monitor')
@@ -305,6 +366,7 @@ def create_inventory_resources(api, models, ctx: ApiContext) -> dict:
             registration = ctx.managers.get('domain_registration')
             health = ctx.managers.get('domain_health')
             try:
+                _check_config_payload(payload, discovery, ct_monitor, registration, health)
                 if isinstance(payload.get('discovery'), dict):
                     discovery.save_config(payload['discovery'])
                 if isinstance(payload.get('ct_monitoring'), dict):
@@ -352,18 +414,27 @@ def create_inventory_resources(api, models, ctx: ApiContext) -> dict:
     InventoryHealth = _inventory_health_resource(api, ctx)
 
     class InventoryCryptoReport(Resource):
-        @api.doc(security='Bearer')
+        @api.doc(security='Bearer', params={
+            'format': {'in': 'query', 'type': 'string', 'enum': ['csv'],
+                       'description': 'csv downloads a CSV; otherwise JSON is returned'},
+            'include_superseded': {
+                'in': 'query', 'type': 'boolean', 'default': True,
+                'description': 'false leaves out certificates replaced everywhere they were seen'},
+        })
         @ctx.auth.require_role('viewer')
         def get(self):
             """Cryptographic algorithm inventory & readiness report over every
             managed + discovered certificate. ``?format=csv`` downloads a CSV;
-            otherwise JSON is returned."""
+            otherwise JSON is returned. ``?include_superseded=false`` leaves out
+            the certificates every endpoint has since stopped serving."""
             from ..core.crypto_report import build_crypto_report, report_to_csv
             inventory = ctx.managers.get('cert_inventory')
             if inventory is None:
                 return {'error': 'Certificate inventory not available'}, 503
             try:
-                records = _scope_filter_records(inventory.list_all())
+                everything = inventory.list_all()
+                records = _visible(_scope_filter_records(everything), everything,
+                                   _include_superseded(request.args))
                 report = build_crypto_report(records, generated_at=utc_now_iso())
             except Exception as e:
                 logger.error(f"Error building crypto report: {e}")

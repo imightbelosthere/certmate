@@ -15,6 +15,7 @@ import logging
 import signal
 import shutil
 from contextlib import contextmanager
+from datetime import datetime
 from dataclasses import dataclass, field
 
 try:  # POSIX only; the lock degrades to a no-op without it
@@ -36,13 +37,22 @@ from .dns_strategies import (DNSStrategyFactory, HTTP01Strategy, PrevalidatedStr
 from .constants import (METADATA_SCHEMA_VERSION, CERTIFICATE_FILES,
                         DEFAULT_RENEWAL_THRESHOLD_DAYS)
 from .inventory_sources import collect_domain_sources
+from . import acme_profiles, renewal_policy
 from .domain_entries import entry_auto_renew, entry_domain
-from .structured_logging import LogContext, new_correlation_id
+from .structured_logging import LogContext, new_correlation_id, scrub_log_value
 from .csr_issuance import (
     CSR_OUTPUT_DIRNAME, CSR_OUTPUT_FILES, CSRError, csr_domains,
     csr_fingerprint, read_csr, to_csr_command,
 )
-from .domain_paths import reject_unsafe_domain, validate_domain_path
+from .challenge_locks import ChallengeLocks, ChallengeRecordBusy, challenge_record_names
+from .domain_paths import (
+    certificate_dir,
+    lineage_archive_dir,
+    lineage_live_dir,
+    reject_unsafe_domain,
+    renewal_conf,
+    validate_domain_path,
+)
 from .utils import (
     DeploymentStatusCache, validate_domain, utc_now, utc_now_iso, validate_key_options,
     repair_certbot_lineage_symlinks,
@@ -104,6 +114,29 @@ class DomainOperationInProgress(RuntimeError):
         super().__init__(f"A certificate operation for {domain} is already in progress")
 
 
+class ChallengeRecordInUse(DomainOperationInProgress):
+    """Another certificate's certbot run is validating at the same DNS record
+    (modules/core/challenge_locks.py). A DomainOperationInProgress, so every
+    caller that turns that into a 409 or a retry does the same here."""
+    def __init__(self, domain, record):
+        self.record = record
+        super().__init__(domain)
+        # No promise of a retry: an API caller gets this as a 409 and nothing
+        # retries for it. The nightly sweep tries again on its own next run.
+        self.args = (f"Another certificate is validating at {record}; "
+                     f"try {domain} again when it finishes",)
+
+
+class CertificateNamesUnknown(Exception):
+    """A certificate exists for *domain* but the names it covers cannot be read:
+    no certificate anywhere it is kept could be parsed, and no record lists them.
+    A scope check that meets this refuses, rather than deciding on the one name
+    it does know."""
+    def __init__(self, domain):
+        self.domain = domain
+        super().__init__(f"The names covered by the certificate for {domain} could not be read")
+
+
 class ReissueRequired(RuntimeError):
     """The certificate has no private key anywhere certbot can reach (#966).
 
@@ -133,6 +166,9 @@ _REISSUE_OWNED_METADATA_KEYS = frozenset({
     'domain', 'san_domains', 'dns_provider', 'challenge_type', 'created_at',
     'email', 'staging', 'account_id', 'ca_provider', 'ca_account_id',
     'domain_alias', 'alias_dns_provider', 'storage_warning',
+    # The ACME profile (#395) is the issuance's: a reissue that clears it clears it, and what
+    # the last issuance found about it (withdrawn by the CA) goes with it.
+    'acme_profile', 'acme_profile_withdrawn_at',
 })
 
 # Every key CertMate itself writes into metadata.json. Used as an allowlist
@@ -307,6 +343,41 @@ def _resolve_all_domains(domain, san_domains, challenge_type):
     return all_domains
 
 
+# What the dashboard sends for a browser report's `method` and `source`:
+# `browser-fallback`, `unavailable`, `browser`.
+_REPORT_LABEL = re.compile(r'[a-z0-9][a-z0-9-]{0,31}\Z')
+
+
+def _recognised_label(value, default):
+    """*value* when it is a short lower-case label, *default* otherwise."""
+    if isinstance(value, str) and _REPORT_LABEL.match(value):
+        return value
+    return default
+
+
+def _recognised_instant(value):
+    """*value* when it is an ISO 8601 date-time, None otherwise."""
+    if not isinstance(value, str):
+        return None
+    try:
+        datetime.fromisoformat(value.replace('Z', '+00:00'))
+    except ValueError:
+        return None
+    return value
+
+
+def _parse_certificate(content):
+    """An x509 certificate from PEM bytes or text, or None when it is not one."""
+    if not content:
+        return None
+    if isinstance(content, str):
+        content = content.encode()
+    try:
+        return x509.load_pem_x509_certificate(content)
+    except ValueError:
+        return None
+
+
 def _reject_path_escaping_domain(domain):
     """Refuse a domain that could escape ``cert_dir`` when used as a path.
 
@@ -384,6 +455,7 @@ class _PreparedIssuance:
     key_type: str | None
     key_size: int | None
     elliptic_curve: str | None
+    acme_profile: str | None = None
 
 
 def _private_key_present(key_state):
@@ -439,6 +511,8 @@ class CertificateManager:
         # Per-domain locks to prevent concurrent create/renew on the same domain
         self._domain_locks: dict[str, threading.Lock] = {}
         self._domain_locks_mutex = threading.Lock()
+        # Per DNS challenge record, across certificates (challenge_locks.py).
+        self._challenge_locks = ChallengeLocks()
         # domain -> (key digest, cert digest, answer) for private_key_state.
         # One entry per domain, like _domain_locks above and bounded the same
         # way: by how many certificates this instance manages. See
@@ -692,7 +766,7 @@ class CertificateManager:
         # called from (#672).
         _reject_path_escaping_domain(domain)
         try:
-            target = Path(cert_dir) / domain / 'accounts'
+            target = certificate_dir(cert_dir, domain) / 'accounts'
             if target.exists() and any(target.rglob('*.json')):
                 return None                      # already has an account
             for candidate in sorted(Path(cert_dir).iterdir()):
@@ -821,9 +895,13 @@ class CertificateManager:
         #
         # `validate_domain_path` rather than the cheaper character check: it
         # resolves the path and confirms it is still under cert_dir, which is
-        # what actually answers the question once symlinks are involved — and
-        # it is the form CodeQL recognises as a sanitizer, so the finding is
-        # closed rather than argued with.
+        # what actually answers the question once symlinks are involved.
+        # This comment used to add that it is "the form CodeQL recognises as a
+        # sanitizer, so the finding is closed". It is not: CodeQL still reports
+        # the path built from `domain_dir` below (alert 1432), because the
+        # containment check tests the resolved path and the function returns
+        # the unresolved one. The guard is real; the alert is a false positive,
+        # and is dismissed as one rather than claimed closed.
         domain_dir, path_error = validate_domain_path(domain, self.cert_dir)
         if path_error:
             raise ValueError(path_error)
@@ -960,7 +1038,7 @@ class CertificateManager:
             if not domain_dir.is_dir():
                 continue
             domain = domain_dir.name
-            live_dir = domain_dir / 'live' / domain
+            live_dir = lineage_live_dir(domain_dir, domain)
             if not live_dir.is_dir():
                 # Imported or externally managed: nothing to reconcile against.
                 continue
@@ -1055,6 +1133,21 @@ class CertificateManager:
             return self._domain_locks[domain]
 
     @contextmanager
+    def _challenge_records_held(self, domain, domains, domain_alias, challenge_type):
+        """Hold the challenge records this certbot run will write.
+
+        Around the certbot run only: that is where the records are published
+        and cleaned up, and two certificates whose records do not overlap keep
+        running in parallel. A record another run holds is refused with
+        ChallengeRecordInUse, a DomainOperationInProgress."""
+        names = challenge_record_names(domains, domain_alias, challenge_type)
+        try:
+            with self._challenge_locks.hold(names, self._domain_lock_timeout()):
+                yield
+        except ChallengeRecordBusy as busy:
+            raise ChallengeRecordInUse(domain, str(busy)) from None
+
+    @contextmanager
     def domain_lock(self, domain: str):
         """Hold the per-domain lock for the duration of the block.
 
@@ -1093,7 +1186,7 @@ class CertificateManager:
         where the path is built makes the property local and keeps it that way.
         """
         _reject_path_escaping_domain(domain)
-        return self.cert_dir / domain / 'metadata.json'
+        return certificate_dir(self.cert_dir, domain) / 'metadata.json'
 
     def _store_in_backend(self, domain, cert_files, metadata):
         """Push the bundle to the configured storage backend.
@@ -1411,7 +1504,7 @@ class CertificateManager:
         a fresh cert (issue #230). Best-effort: it never fails the surrounding
         certificate operation.
         """
-        domain_dir = self.cert_dir / domain
+        domain_dir = certificate_dir(self.cert_dir, domain)
         pfx_path = domain_dir / 'cert.pfx'
         try:
             settings = self.settings_manager.load_settings()
@@ -1492,11 +1585,16 @@ class CertificateManager:
             if not isinstance(deployment_status, dict):
                 deployment_status = {}
 
+            # A report comes from the dashboard of whoever is signed in, the
+            # read-only role included, and is kept in the certificate's
+            # metadata and shown to everyone else. So what is kept is what is
+            # recognised: a short label, an instant. Anything else is replaced
+            # by the value the dashboard itself would have sent.
             deployment_status['browser'] = {
                 'reachable': bool(browser_status.get('reachable', False)),
-                'checked_at': browser_status.get('checked_at') or utc_now_iso(),
-                'method': browser_status.get('method') or 'browser-fallback',
-                'source': browser_status.get('source') or 'browser',
+                'checked_at': _recognised_instant(browser_status.get('checked_at')) or utc_now_iso(),
+                'method': _recognised_label(browser_status.get('method'), 'browser-fallback'),
+                'source': _recognised_label(browser_status.get('source'), 'browser'),
             }
 
             metadata['deployment_status'] = deployment_status
@@ -1622,10 +1720,16 @@ class CertificateManager:
         if dns_provider not in DNS_ALIAS_SUPPORTED_PROVIDERS:
             raise RuntimeError(f"DNS alias mode is not implemented for provider '{dns_provider}'")
 
+        if dns_provider == 'route53':
+            from .storage_backends import _aws_storage_auth
+            _aws_storage_auth(dns_config, 'Route53 DNS')
+            if dns_config.get('auth_mode') == 'iam_role':
+                dns_config = {k: v for k, v in dns_config.items()
+                              if k not in ('access_key_id', 'secret_access_key')}
         missing_fields = [
             field for field in DNS_ALIAS_REQUIRED_FIELDS[dns_provider]
             if not str(dns_config.get(field) or '').strip()
-        ]
+        ] if dns_provider != 'route53' else []
         if missing_fields:
             raise ValueError(
                 f"{dns_provider} DNS alias mode requires: {', '.join(missing_fields)}"
@@ -1863,7 +1967,122 @@ class CertificateManager:
         if info is not None:
             return info
         return self._certificate_info_from_disk(domain, settings)
-    
+
+    def names_covered(self, domain):
+        """Every name the certificate stored as *domain* is valid for, *domain* first.
+
+        A certificate is one object however many names it carries: its key
+        serves all of them, so a scope check on a certificate is a check on
+        every one of its names. Creation checks every name it is asked for;
+        this is the same set for a certificate that already exists.
+
+        Read from both places a name can be recorded, because either can be
+        absent: `san_domains` in the metadata (missing for an adopted or
+        restored certificate, or one older than the field), and the DNS
+        names of the certificate itself. The certificate is looked for where
+        CertMate serves it, then in certbot's lineage (`live/`, then the
+        newest generation in `archive/`), so a served copy that is missing
+        or torn does not hide the names. The storage backend is asked only
+        when there is no certificate on disk at all, which is the one case
+        the backend can be the only record.
+
+        Raises `CertificateNamesUnknown` when certificate material is there
+        (a served PEM, or a lineage) but neither a certificate nor a record
+        names what it covers: refusing is the only answer that does not
+        guess. No material at all is just *domain*, which includes the empty
+        directory of an issuance in flight: there is nothing to act on, and
+        the operation itself answers that. A domain that cannot name a directory is just *domain*
+        too, and the operation refuses that input as it always has.
+        """
+        names = [domain]
+        if not isinstance(domain, str) or not domain:
+            return names
+        try:
+            _reject_path_escaping_domain(domain)
+        except ValueError:
+            return names
+        try:
+            metadata = self._load_metadata(domain)
+        except OSError:
+            metadata = {}  # the certificate may still say; if not, unknown
+        directory = certificate_dir(self.cert_dir, domain)
+        certificate = self._first_readable_certificate(domain, directory)
+        exists = self._holds_certificate_material(domain, directory)
+        if certificate is None and self.storage_manager:
+            # Not caught: a backend that cannot answer leaves the names
+            # unknown, and the caller's request fails rather than being
+            # checked against fewer names than the certificate has.
+            stored = self._storage_retrieve(domain)
+            if stored:
+                cert_files, stored_metadata = stored
+                exists = True
+                certificate = _parse_certificate((cert_files or {}).get('cert.pem'))
+                metadata = metadata or stored_metadata or {}
+        recorded = metadata.get('san_domains') if isinstance(metadata, dict) else None
+        if certificate is None and not isinstance(recorded, list) and exists:
+            raise CertificateNamesUnknown(domain)
+        if isinstance(recorded, list):
+            names.extend(n for n in recorded if isinstance(n, str))
+        if certificate is not None:
+            names.extend(csr_domains(certificate))
+        seen, ordered = set(), []
+        for name in names:
+            key = name.strip().lower()
+            if key and key not in seen:
+                seen.add(key)
+                ordered.append(name.strip())
+        return ordered
+
+    def every_name_matches(self, domain, matches):
+        """True when *matches* accepts every name the certificate covers.
+
+        False when one is refused, and False when the names cannot be read
+        (`CertificateNamesUnknown`): a scope that cannot be confirmed is not
+        granted. The one form every scope check uses, so they cannot differ
+        on that case.
+        """
+        try:
+            names = self.names_covered(domain)
+        except CertificateNamesUnknown:
+            logger.warning("The names of the certificate for %s could not be read; "
+                           "a scoped request for it is refused", scrub_log_value(domain))
+            return False
+        return all(matches(name) for name in names)
+
+    @staticmethod
+    def _holds_certificate_material(domain, directory):
+        """Is there anything of a certificate here: a served PEM, or a lineage?
+
+        The directory alone is not that. It exists from the first moment of a
+        first issuance, empty, and the caller creating that certificate reads
+        its progress; and a directory left behind by a failed create holds
+        nothing to protect.
+        """
+        if any((directory / name).exists() for name in CERTIFICATE_FILES):
+            return True
+        live = lineage_live_dir(directory, domain)
+        archive = lineage_archive_dir(directory, domain)
+        return any(d.is_dir() and any(d.iterdir()) for d in (live, archive))
+
+    @staticmethod
+    def _first_readable_certificate(domain, directory):
+        """The certificate as served, else certbot's live copy, else its newest
+        archived generation; None when none of them parses."""
+        archive = lineage_archive_dir(directory, domain)
+        generations = sorted(
+            archive.glob('cert*.pem') if archive.is_dir() else [],
+            key=lambda p: int(re.sub(r'\D', '', p.stem) or 0), reverse=True)
+        for candidate in [directory / 'cert.pem',
+                          lineage_live_dir(directory, domain) / 'cert.pem',
+                          *generations]:
+            try:
+                certificate = _parse_certificate(candidate.read_bytes())
+            except OSError:
+                continue
+            if certificate is not None:
+                return certificate
+        return None
+
     def private_key_state(self, domain, cert_content=None, metadata=None):
         """Is there a usable private key beside this certificate? (#608)
 
@@ -1909,7 +2128,7 @@ class CertificateManager:
         The warning below therefore fires once per distinct file pair rather
         than once per read, which is the same information at 1/N the volume.
         """
-        key_file = self.cert_dir / domain / 'privkey.pem'
+        key_file = certificate_dir(self.cert_dir, domain) / 'privkey.pem'
         if not key_file.exists():
             return self.key_state_for_bytes(domain, None, cert_content, metadata)
 
@@ -2136,7 +2355,7 @@ class CertificateManager:
         """
         # Fall back to local filesystem for backward compatibility
         cert_dir = self.cert_dir
-        cert_path = cert_dir / domain
+        cert_path = certificate_dir(cert_dir, domain)
         if not cert_path.exists():
             logger.info(f"Certificate directory does not exist for domain: {domain}")
             return self._create_empty_cert_info(domain)
@@ -2186,7 +2405,7 @@ class CertificateManager:
         """
         if key_state != 'missing':
             return False
-        return self._lineage_lost_its_key(Path(self.cert_dir) / domain, domain)
+        return self._lineage_lost_its_key(certificate_dir(self.cert_dir, domain), domain)
 
     def _parse_certificate_info(self, domain, cert_content, metadata=None,
                                 settings=None, key_state='present'):
@@ -2246,11 +2465,21 @@ class CertificateManager:
             # a default private CA.
             days_left = remaining.days
             seconds_left = int(remaining.total_seconds())
+            # One rule decides when this renews, and the sweep acts on the same instant
+            # (renewal_policy, #393): the threshold where it is meaningful for this lifetime,
+            # the lifetime rule where it is not, the CA's recorded window within a floor.
+            renewal_info = self._renewal_info_for(domain, cert, settings)
+            renew_instant, _ = renewal_policy.renews_at(
+                cert.not_valid_before_utc.replace(tzinfo=None), expiry_date,
+                renewal_threshold_days, renewal_info)
 
             return {
                 'domain': domain,
                 'exists': True,
                 'expiry_date': expiry_date.strftime('%Y-%m-%d %H:%M:%S'),
+                # The same instant in the form every other date-time has (#1127); expiry_date
+                # keeps its own form for the clients that parse it, deprecated.
+                'expires_at': expiry_date.isoformat(),
                 'days_left': days_left,
                 'days_until_expiry': days_left,
                 # The two questions days_left cannot answer at once: how much
@@ -2258,9 +2487,10 @@ class CertificateManager:
                 # the same instant, so they cannot disagree with each other.
                 'seconds_left': seconds_left,
                 'expired': seconds_left <= 0,
-                # Inclusive boundary: a cert with exactly renewal_threshold_days
-                # left must renew. Using `<` skipped the boundary, delaying
-                # renewal by a day; digest.py and metrics.py already use `<=`.
+                # Due from the instant renewal_policy computes (inclusive: at
+                # exactly that instant it renews). digest.py, metrics.py and
+                # expiry_watch.py read `renews_at` rather than redoing the
+                # arithmetic, so none of them can disagree with the sweep.
                 # A certificate with no usable private key cannot serve TLS,
                 # so it needs attention now rather than at its expiry — which
                 # is what let a restored keyless certificate sit untouched
@@ -2269,8 +2499,10 @@ class CertificateManager:
                 # listing path never fetches the key, so only a key we looked
                 # for and did not find (or one that does not match) forces
                 # attention here.
-                'needs_renewal': (days_left <= renewal_threshold_days
+                'needs_renewal': (now_utc >= renew_instant
                                   or key_state in ('missing', 'mismatched')),
+                # The instant the sweep renews it at, so a client is told when, not only whether.
+                'renews_at': renewal_policy.stamp(renew_instant),
                 'private_key_present': _private_key_present(key_state),
                 'private_key_state': key_state,
                 'reissue_required': self._reissue_required(domain, key_state),
@@ -2297,7 +2529,11 @@ class CertificateManager:
                 'renewed_at': metadata.get('renewed_at'),
                 # What the CA's ARI endpoint said at the last sweep (#962),
                 # read from the record the sweep keeps — never fetched here.
-                'renewal_info': self._renewal_info_for(domain, cert, settings),
+                'renewal_info': renewal_info,
+                # The ACME profile it was issued with (#395), and when a renewal found the
+                # CA no longer offers it (the CA's default was issued instead).
+                'acme_profile': metadata.get('acme_profile'),
+                'acme_profile_withdrawn_at': metadata.get('acme_profile_withdrawn_at'),
             }
         except Exception as e:
             logger.error(f"Error parsing certificate for {domain}: {e}")
@@ -2307,6 +2543,7 @@ class CertificateManager:
             'domain': domain,
             'exists': True,
             'expiry_date': None,
+            'expires_at': None,
             'days_left': None,
             'days_until_expiry': None,
             # None, not False. This is the branch where the certificate could
@@ -2336,6 +2573,10 @@ class CertificateManager:
             # A certificate that cannot be parsed cannot be named in ARI, so
             # there is no record that could belong to it.
             'renewal_info': None,
+            # Nor a lifetime to renew within: it is due now (needs_renewal above).
+            'renews_at': None,
+            'acme_profile': metadata.get('acme_profile'),
+            'acme_profile_withdrawn_at': metadata.get('acme_profile_withdrawn_at'),
         }
 
     def _create_empty_cert_info(self, domain):
@@ -2347,6 +2588,7 @@ class CertificateManager:
             'domain': domain,
             'exists': False,
             'expiry_date': None,
+            'expires_at': None,
             'days_left': None,
             'days_until_expiry': None,
             # Same shape as every other answer, so a client does not have to
@@ -2372,15 +2614,15 @@ class CertificateManager:
         ``.broken-lineage-*`` dir so it stays recoverable; the flat
         ``<domain>/*.pem`` we serve from is untouched.
         """
-        conf = cert_output_dir / 'renewal' / f'{domain}.conf'
+        conf = renewal_conf(cert_output_dir, domain)
         if not conf.exists():
             return
-        live_cert = cert_output_dir / 'live' / domain / 'cert.pem'
+        live_cert = lineage_live_dir(cert_output_dir, domain) / 'cert.pem'
         broken = (not live_cert.exists()) or (not live_cert.is_symlink())
         if not broken:
             return
         quarantine = Path(tempfile.mkdtemp(prefix='.broken-lineage-', dir=str(cert_output_dir)))
-        for rel in (Path('renewal') / f'{domain}.conf', Path('live') / domain, Path('archive') / domain):
+        for rel in (renewal_conf(Path(), domain), lineage_live_dir(Path(), domain), lineage_archive_dir(Path(), domain)):
             src = cert_output_dir / rel
             if src.exists() or src.is_symlink():
                 dst = quarantine / rel
@@ -2569,7 +2811,7 @@ class CertificateManager:
                           account_id, staging, ca_provider, ca_account_id,
                           domain_alias, alias_dns_provider, san_domains,
                           challenge_type, key_type, key_size, elliptic_curve,
-                          replace):
+                          replace, acme_profile=None):
         """Validate and resolve everything an issuance needs, before any
         command is built (#666).
 
@@ -2603,7 +2845,7 @@ class CertificateManager:
         # This existence check runs *under* the per-domain lock acquired
         # above so two concurrent creates for the same domain can't both
         # pass the check and race to issue duplicate certificates.
-        existing_cert = self.cert_dir / domain / 'cert.pem'
+        existing_cert = certificate_dir(self.cert_dir, domain) / 'cert.pem'
         if existing_cert.exists() and not replace:
             raise FileExistsError(f"Certificate for {domain} already exists. Use renew to refresh it.")
 
@@ -2627,12 +2869,12 @@ class CertificateManager:
 
         # Create output directory
         cert_dir = self.cert_dir
-        cert_output_dir = cert_dir / domain
+        cert_output_dir = certificate_dir(cert_dir, domain)
         cert_output_dir.mkdir(parents=True, exist_ok=True)
 
         key_type, key_size, elliptic_curve = self._resolve_key_shape(
             settings, domain, replace, key_type, key_size, elliptic_curve)
-
+        acme_profile = self._resolve_acme_profile(domain, replace, acme_profile, ca_account_config)
 
         return _PreparedIssuance(
             settings=settings.value,
@@ -2650,9 +2892,25 @@ class CertificateManager:
             key_type=key_type,
             key_size=key_size,
             elliptic_curve=elliptic_curve,
+            acme_profile=acme_profile,
         )
 
+    def _resolve_acme_profile(self, domain, replace, requested, ca_account_config):
+        """The ACME profile this issuance asks for, or None for the CA's default (#395).
 
+        Said in the request: that ('' is "the CA's default"). Not said: for a reissue (and a CSR
+        renewal, which is one) the profile the certificate was issued with, so editing a SAN
+        does not quietly change its kind; for a new certificate the CA account's default.
+        """
+        if requested is None:
+            if replace:
+                requested = self._load_metadata(domain).get('acme_profile')
+            else:
+                requested = (ca_account_config or {}).get('acme_profile')
+        ok, profile = acme_profiles.validate_profile(requested)
+        if not ok:
+            raise ValueError(profile)
+        return profile
 
     def _write_dns_credentials(self, strategy, artifacts, dns_provider,
                                dns_config, domain, san_domains):
@@ -2799,6 +3057,7 @@ class CertificateManager:
             domain, email, ca_provider, dns_provider, dns_config,
             ca_account_config or {}, staging, cert_dir, san_domains=san_list,
             key_type=key_type, key_size=key_size, elliptic_curve=elliptic_curve,
+            acme_profile=prepared.acme_profile,
         )
 
         if replace:
@@ -2903,7 +3162,7 @@ class CertificateManager:
             return ''
         return f"\n\n{sentence}" if sentence else ''
 
-    def create_certificate(self, domain, email, dns_provider=None, dns_config=None, account_id=None, staging=False, ca_provider=None, ca_account_id=None, domain_alias=None, alias_dns_provider=None, san_domains=None, challenge_type=None, key_type=None, key_size=None, elliptic_curve=None, replace=False, csr_pem=None, *, renewal=False):
+    def create_certificate(self, domain, email, dns_provider=None, dns_config=None, account_id=None, staging=False, ca_provider=None, ca_account_id=None, domain_alias=None, alias_dns_provider=None, san_domains=None, challenge_type=None, key_type=None, key_size=None, elliptic_curve=None, replace=False, csr_pem=None, *, renewal=False, acme_profile=None):
         """Create SSL certificate using configurable CA with DNS challenge
 
         Args:
@@ -2941,6 +3200,10 @@ class CertificateManager:
                 stays on the appliance that made it. These certificates have no
                 certbot lineage, so ``certbot renew`` will not touch them —
                 renewal re-runs this command with the stored CSR.
+            acme_profile: The ACME profile to ask the CA for (#395), keyword-only.
+                None means "not said": the CA account's default for a new
+                certificate, the recorded profile for a reissue or a CSR
+                renewal. '' means the CA's own default, explicitly.
             renewal: Keyword-only, and passed by one caller:
                 `_renew_from_stored_csr`, which renews a CSR-only certificate
                 by re-running issuance. The certificate is not new, so its
@@ -3001,6 +3264,7 @@ class CertificateManager:
                 san_domains=san_domains, challenge_type=challenge_type,
                 key_type=key_type, key_size=key_size,
                 elliptic_curve=elliptic_curve, replace=replace,
+                acme_profile=acme_profile,
             )
             email = (prepared.ca_account_config or {}).get('email') or email
             ca_provider = prepared.ca_provider
@@ -3021,6 +3285,16 @@ class CertificateManager:
                 account_id=account_id, domain_alias=domain_alias,
                 alias_dns_provider=alias_dns_provider, replace=replace,
             )
+            if renewal and prepared.acme_profile:
+                # A CSR certificate renews by re-running issuance; a renewal asks for its
+                # profile as preferred, like every other renewal (#395).
+                certbot_cmd = ['--preferred-profile' if arg == '--required-profile' else arg
+                               for arg in certbot_cmd]
+                profile_withdrawn = self._profile_still_offered(
+                    domain, prepared.ca_provider, prepared.used_ca_account_id,
+                    prepared.acme_profile) is False
+            else:
+                profile_withdrawn = False
 
             # CSR mode (#599). The command above is reused wholesale — the CA,
             # the EAB credentials, the DNS plugin and its credentials file are
@@ -3076,14 +3350,16 @@ class CertificateManager:
             # (Copilot, #604).
             self._seed_acme_account(domain, cert_dir, ca_provider, used_ca_account_id)
 
-            # Run certbot with isolated environment
-            result = self.shell_executor.run(
-                certbot_cmd,
-                capture_output=True,
-                text=True,
-                timeout=1800,  # 30 minute timeout
-                env=process_env
-            )
+            # Run certbot with isolated environment, holding the challenge
+            # records it will write (another certificate may share them).
+            with self._challenge_records_held(domain, all_domains, domain_alias, challenge_type):
+                result = self.shell_executor.run(
+                    certbot_cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=1800,  # 30 minute timeout
+                    env=process_env
+                )
 
             if result.returncode != 0:
                 # One builder for create and renew (#666 S6): what is logged
@@ -3117,7 +3393,7 @@ class CertificateManager:
             # promote is the same one either way, and it skips files that do
             # not exist, which is what leaves privkey.pem alone.
             live_dir = (csr_output_dir if csr_output_dir is not None
-                        else cert_output_dir / 'live' / domain)
+                        else lineage_live_dir(cert_output_dir, domain))
             cert_files = {}
 
             if live_dir.exists():
@@ -3164,6 +3440,15 @@ class CertificateManager:
                 'ca_provider': ca_provider,
                 'ca_account_id': used_ca_account_id
             }
+            if prepared.acme_profile:
+                metadata['acme_profile'] = prepared.acme_profile
+                if profile_withdrawn:
+                    metadata['acme_profile_withdrawn_at'] = utc_now_iso()
+                if csr_pem is None:
+                    # Required at issuance, preferred at renewal (#395): a profile the CA
+                    # withdraws must not turn every later renewal into a failure.
+                    acme_profiles.soften_renewal_conf(
+                        renewal_conf(cert_output_dir, domain))
             if csr_pem is not None:
                 # `key_management` is what stops the health check from reading
                 # the absent key as a lost one (#608 forces needs_renewal on
@@ -3225,7 +3510,8 @@ class CertificateManager:
 
         except Exception as e:
             duration = time.time() - start_time
-            logger.error(f"Certificate creation failed for {domain}: {str(e)} (duration: {duration:.2f}s)")
+            logger.error("Certificate creation failed for %s: %s (duration: %.2fs)",
+                         scrub_log_value(domain), scrub_log_value(e), duration)
             if not renewal:
                 self._record_creation_metrics(
                     domain, dns_provider, False, duration, error=e)
@@ -3292,7 +3578,7 @@ class CertificateManager:
         metadata = self._load_metadata(domain) or {}
         if metadata.get('key_management') != 'external':
             return None
-        csr_path = self.cert_dir / domain / 'csr.pem'
+        csr_path = certificate_dir(self.cert_dir, domain) / 'csr.pem'
         if not csr_path.exists():
             raise RuntimeError(
                 f"Cannot renew {domain}: it was issued from a CSR this "
@@ -3316,7 +3602,7 @@ class CertificateManager:
         buy is the reissue metadata semantics, which are the right ones here.
         """
         metadata = request['metadata']
-        before = self._cert_fingerprint(self.cert_dir / domain / 'cert.pem')
+        before = self._cert_fingerprint(certificate_dir(self.cert_dir, domain) / 'cert.pem')
 
         result = self.create_certificate(
             domain=domain,
@@ -3344,7 +3630,7 @@ class CertificateManager:
         # for an unchanged CSR — which is exactly what a repeat request inside
         # the CA's own reuse window produces — must not be reported as a
         # renewal, or `renewed_at` would advance while the expiry did not.
-        after = self._cert_fingerprint(self.cert_dir / domain / 'cert.pem')
+        after = self._cert_fingerprint(certificate_dir(self.cert_dir, domain) / 'cert.pem')
         renewed = after is None or after != before
         return {
             'success': True,
@@ -3372,9 +3658,9 @@ class CertificateManager:
         """
         if (domain_dir / 'privkey.pem').exists():
             return False
-        if (domain_dir / 'live' / domain / 'privkey.pem').exists():
+        if (lineage_live_dir(domain_dir, domain) / 'privkey.pem').exists():
             return False
-        archive = domain_dir / 'archive' / domain
+        archive = lineage_archive_dir(domain_dir, domain)
         if not archive.is_dir():
             return False
         has_certs = any(archive.glob('cert*.pem'))
@@ -3409,7 +3695,7 @@ class CertificateManager:
         try:
             # Use the same config/work/log directories as during creation
             cert_dir = self.cert_dir
-            domain_dir = cert_dir / domain
+            domain_dir = certificate_dir(cert_dir, domain)
             if not domain_dir.exists() or not (domain_dir / 'cert.pem').exists():
                 raise FileNotFoundError(f"No certificate found for domain: {domain}")
 
@@ -3483,6 +3769,7 @@ class CertificateManager:
             ]
             if force:
                 cmd.append('--force-renewal')
+            self._renew_with_profile(domain, domain_dir, metadata, cmd)
 
             # Build per-request environment with DNS provider credentials
             # (fix #112: env vars like AWS_ACCESS_KEY_ID were missing during
@@ -3510,7 +3797,7 @@ class CertificateManager:
             # cert before the run and compare after. Skipped for
             # non-artifact-producing doubles (MockShellExecutor), which stage
             # no real files — those fall back to the output sentinel below.
-            live_cert_file = domain_dir / 'live' / domain / 'cert.pem'
+            live_cert_file = lineage_live_dir(domain_dir, domain) / 'cert.pem'
             fingerprint_check = getattr(self.shell_executor, 'produces_artifacts', True)
             pre_renew_fingerprint = None
             if fingerprint_check:
@@ -3524,8 +3811,11 @@ class CertificateManager:
             # would silently stop EVERY future automatic renewal until the
             # process is restarted; a synchronous API/web renew would also pin
             # its gunicorn worker. Fail fast instead.
-            result = self.shell_executor.run(cmd, capture_output=True, text=True,
-                                             timeout=1800, env=process_env)
+            renewal_domains = [domain, *(metadata.get('san_domains') or [])]
+            with self._challenge_records_held(domain, renewal_domains,
+                                              metadata.get('domain_alias'), challenge_type):
+                result = self.shell_executor.run(cmd, capture_output=True, text=True,
+                                                 timeout=1800, env=process_env)
 
             if result.returncode == 0:
                 # If CertMate's renewal_threshold_days is wider than certbot's
@@ -3718,7 +4008,7 @@ class CertificateManager:
         # the domain as skipped_not_due. Reconciling here is what
         # heals an instance that is already in that state; the
         # staged publish above is what stops it happening again.
-        stale = self._stale_flat_files(domain_dir / 'live' / domain, domain_dir)
+        stale = self._stale_flat_files(lineage_live_dir(domain_dir, domain), domain_dir)
         if stale:
             logger.warning(
                 "Certificate for %s did not need renewing, but its "
@@ -3727,7 +4017,7 @@ class CertificateManager:
                 "certificate can sit beside the previous private "
                 "key.", domain, ", ".join(stale))
             try:
-                self._publish_flat_files(domain_dir / 'live' / domain, domain_dir)
+                self._publish_flat_files(lineage_live_dir(domain_dir, domain), domain_dir)
             except Exception as republish_error:
                 logger.error(
                     "Could not republish the served copy for %s: %s",
@@ -3775,6 +4065,7 @@ class CertificateManager:
             'success': True,
             'renewed': False,
             'domain': domain,
+            'dns_provider': metadata.get('dns_provider'),
             'repaired': stale or None,
             'message': 'Certificate not yet due for renewal',
         }
@@ -3789,7 +4080,7 @@ class CertificateManager:
         Returns the result dict `renew_certificate` returns unchanged.
         """
         # Copy renewed certificates from the correct live directory
-        src_dir = domain_dir / 'live' / domain
+        src_dir = lineage_live_dir(domain_dir, domain)
         dest_dir = domain_dir
 
         cert_files = self._publish_flat_files(src_dir, dest_dir)
@@ -3809,6 +4100,7 @@ class CertificateManager:
             'success': True,
             'renewed': True,
             'domain': domain,
+            'dns_provider': metadata.get('dns_provider'),
             'message': "Certificate renewed successfully"
         }
         if storage_warning:
@@ -3970,6 +4262,7 @@ class CertificateManager:
                     'skipped_disabled': 0, 'skipped_invalid': 0,
                     'skipped_not_due': 0, 'skipped_busy': 0,
                     'unmanaged': 0, 'reregistered': 0, 'ari_advanced': 0,
+                    'ari_postponed': 0, 'early_forced': 0, 'early_deferred': 0,
                     'reissue_required': 0, 'auto_reissued': 0,
                     'auto_renew_disabled': True}
 
@@ -3984,15 +4277,17 @@ class CertificateManager:
                    'skipped_not_due': 0, 'skipped_busy': 0,
                    'unmanaged': 0, 'reregistered': 0,
                    # Renewals the CA's window brought forward, which the
-                   # configured threshold would not have started tonight.
-                   'ari_advanced': 0,
+                   # configured threshold would not have started tonight; and
+                   # certificates the threshold would have renewed tonight that
+                   # the window postpones (#393).
+                   'ari_advanced': 0, 'ari_postponed': 0,
                    # Certificates with no key anywhere: only a reissue repairs
                    # them, so they are counted apart from failures (#966).
                    'reissue_required': 0,
-                   # Renewals the threshold called due while certbot's own
-                   # 30-day gate would have refused, forced (#966, part 2);
-                   # and those held for the next sweep by the cap or because
-                   # the certificate is less than a week old.
+                   # Renewals the operator's threshold brought ahead of the
+                   # lifetime rule (#966, part 2, #393); and those held for the
+                   # next sweep by the cap or because the certificate is younger
+                   # than a week or a third of its lifetime.
                    'early_forced': 0, 'early_deferred': 0,
                    # Reissued by the sweep itself, opt-in (#966, step 4).
                    'auto_reissued': 0}
@@ -4014,6 +4309,14 @@ class CertificateManager:
                 domain = entry_domain(domain_entry)
                 if not domain:
                     logger.warning(f"Skipping domain entry that names no domain: {domain_entry!r}")
+                    summary['skipped_invalid'] += 1
+                    continue
+                try:
+                    _reject_path_escaping_domain(domain)
+                except ValueError:
+                    # The settings are validated when they are saved, but the sweep reads
+                    # them and builds paths from the names, so it asks for itself.
+                    logger.warning("Skipping a domain entry whose name is not a usable certificate name")
                     summary['skipped_invalid'] += 1
                     continue
                 per_cert_auto_renew = entry_auto_renew(domain_entry)
@@ -4094,7 +4397,8 @@ class CertificateManager:
             "Renewal check complete in %.1fs: %d checked, %d renewed, "
             "%d failed, %d disabled, %d invalid, %d not-due, %d busy, "
             "%d unmanaged, %d re-registered, %d need reissue, "
-            "%d auto-reissued, %d early (forced), %d early deferred",
+            "%d auto-reissued, %d early (forced), %d early deferred, "
+            "%d brought forward by the CA, %d postponed by the CA",
             duration,
             summary['checked'], summary['renewed'], summary['failed'],
             summary['skipped_disabled'], summary['skipped_invalid'],
@@ -4102,33 +4406,55 @@ class CertificateManager:
             summary['unmanaged'], summary['reregistered'],
             summary['reissue_required'], summary['auto_reissued'],
             summary['early_forced'], summary['early_deferred'],
+            summary['ari_advanced'], summary['ari_postponed'],
         )
         return summary
 
-    #: certbot renews unforced only inside this many seconds of expiry
-    #: (`renew_before_expiry`, default "30 days", never set by CertMate).
-    CERTBOT_RENEWAL_WINDOW_SECONDS = 30 * 86400
     #: Default for `early_renewals_per_sweep` (#966, part 2).
     EARLY_RENEWAL_DEFAULT_PER_SWEEP = 10
-    #: A certificate younger than this is never force-renewed (#966, part 2).
-    EARLY_RENEWAL_MIN_AGE_SECONDS = 7 * 86400
 
-    @classmethod
-    def _threshold_outruns_certbot(cls, cert_info, settings):
-        """Did the threshold, and only the threshold, call this due while
-        certbot's own gate would answer "not yet due"? (#966, part 2)
+    def _served_validity(self, domain):
+        """(notBefore, notAfter) of the served certificate as naive UTC, or None."""
+        cert_dir = getattr(self, 'cert_dir', None)
+        if cert_dir is None:
+            return None
+        try:
+            with open(certificate_dir(cert_dir, domain) / 'cert.pem', 'rb') as f:
+                cert = x509.load_pem_x509_certificate(f.read())
+        except (OSError, ValueError):
+            return None
+        return (cert.not_valid_before_utc.replace(tzinfo=None),
+                cert.not_valid_after_utc.replace(tzinfo=None))
 
-        Measured in seconds against certbot's window, because days_left rounds
-        down: 30 days and some hours reads 30 and certbot still refuses. A
-        certificate due for another reason (a missing or mismatched served
-        key forces needs_renewal) is not this case: it repairs from the
-        lineage, and forcing would ship a new key for nothing.
+    def _renewal_timing(self, domain, cert_info, settings, now=None):
+        """Why the certificate is or is not due, for the sweep to act on and count (#393).
+
+        The decision itself is `cert_info['needs_renewal']`, computed by renewal_policy in
+        `get_certificate_info`; this says which rule made it, so the sweep can force a renewal
+        that was decided by time, guard one the operator's threshold brought ahead of the
+        lifetime rule (#966), and attribute one the CA's window moved. None when the served
+        certificate cannot be read: nothing is forced then.
         """
-        seconds_left = cert_info.get('seconds_left')
-        if not cert_info.get('needs_renewal') or not isinstance(seconds_left, int):
-            return False
-        threshold = cls._coerce_renewal_threshold_days(settings) * 86400
-        return cls.CERTBOT_RENEWAL_WINDOW_SECONDS <= seconds_left <= threshold
+        validity = self._served_validity(domain)
+        if validity is None:
+            return None
+        not_before, not_after = validity
+        now = now or utc_now()
+        threshold = self._coerce_renewal_threshold_days(settings)
+        instant, reason = renewal_policy.renews_at(
+            not_before, not_after, threshold, cert_info.get('renewal_info'))
+        planned, planned_reason = renewal_policy.renews_at(not_before, not_after, threshold)
+        due = now >= instant
+        advanced = due and reason == renewal_policy.REASON_ARI and now < planned
+        return {
+            'due': due,
+            'advanced': advanced,
+            'postponed': not due and now >= planned,
+            'early': due and not advanced and renewal_policy.is_early(
+                not_before, not_after, threshold, now),
+            'planned_reason': planned_reason,
+            'lifetime': renewal_policy.lifetime_seconds(not_before, not_after),
+        }
 
     @classmethod
     def _early_renewal_cap(cls, settings):
@@ -4140,7 +4466,7 @@ class CertificateManager:
         except (TypeError, ValueError):
             return cls.EARLY_RENEWAL_DEFAULT_PER_SWEEP
 
-    def _may_force_early(self, domain, settings, summary):
+    def _may_force_early(self, domain, settings, summary, lifetime):
         """The two guards on a forced early renewal (#966, part 2).
 
         The cap counts attempts, not successes: it limits orders sent to the
@@ -4148,7 +4474,9 @@ class CertificateManager:
         bounds the damage of a threshold at or above the certificate's
         lifetime, or of a miscomputed expiry: one renewal a week, not one a
         night against Let's Encrypt's five duplicate certificates a week. An
-        unreadable age does not block a renewal that is due.
+        unreadable age does not block a renewal that is due. The age is a week
+        or a third of the lifetime, whichever is less (#393): a fixed week would
+        never let a 160-hour certificate through.
         """
         if summary.get('early_forced', 0) >= self._early_renewal_cap(settings):
             logger.info("%s is due by the threshold, but this sweep already "
@@ -4156,16 +4484,17 @@ class CertificateManager:
                         domain, self._early_renewal_cap(settings))
             return False
         age = self._certificate_age_seconds(domain)
-        if age is not None and age < self.EARLY_RENEWAL_MIN_AGE_SECONDS:
+        min_age = renewal_policy.early_min_age_seconds(lifetime)
+        if age is not None and age < min_age:
             logger.info("%s is due by the threshold but was issued less than "
-                        "7 days ago; not forcing a renewal.", domain)
+                        "%.1f days ago; not forcing a renewal.", domain, min_age / 86400)
             return False
         return True
 
     def _certificate_age_seconds(self, domain):
         """Seconds since the served certificate's notBefore, or None."""
         try:
-            with open(Path(self.cert_dir) / domain / 'cert.pem', 'rb') as f:
+            with open(certificate_dir(self.cert_dir, domain) / 'cert.pem', 'rb') as f:
                 cert = x509.load_pem_x509_certificate(f.read())
         except (OSError, ValueError):
             return None
@@ -4264,38 +4593,51 @@ class CertificateManager:
         cert_info = self.get_certificate_info(domain, settings=settings, use_cache=False)
         if not cert_info:
             return False
-        ari_advanced = False
-        if not cert_info.get('needs_renewal'):
-            # The threshold said no. Ask the CA, which may know something the
-            # threshold cannot: a batch replacement, a compromised
-            # intermediate, a ruling that shortens everything it issued. ARI
-            # can only bring a renewal FORWARD here — see modules/core/ari.py
-            # for why the other direction waits on #395.
-            if not self._ari_says_renew(domain, cert_info, settings):
-                return False
-            ari_advanced = True
-            logger.info("%s is not due by the configured threshold, but its CA "
-                        "says its renewal window has opened; renewing now.",
-                        domain)
+        # Ask the CA first, for every certificate (#393): its window may bring a renewal
+        # forward or postpone it, and the decision below reads the record this writes. A CA
+        # that does not answer leaves no window, and the threshold or lifetime rule decides.
+        self._refresh_renewal_info(domain, cert_info, settings)
+        cert_info = self.get_certificate_info(domain, settings=settings, use_cache=False)
+        if not cert_info:
+            return False
+        # One clock for the decision: the ARI client's, which is the wall clock in production and
+        # the one place a test can move time (tests/test_ari_staging_e2e.py moves it to the
+        # instant staging's window names, and the renewal that follows is real).
+        now = self._renewal_info_client().now()
+        timing = self._renewal_timing(domain, cert_info, settings, now=now)
+        if timing is None:
+            # The served certificate cannot be read: the answer's own verdict (an unparseable
+            # certificate is due), attempted unforced, as before.
+            due = bool(cert_info.get('needs_renewal'))
+        else:
+            due = timing['due'] or cert_info.get('private_key_state') in ('missing', 'mismatched')
+        if not due:
+            if timing and timing['postponed']:
+                summary['ari_postponed'] += 1
+                logger.info("%s would be due by %s, but its CA's renewal window says later; "
+                            "renewing at %s.", domain, timing['planned_reason'],
+                            cert_info.get('renews_at'))
+            return False
 
-        force = ari_advanced
-        if not ari_advanced and self._threshold_outruns_certbot(cert_info, settings):
-            if not self._may_force_early(domain, settings, summary):
+        # CertMate decided, so certbot is told to renew: its own gate (2/3 of the lifetime in
+        # 5.8, 30 days in 2.10, its own ARI reading) no longer takes part. A certificate due
+        # only for a key problem is not: it repairs from the lineage unforced, and forcing
+        # would ship a new key for nothing.
+        force = bool(timing and timing['due'])
+        ari_advanced = bool(timing and timing['advanced'])
+        if ari_advanced:
+            logger.info("%s is not due by the configured threshold, but its CA "
+                        "says its renewal window has opened; renewing now.", domain)
+        elif timing and timing['early']:
+            if not self._may_force_early(domain, settings, summary, timing['lifetime']):
                 summary['early_deferred'] += 1
                 return False
             summary['early_forced'] += 1
-            force = True
 
         logger.info(f"Renewing certificate for {domain}")
         renew_started = time.time()
         try:
-            # Forced when the CA asked for it (#962), or when the threshold
-            # called it due while certbot would refuse (#966). certbot has its
-            # own gate — without --force-renewal it renews only inside 30 days
-            # of expiry — so both were answered "not yet due": the CA's window
-            # moved to now on a certificate with 60 days left, or a threshold
-            # of 45 that behaved as 30. Inside certbot's window nothing is
-            # forced, and certbot keeps its say.
+            # Forced whenever the decision was about time (#393); see above.
             res = self.renew_certificate(domain, force=force)
             # certbot can still report "not yet due" (renewed=False) on an
             # unforced run: a certificate due for a key problem rather than the
@@ -4417,27 +4759,69 @@ class CertificateManager:
                         "usable ACME directory")
             return None
 
-    def _ari_says_renew(self, domain, cert_info, settings, now=None):
-        """Has the CA's renewal window for this certificate opened? (#393)
+    def _renew_with_profile(self, domain, domain_dir, metadata, cmd):
+        """Ask for the profile the certificate was issued with, as preferred (#395).
 
-        False for every absence — ARI switched off, no CA manager, a CA that
-        does not publish `renewalInfo`, an unreadable certificate, a request
-        that failed. That asymmetry is the safety property: this can only
-        make a renewal happen sooner than the configured threshold would, so
-        a CA that is down or wrong cannot push a certificate towards expiry.
-
-        `ari_enabled: false` in settings.json turns it off. It is on by
-        default because the answer is strictly better than a fixed number
-        and costs one unauthenticated GET per certificate per sweep.
+        On the command line too, so a renewal configuration restored from an older backup, or
+        written before the profile was softened, still follows the metadata. What the CA's
+        directory says about the profile is recorded in `metadata`, which the renewal saves.
         """
-        if not settings.get('ari_enabled', True):
-            return False
+        ok, profile = acme_profiles.validate_profile(metadata.get('acme_profile'))
+        if not ok or not profile:
+            return
+        cmd.extend(['--preferred-profile', profile])
+        acme_profiles.soften_renewal_conf(renewal_conf(domain_dir, domain))
+        offered = self._profile_still_offered(domain, metadata.get('ca_provider'),
+                                              metadata.get('ca_account_id'), profile)
+        if offered is False:
+            metadata['acme_profile_withdrawn_at'] = utc_now_iso()
+        elif offered:
+            metadata.pop('acme_profile_withdrawn_at', None)
+
+    def _profile_still_offered(self, domain, ca_provider, ca_account_id, profile):
+        """Warn when the CA no longer offers the profile a certificate was issued with (#395).
+
+        The renewal asks for it as preferred, so the CA issues its default instead and the
+        renewal succeeds: the certificate does not expire for want of a profile. That is a
+        different kind of certificate (a 90-day one where a 45-day one was), so it is said here,
+        and the caller records it in the metadata the renewal saves (`acme_profile_withdrawn_at`).
+        Returns True (offered), False (withdrawn: warned), or None when the directory cannot be
+        read, which is not evidence either way.
+        """
+        # Neither raises: _acme_directory_url answers None for a CA it cannot place, and the ARI
+        # client answers None for a directory it could not fetch or parse (cached per CA).
+        url = self._acme_directory_url({'ca_provider': ca_provider, 'account_id': ca_account_id})
+        directory = self._renewal_info_client().directory(url) if url else None
+        offered = acme_profiles.profile_offered(directory, profile)
+        if offered is not False:
+            return offered
+        # Both pass the name check before they get here (no CR/LF); scrubbed anyway, because the
+        # profile arrives from a request and the plain log formatter writes it as it is.
+        logger.warning("%s was issued with the ACME profile %s, which its CA no longer offers; "
+                       "the renewal asks for it as preferred and the CA will issue its default "
+                       "profile instead.", scrub_log_value(domain), scrub_log_value(profile))
+        return False
+
+    def _refresh_renewal_info(self, domain, cert_info, settings, now=None):
+        """Ask the CA for this certificate's renewal window and record the answer (#962, #393).
+
+        Every absence is recorded as itself — ARI switched off (nothing recorded, and the record
+        is not shown), no identifier, a CA that does not publish `renewalInfo`, a request that
+        failed — and none of them is a window, so the threshold or lifetime rule decides. A CA
+        that is down or wrong cannot push a certificate towards expiry: a window can postpone a
+        renewal only down to the floor in renewal_policy, never past the window's end.
+
+        `ari_enabled: false` in settings.json turns it off. It is on by default; it costs one
+        unauthenticated GET per certificate per sweep. Returns the status recorded, or None.
+        """
+        if not settings.get('ari_enabled', True) or getattr(self, 'cert_dir', None) is None:
+            return None
         from . import ari
 
         client = self._renewal_info_client()
         now = now or client.now()
         try:
-            raw = (self.cert_dir / domain / 'cert.pem').read_bytes()
+            raw = (certificate_dir(self.cert_dir, domain) / 'cert.pem').read_bytes()
             cert_id = ari.certificate_id(x509.load_pem_x509_certificate(raw))
         except (OSError, ValueError) as e:
             # A self-signed certificate with no Authority Key Identifier
@@ -4445,7 +4829,7 @@ class CertificateManager:
             logger.info("Cannot build an ARI identifier for %s: %s", domain, e)
             self._record_renewal_info(domain, ari.observation(
                 None, ari.STATUS_NO_IDENTIFIER, None, now))
-            return False
+            return ari.STATUS_NO_IDENTIFIER
         directory_url = self._acme_directory_url(cert_info)
         if not directory_url:
             # No usable ACME directory is, from here, a CA that publishes no
@@ -4453,13 +4837,10 @@ class CertificateManager:
             # because no sweep will ever get a different answer.
             self._record_renewal_info(domain, ari.observation(
                 cert_id, ari.STATUS_UNSUPPORTED, None, now))
-            return False
+            return ari.STATUS_UNSUPPORTED
         status, payload = client.lookup(directory_url, cert_id)
-        record = ari.observation(cert_id, status, payload, now)
-        self._record_renewal_info(domain, record)
-        if status != ari.STATUS_WINDOW:
-            return False
-        return ari.is_due(cert_id, payload, now)
+        self._record_renewal_info(domain, ari.observation(cert_id, status, payload, now))
+        return status
 
     def _record_renewal_info(self, domain, record):
         """Keep what the CA said about this certificate, beside it (#962).
@@ -4475,7 +4856,7 @@ class CertificateManager:
         """
         try:
             self._atomic_json_write(
-                self.cert_dir / domain / RENEWAL_INFO_FILE, record)
+                certificate_dir(self.cert_dir, domain) / RENEWAL_INFO_FILE, record)
         except OSError as e:
             # The class name only: an OSError's text repeats the path, and
             # nothing here is worth a traceback in a nightly log.
@@ -4517,7 +4898,7 @@ class CertificateManager:
         if cert_dir is None:
             return None
         try:
-            with open(cert_dir / domain / RENEWAL_INFO_FILE,
+            with open(certificate_dir(cert_dir, domain) / RENEWAL_INFO_FILE,
                       encoding='utf-8') as handle:
                 record = json.load(handle)
         except (OSError, ValueError):
@@ -4770,12 +5151,6 @@ class CertificateManager:
         except Exception:  # pragma: no cover - defensive
             logger.debug("Could not record a renewal sweep metric")
 
-    def create_certificate_legacy(self, domain, email, cloudflare_token):
-        """Legacy function for backward compatibility"""
-        dns_config = {'api_token': cloudflare_token}
-        # Fallback to direct method call
-        return self.create_certificate(domain, email, 'cloudflare', dns_config)
-    
 
 
     def _get_dns_config(self, dns_provider, account_id):
@@ -4889,13 +5264,14 @@ class CertificateManager:
         An explicit user-initiated deletion must destroy the key material
         everywhere CertMate put it.
         """
+        _reject_path_escaping_domain(domain)
         domain_lock = self._get_domain_lock(domain)
         # Acquire lock to ensure no create/renew is in progress (non-blocking)
         if not domain_lock.acquire(blocking=False):
             raise RuntimeError(f"Cannot delete certificate for {domain}: an operation is currently in progress")
         try:
             import shutil
-            domain_dir = self.cert_dir / domain
+            domain_dir = certificate_dir(self.cert_dir, domain)
             local_deleted = False
             if domain_dir.exists():
                 shutil.rmtree(domain_dir)

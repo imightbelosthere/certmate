@@ -14,6 +14,7 @@ Environment variables:
 """
 
 import os
+import sys
 import secrets
 import time
 import subprocess
@@ -141,6 +142,138 @@ def _caa_never_asks_real_dns():
         patch.setattr("modules.core.caa.resolver_factory",
                       lambda timeout, nameservers=None: (lambda name: []))
         yield
+
+
+# The applications built in this process and not yet stopped.
+_APPLICATIONS = []
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _applications_are_remembered(_isolate_runtime_dirs):
+    """Every `create_app()` in the suite is written down, so it can be stopped.
+
+    `create_app()` starts a scheduler, an issuance pool, four event threads and
+    a watchdog, and leaves stopping them to `atexit`: right for a server, which
+    has one application and exits when it is done. A test process builds some
+    ninety, and nothing stopped any of them before the last test. Their
+    schedulers went on running: each fires `deploy_window_drain` at every
+    minute, and the daily sweeps at 02:00 to 07:00, in the middle of whatever
+    test is running by then.
+    """
+    import functools
+
+    import modules.factory as factory
+    register_at_exit = factory._stop_background_work_at_exit
+
+    # `wraps`, so that a test which reads the source of the hook reads the
+    # application's and not this.
+    @functools.wraps(register_at_exit)
+    def remember(container):
+        _APPLICATIONS.append(container)
+        register_at_exit(container)
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(factory, '_stop_background_work_at_exit', remember)
+        yield
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _an_application_stops_with_its_module(_applications_are_remembered):
+    """An application lives no longer than the module that built it.
+
+    Whatever fixture built it, of whatever scope: by the time the next module
+    runs, its scheduler, its pool and its threads are stopped, the way the
+    application stops itself (`stop_background_work`). A module that needs an
+    application gets one from its own fixture, as all of them do.
+
+    Measured before this: 22 schedulers running after the first 76 modules.
+    Idle they allocate nothing, and at the minute they allocated 666 KB between
+    them, which a test that measures the memory of something else (the audit
+    chain's verifier, 25 KB on its own) read as its own and failed on.
+    """
+    yield
+    from modules.factory import stop_background_work
+    failed = []
+    while _APPLICATIONS:
+        container = _APPLICATIONS.pop()
+        try:
+            stop_background_work(container)
+        except Exception as error:                      # every one is tried, then all are reported
+            failed.append(repr(error))
+    assert failed == [], f'an application built in this module did not stop: {failed}'
+
+
+# certbot invocations that only read the local installation.
+_CERTBOT_LOCAL_ONLY = {'--version', '--help', '-h', 'plugins'}
+_REAL_CERTBOT = {'allowed': False, 'refused': [], 'session_over': False}
+
+
+class _NoRealCertbot:
+    """`subprocess` as `modules/core/shell.py` sees it, minus the real certbot.
+
+    Every test that issues or renews replaces `ShellExecutor.run` with a
+    stand-in, so a certbot that reaches this point is one that escaped its
+    stand-in. That happened: a reissue queued by a test ran on a worker thread
+    after the test's fixture had closed the stand-in, and the real certbot
+    registered an account with Let's Encrypt staging. Nothing failed, and the
+    log line was the only trace. Here it is refused, and recorded so the run
+    fails even when the call happened on a thread no test was waiting for.
+
+    It sits below the stand-ins (which replace `ShellExecutor.run` whole and
+    never reach `subprocess`), so it cannot get in their way, and for the whole
+    process, because a thread can outlive the test that started it and the
+    session too. Tests
+    marked `e2e` are the ones meant to reach a CA, and the guard stands aside
+    for them.
+    """
+
+    def __init__(self, real):
+        self._real = real
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+    def run(self, cmd, *args, **kwargs):
+        program = os.path.basename(str(cmd[0])) if cmd else ''
+        if (program == 'certbot' and not _REAL_CERTBOT['allowed']
+                and not set(map(str, cmd[1:])) <= _CERTBOT_LOCAL_ONLY):
+            _REAL_CERTBOT['refused'].append(' '.join(map(str, cmd[:2])))
+            if _REAL_CERTBOT['session_over']:
+                # Too late to fail the run: say it where a person reading the log will see it.
+                print(f'\nThe real certbot was refused after the last test ({" ".join(map(str, cmd[:2]))}): '
+                      'a test left a job running.', file=sys.__stderr__, flush=True)
+            raise RuntimeError(
+                'the test suite refused to run the real certbot '
+                f'({" ".join(map(str, cmd[:2]))}): use a stand-in, or mark the test e2e')
+        return self._real.run(cmd, *args, **kwargs)
+
+
+def pytest_sessionstart(session):
+    """Put the guard in for the life of the process, not of the session.
+
+    It was a session fixture, and a session fixture is taken out when the last
+    test ends. A job a test has queued can still be on a worker thread then,
+    while the interpreter closes: it found the real `subprocess` back in place
+    and ran the real certbot, with nothing left to refuse it or to report it.
+    """
+    import modules.core.shell as shell
+    if not isinstance(shell.subprocess, _NoRealCertbot):
+        shell.subprocess = _NoRealCertbot(shell.subprocess)
+
+
+@pytest.fixture(autouse=True)
+def _real_certbot_for_e2e(request):
+    _REAL_CERTBOT['allowed'] = request.node.get_closest_marker('e2e') is not None
+    yield
+    _REAL_CERTBOT['allowed'] = False
+
+
+def pytest_sessionfinish(session, exitstatus):
+    _REAL_CERTBOT['session_over'] = True
+    if _REAL_CERTBOT['refused']:
+        print('\nThe real certbot was refused outside an e2e test '
+              f'{len(_REAL_CERTBOT["refused"])} time(s): {_REAL_CERTBOT["refused"][:5]}')
+        session.exitstatus = 1
 
 
 # ---------------------------------------------------------------------------
@@ -587,13 +720,27 @@ def ui_session_cookie(docker_container):
             f"/login and the tests would silently exercise the login screen."
         )
 
+    # The first-run wizard covers the page and takes every click. It is
+    # dismissed here once, the way its own Skip button does it for every
+    # browser, and the instance stays what it is: one whose setup is not
+    # finished.
+    #
+    # This used to post the whole settings back with `setup_completed` set, and
+    # the answer was never read. It was a 403 (a session request with no Origin
+    # is refused), and with an Origin it would have been a 400 (the settings it
+    # had just read carry `users` and `oidc`, which this route does not take).
+    # So the wizard was on every page, and fourteen modules each hid it for
+    # themselves; the one that did not raced it.
     s = requests.Session()
     s.cookies.set("certmate_session", session_cookie)
-    r = s.get(f"{BASE_URL}/api/web/settings")
-    if r.status_code == 200:
-        data = r.json()
-        data["setup_completed"] = True
-        s.post(f"{BASE_URL}/api/web/settings", json=data)
+    dismissed = s.post(f"{BASE_URL}/api/web/settings", json={"wizard_dismissed": True},
+                       headers={"Origin": BASE_URL})
+    seen = s.get(f"{BASE_URL}/api/web/settings")
+    if dismissed.status_code != 200 or seen.json().get("wizard_dismissed") is not True:
+        pytest.fail(
+            f"UI suite could not dismiss the first-run wizard (HTTP {dismissed.status_code}: "
+            f"{dismissed.text[:200]}). It covers every page and takes the clicks."
+        )
     return session_cookie
 
 

@@ -6,6 +6,7 @@ from ..core.audit_chain import CheckpointReadError
 from ..core.metrics import generate_metrics_response
 from flask import request, jsonify, Response, stream_with_context
 from modules.core.request_fields import json_booleans
+from modules.core.structured_logging import scrub_log_value
 
 # Log-stream pacing (#418). The poll interval bounds how long a new line
 # waits; the idle ceiling bounds how long an abandoned tab can hold a worker
@@ -348,6 +349,54 @@ def _activity_page(audit_logger, limit, query, scope=None, matches=None):
         'complete': found['complete'],
     }
 
+# What the two public health routes say about a failure. The reason itself
+# (certbot's last 400 characters of output, the scheduler's exception text)
+# carries install paths, versions and library names, and these routes answer
+# anyone who can reach the instance. It stays in the server log, where
+# issuance_readiness and the factory already write it, and in the same field
+# for a request that carries credentials.
+REASON_WITHHELD = ('not shown without credentials: it is in the server log, '
+                   'and in this field when the request is authenticated')
+
+
+def _reason_for_caller(auth_manager, reason):
+    """The reason for a caller with credentials, a fixed pointer otherwise.
+
+    Fail closed: anything but a user record from optional_identity() counts
+    as anonymous."""
+    if not reason:
+        return reason
+    identity = auth_manager.optional_identity() if auth_manager is not None else None
+    return reason if isinstance(identity, dict) else REASON_WITHHELD
+
+
+def _metrics_scope(managers, auth_manager):
+    """What of `/metrics` the caller may see: None for everything, or a
+    predicate on a domain for a key restricted with `allowed_domains`.
+
+    The predicate is the rule every certificate route applies: the key's scope
+    has to cover every name the certificate filed under that domain covers
+    (`CertificateManager.every_name_matches`), so a certificate the key cannot
+    read is not described to it here either. Asked once per domain per scrape.
+    Outside `register_misc_routes`, whose complexity is budgeted.
+    """
+    user = getattr(request, 'current_user', None)
+    scope = user.get('allowed_domains') if isinstance(user, dict) else None
+    if scope is None:
+        return None
+    certificates = managers.get('certificates')
+    answers = {}
+
+    def in_scope(domain):
+        if domain not in answers:
+            def matches(name):
+                return auth_manager.domain_matches_scope(name, scope)
+            answers[domain] = (certificates.every_name_matches(domain, matches)
+                               if certificates is not None else matches(domain))
+        return answers[domain]
+    return in_scope
+
+
 def register_misc_routes(app, managers, require_web_auth, auth_manager):
 
     _register_update_check(app, managers, auth_manager)
@@ -506,6 +555,10 @@ def register_misc_routes(app, managers, require_web_auth, auth_manager):
         DNS-provider and cache gauges are actually populated. Without a
         context, generate_metrics_response only emits application_uptime and
         every labelled inventory metric stays empty ('No data' at scrape).
+
+        The series are about the whole instance: every managed domain is a
+        label, and the rest are its totals. A key restricted to domains gets
+        the series about its own domains and nothing else (`_metrics_scope`).
         """
         try:
             app_context = None
@@ -529,7 +582,8 @@ def register_misc_routes(app, managers, require_web_auth, auth_manager):
                     logger.warning(
                         "Metrics context unavailable, emitting base metrics "
                         f"only: {ctx_err}")
-            return generate_metrics_response(app_context)
+            return generate_metrics_response(
+                app_context, domain_in_scope=_metrics_scope(managers, auth_manager))
         except Exception as e:
             logger.error(f"Metrics error: {e}")
             return jsonify({'error': 'Internal Server Error'}), 500
@@ -576,7 +630,7 @@ def register_misc_routes(app, managers, require_web_auth, auth_manager):
             # diagnose without grepping logs; without this the /health response
             # collapsed to a bare 'not_running' that hid the actual cause.
             checks['scheduler'] = 'failed'
-            checks['scheduler_error'] = scheduler_status.get('error')
+            checks['scheduler_error'] = _reason_for_caller(auth_manager, scheduler_status.get('error'))
             checks['scheduler_failed_at'] = scheduler_status.get('timestamp')
             overall = 'degraded'
         else:
@@ -594,7 +648,7 @@ def register_misc_routes(app, managers, require_web_auth, auth_manager):
             if issuance.get('version'):
                 checks['certbot_version'] = issuance['version']
             if issuance_state == 'failed':
-                checks['certbot_error'] = issuance.get('error')
+                checks['certbot_error'] = _reason_for_caller(auth_manager, issuance.get('error'))
                 overall = 'degraded'
 
         # Cert directory
@@ -676,9 +730,9 @@ def register_misc_routes(app, managers, require_web_auth, auth_manager):
             'certbot': issuance.get('state') or 'unknown',
         }
         if not scheduler_ok and scheduler_status.get('error'):
-            body['scheduler_error'] = scheduler_status.get('error')
+            body['scheduler_error'] = _reason_for_caller(auth_manager, scheduler_status.get('error'))
         if not issuance_ok and issuance.get('error'):
-            body['certbot_error'] = issuance.get('error')
+            body['certbot_error'] = _reason_for_caller(auth_manager, issuance.get('error'))
         return jsonify(body), (200 if ready else 503)
 
     @app.route('/api/events/stream')
@@ -919,8 +973,11 @@ def register_misc_routes(app, managers, require_web_auth, auth_manager):
             success = 'error' not in result
             return jsonify({'success': success, **result})
         except Exception as e:
-            logger.error(f"Notification test failed: {e}")
-            return jsonify({'success': False, 'error': str(e)}), 500
+            # A delivery failure comes back in `result` above, on purpose: it
+            # is what the admin is testing. This is something else breaking,
+            # and its text is the server's, not the channel's.
+            logger.error("Notification test failed: %s", scrub_log_value(e))
+            return jsonify({'success': False, 'error': 'Notification test failed'}), 500
 
     @app.route('/api/notifications/webhook/preview', methods=['POST'])
     @auth_manager.require_role('admin')

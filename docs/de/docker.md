@@ -1,6 +1,6 @@
 # Docker Build & Deployment
 
-<!-- CERTMATE-TRANSLATED-FROM 875370d723412467 -->
+<!-- CERTMATE-TRANSLATED-FROM e7c97bf8776edb69 -->
 
 Diese Anleitung beschreibt das Erstellen, Deployen und Ausführen von CertMate in Docker — einschließlich Multi-Plattform-Unterstützung für ARM und AMD64.
 
@@ -151,7 +151,7 @@ docker run -d --name certmate \
 | `API_BEARER_TOKEN_FILE` | Nein | Pfad zu einer Datei mit dem API-Bearer-Token (hat Vorrang vor `API_BEARER_TOKEN`) |
 | `CERTMATE_LOG_LEVEL` | Nein | `INFO` (Standard), `DEBUG`, `WARNING`, `ERROR` |
 | `CERTMATE_BACKUP_PASSPHRASE` | Nein | Wenn gesetzt, werden einheitliche Backups im Ruhezustand verschlüsselt (`.zip.enc`, PBKDF2-SHA256 + Fernet). Dieselbe Passphrase wird zur Wiederherstellung benötigt. Nicht gesetzt = ältere unverschlüsselte `.zip`-Backups |
-| `CLOUDFLARE_TOKEN` | Nein | API-Token für das Standard-Cloudflare-DNS-Konto. Cloudflare ist der einzige DNS-Provider, der aus der Umgebung gelesen wird: Route53 und die übrigen werden unter Einstellungen → DNS-Provider oder über die API konfiguriert, und `AWS_ACCESS_KEY_ID` im Container zu setzen bewirkt nichts |
+| `CLOUDFLARE_TOKEN` | Nein | API-Token für das Standard-Cloudflare-DNS-Konto. Route53 nutzt die unter Einstellungen → DNS-Provider konfigurierten Zugangsdaten, außer wenn für das Konto ausdrücklich der IAM-Modus gewählt wird: Dann nutzt Certbot die AWS-Anmeldekette des Containers (einschließlich IAM-Rollen). |
 
 Siehe den [Installationsleitfaden](./installation.md#environment-variables) für die vollständige Liste.
 
@@ -256,25 +256,6 @@ CertMate unterstützt Multi-Plattform-Docker-Images für ARM- und AMD64-Architek
 | `linux/arm/v7` | ARM 32-Bit v7 | Raspberry Pi 3+ |
 | `linux/arm/v6` | ARM 32-Bit v6 | Raspberry Pi 1, Zero |
 
-### Build-Skripte
-
-```bash
-# Nur für die aktuelle Plattform bauen
-./build-docker.sh
-
-# Für mehrere Plattformen bauen (ARM64 + AMD64)
-./build-docker.sh -m
-
-# Bauen und zu Docker Hub pushen
-./build-docker.sh -m -p -r YOUR_DOCKERHUB_USERNAME
-
-# Dediziertes Multi-Plattform-Skript
-./build-multiplatform.sh -r USERNAME -v v1.0.0 -p
-
-# Für Raspberry Pi bauen
-./build-multiplatform.sh --platforms linux/arm/v7 -r USERNAME -p
-```
-
 ### Manuelles Docker Buildx
 
 ```bash
@@ -288,6 +269,16 @@ docker buildx build --platform linux/amd64,linux/arm64 \
 # Bauen und pushen
 docker buildx build --platform linux/amd64,linux/arm64 \
   -t USERNAME/certmate:latest --push .
+
+# Nur für die aktuelle Plattform bauen
+docker build -t certmate:latest .
+
+# Eine Version taggen und pushen
+docker buildx build --platform linux/amd64,linux/arm64 \
+  -t USERNAME/certmate:v1.0.0 -t USERNAME/certmate:latest --push .
+
+# Raspberry Pi 3+ (linux/arm/v7, nicht veröffentlicht)
+docker buildx build --platform linux/arm/v7 -t USERNAME/certmate:armv7 --push .
 ```
 
 ### Voraussetzungen für Multi-Plattform

@@ -7,7 +7,9 @@ from flask import request, jsonify, send_file, after_this_request
 from ..core.certificates import DomainOperationInProgress
 from ..core.cert_service import CertificateService, DomainOutOfScope
 from ..core.audit_context import audit_context_from_request
+from modules.core.auth import not_for_domain_restricted_keys
 from modules.core.request_fields import json_booleans
+from modules.core.structured_logging import scrub_log_value
 
 
 logger = logging.getLogger(__name__)
@@ -63,7 +65,7 @@ def register_cert_routes(app, managers, require_web_auth, auth_manager,
         except ValueError as e:
             # Log the specific reason; return a generic message so the caught
             # exception text never reaches the client (CodeQL py/stack-trace-exposure).
-            logger.info("Certificate creation rejected: %s", e)
+            logger.info("Certificate creation rejected: %s", scrub_log_value(e))
             return jsonify({'error': 'Invalid certificate request'}), 400
         except DomainOperationInProgress:
             return jsonify({'error': 'A certificate operation is already in progress for this domain', 'code': 'DOMAIN_OPERATION_IN_PROGRESS'}), 409
@@ -134,7 +136,11 @@ def register_cert_routes(app, managers, require_web_auth, auth_manager,
                     cert_dir, error = _sanitize_domain(domain, file_ops.cert_dir)
                     if error:
                         continue
-                    if not auth_manager.domain_matches_scope(cert_dir.name, scope):
+                    # Every name the certificate covers, as for the single
+                    # download: what it holds is valid for all of them.
+                    if scope is not None and not certificate_manager.every_name_matches(
+                            cert_dir.name,
+                            lambda name: auth_manager.domain_matches_scope(name, scope)):
                         if audit_logger:
                             audit_logger.log_authz_denied(
                                 operation='batch_download',
@@ -170,8 +176,10 @@ def register_cert_routes(app, managers, require_web_auth, auth_manager,
 
     @app.route('/api/web/certificates/dns-providers', methods=['GET'])
     @auth_manager.require_role('viewer')
+    @not_for_domain_restricted_keys(audit_logger, 'dns_providers', 'the DNS provider accounts')
     def list_dns_providers_web():
-        """List available DNS providers"""
+        """List available DNS providers. Refused to a key restricted to
+        domains, as the API's twin is: the accounts are the instance's."""
         try:
             providers = dns_manager.get_available_providers()
             return jsonify(providers)

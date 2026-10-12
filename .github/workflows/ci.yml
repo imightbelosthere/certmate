@@ -84,15 +84,15 @@ jobs:
 
     - name: Install dependencies
       run: |
-        python -m pip install --upgrade pip
+        python -m pip install --require-hashes -r requirements-build.lock
         pip install -r requirements.txt
         pip install -r requirements-test.txt
 
     - name: Lint with flake8
       run: |
-        # Pinned so the build pulls a known version (OpenSSF Scorecard
-        # Pinned-Dependencies flags bare, unversioned pip installs).
-        pip install flake8==7.4.1
+        # From requirements-lint.lock, with hashes: a version pin names the
+        # release, not the file (OpenSSF Scorecard, Pinned-Dependencies).
+        pip install --require-hashes -r requirements-lint.lock
         # stop the build if there are Python syntax errors or undefined names
         # Fails the build. E9/F63/F7/F82 are syntax errors and undefined
         # names; the rest are bug classes that are already clean in this
@@ -117,6 +117,10 @@ jobs:
         # The same shape for broad exception handlers. #671 counted 397 and
         # nothing measured it again, so it reached 425 with the issue open.
         python scripts/check_exception_budget.py
+        # ruff, as a ratchet per (area, rule) rather than an ignore list (#1093): the rules in
+        # ruff.toml are enforced at zero except for the counts the baseline records, which only
+        # go down. The ruff version is pinned in requirements-test.txt, installed above.
+        python scripts/check_ruff_budget.py
         # Style is reported, never enforced: line length is not a defect class.
         flake8 . --count --exit-zero --max-line-length=127 --statistics
 
@@ -372,8 +376,10 @@ jobs:
           set -- $combo
           base="$1"; shift
           # The same derivation the Dockerfile makes, so a variant that gains
-          # or loses a lock is covered here without editing this list.
-          constraint="${base%.txt}.lock"
+          # or loses a lock is covered here without editing this list. The
+          # .constraints file is the lock's pins without its hashes: the lock
+          # itself would turn hash checking on for the extras and refuse them.
+          constraint="${base%.txt}.constraints"
           [ -f "$constraint" ] || constraint="$base"
           echo "::group::$base (constraint: $constraint) + $*"
           for extra in "$@"; do
@@ -461,6 +467,35 @@ jobs:
     - name: Every stale translation says it is stale
       run: python scripts/check_translation_freshness.py
 
+  # mypy as a ratchet (#1094): errors per file that only go down, in default mode. A job of its own,
+  # and on the LOCKED set, because what mypy reports depends on the versions of the packages it reads:
+  # the test job installs requirements.txt, whose transitive dependencies float on purpose, and a
+  # typed library's release would turn this red for a reason that is not the change under review.
+  # Python 3.12: the baseline was measured there, and it is the interpreter the image runs.
+  typecheck:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+    - name: Set up Python
+      uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v5
+      with:
+        python-version: '3.12'
+
+    - name: Install the locked set and the pinned tools
+      # The image's own sequence: the tools and the lock with --require-hashes,
+      # then the test requirements constrained by the lock's pins without
+      # hashes (requirements.constraints), as the Dockerfile layers the extras.
+      run: |
+        python -m pip install --require-hashes -r requirements-build.lock
+        pip install --require-hashes -r requirements.lock
+        pip install -c requirements.constraints -r requirements-test.txt
+
+    - name: mypy ratchet
+      run: python scripts/check_mypy_budget.py
+
   ca-endpoints:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
@@ -475,7 +510,7 @@ jobs:
 
     - name: Install dependencies
       run: |
-        python -m pip install --upgrade pip
+        python -m pip install --require-hashes -r requirements-build.lock
         pip install -r requirements.txt
         pip install -r requirements-test.txt
 
@@ -583,7 +618,7 @@ jobs:
 
     - name: Install dependencies
       run: |
-        python -m pip install --upgrade pip
+        python -m pip install --require-hashes -r requirements-build.lock
         pip install -r requirements.txt
 
     # The wiki has no CI of its own, so it is fetched here. A clone failure
@@ -594,6 +629,37 @@ jobs:
 
     - name: Every endpoint the wiki states is one the application serves
       run: python scripts/check_wiki_endpoints.py /tmp/wiki
+
+  # A red scheduled run is read by nobody: it notifies whoever last edited the
+  # cron line, and the weekly run went red on four of its last six runs without
+  # anyone being told. This turns the result of each scheduled check into an
+  # issue (opened on failure, commented while it stays red, closed when green).
+  #
+  # Only the checks whose failure may be said in public are listed. `advisories`
+  # is left out on purpose: a failure there means a dependency advisory is open
+  # and not yet written down, and an issue would announce it before it is fixed.
+  # tests/test_a_red_scheduled_check_reaches_someone.py keeps this list and the
+  # script's in step, and fails when a scheduled-only job is in neither.
+  report-scheduled:
+    if: always() && github.event_name == 'schedule'
+    needs: [ca-endpoints, wiki, wiki-endpoints]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+    - name: Report each check
+      run: |
+        python3 scripts/report_scheduled_result.py ca-endpoints "${{ needs.ca-endpoints.result }}" --run-url "$RUN_URL"
+        python3 scripts/report_scheduled_result.py wiki "${{ needs.wiki.result }}" --run-url "$RUN_URL"
+        python3 scripts/report_scheduled_result.py wiki-endpoints "${{ needs.wiki-endpoints.result }}" --run-url "$RUN_URL"
 
   # Storage backends against real servers rather than a faithful fake.
   #
@@ -622,7 +688,7 @@ jobs:
 
     - name: Install dependencies
       run: |
-        python -m pip install --upgrade pip
+        python -m pip install --require-hashes -r requirements-build.lock
         pip install -r requirements.txt
         pip install -r requirements-test.txt
         # hvac lives in the optional Vault set, not the core one. Installed
@@ -763,7 +829,7 @@ jobs:
 
     - name: Install dependencies
       run: |
-        python -m pip install --upgrade pip
+        python -m pip install --require-hashes -r requirements-build.lock
         pip install -r requirements.txt
         pip install -r requirements-test.txt
 
@@ -902,6 +968,15 @@ jobs:
           echo "::error::static/css/tailwind.min.css is out of date. Run 'npm run css:build' and commit the result."
           exit 1
         fi
+
+    # The page runs the build of Alpine that evaluates expressions without
+    # `eval`, which is what lets the Content-Security-Policy go without
+    # 'unsafe-eval'. An expression it cannot evaluate fails in the browser,
+    # and only when someone's data reaches it. This checks every one of them
+    # against the package's own parser, and that the vendored file is the
+    # package's.
+    - name: Alpine expressions are evaluable without eval
+      run: node scripts/check_alpine_expressions.mjs
 
     # Theme-token regression gate: the migration (docs/THEME_MIGRATION.md)
     # collapsed every light + dark: color pair onto semantic tokens. This fails

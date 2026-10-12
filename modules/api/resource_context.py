@@ -16,11 +16,12 @@ and fallbacks the closure performed, including the `CertificateService`
 fallback that lets tests pass a minimal manager dict.
 """
 from dataclasses import dataclass
+from functools import wraps
 from typing import Any, Optional
 
 from flask import request
 
-from modules.core.auth import ROLE_HIERARCHY
+from modules.core.auth import ROLE_HIERARCHY, domain_restricted_refusal
 from modules.core.cert_service import CertificateService
 from modules.core.inventory_view import record_in_scope
 from modules.core.structured_logging import scrub_log_value
@@ -117,6 +118,10 @@ def job_accepted(job_id, operation, domain, status_url) -> dict:
     }
 
 
+_COVERS_ANOTHER_NAME = (
+    'certificate covers a name outside scoped key allowed_domains, or its names could not be read')
+
+
 def check_domain_scope(ctx: ApiContext, domain, operation):
     """Reject the request if the caller's API-key allowed_domains does not
     cover *domain*. Returns (body, status) on denial, or None when permitted.
@@ -128,6 +133,67 @@ def check_domain_scope(ctx: ApiContext, domain, operation):
     user = getattr(request, 'current_user', None) or {}
     if ctx.auth.user_can_access_domain(user, domain):
         return None
+    return _scope_denied(ctx, user, domain, operation)
+
+
+def check_certificate_scope(ctx: ApiContext, domain, operation):
+    """`check_domain_scope` for an operation on an existing certificate.
+
+    The certificate filed as *domain* may cover other names, and whatever is
+    done to it is done for all of them: its key serves every one. So the
+    caller's scope must cover each name it carries, which is the rule
+    creation has always applied to the names it is asked for.
+
+    The answer names only *domain*, the name the caller sent: the other
+    names are what the caller is not entitled to. The audit entry says a name
+    was outside the scope without naming it; the certificate's names are on
+    record for whoever administers it.
+    """
+    user = getattr(request, 'current_user', None) or {}
+    if not ctx.auth.user_can_access_domain(user, domain):
+        return _scope_denied(ctx, user, domain, operation)
+    if user.get('allowed_domains') is None:
+        # Unrestricted: no name can fall outside, so nothing is read.
+        return None
+    if not ctx.certificates.every_name_matches(
+            domain, lambda name: ctx.auth.user_can_access_domain(user, name)):
+        return _scope_denied(ctx, user, domain, operation, reason=_COVERS_ANOTHER_NAME)
+    return None
+
+
+def certificate_in_scope(ctx: ApiContext, domain, scope) -> bool:
+    """Whether *scope* covers every name of the certificate filed as *domain*.
+
+    The question `check_certificate_scope` asks, for a caller that filters
+    rather than refuses (the certificate list). Unrestricted reads nothing.
+    """
+    if scope is None:
+        return True
+    return ctx.certificates.every_name_matches(
+        domain, lambda name: ctx.auth.domain_matches_scope(name, scope))
+
+
+def instance_wide(ctx: ApiContext, resource_type, what):
+    """A decorator for a route about something the instance owns, not a domain.
+
+    Refuses a key restricted with `allowed_domains` (`domain_restricted_refusal`
+    is the rule). Placed under `require_role`, which sets the caller, and above
+    `marshal_with`, which would otherwise reshape the refusal into the route's
+    success model.
+    """
+    def decorator(fn):
+        @wraps(fn)
+        def wrapped(*args, **kwargs):
+            refusal = domain_restricted_refusal(ctx.audit, resource_type, what)
+            if refusal:
+                return {'error': refusal, 'code': 'DOMAIN_OUT_OF_SCOPE'}, 403
+            return fn(*args, **kwargs)
+        return wrapped
+    return decorator
+
+
+def _scope_denied(ctx: ApiContext, user, domain, operation,
+                  reason='domain outside scoped key allowed_domains'):
     # Scrubbed exactly as cert_service does for the same denial log: the
     # username can carry a newline (create_user does not constrain it, and the
     # OIDC path takes it from an IdP claim), which under the non-JSON log
@@ -142,7 +208,7 @@ def check_domain_scope(ctx: ApiContext, domain, operation):
             operation=operation,
             resource_type='certificate',
             resource_id=domain,
-            reason='domain outside scoped key allowed_domains',
+            reason=reason,
             user=user.get('username'),
             ip_address=request.remote_addr,
         )
@@ -153,8 +219,8 @@ def check_domain_scope(ctx: ApiContext, domain, operation):
 
 
 def is_record_in_scope(ctx: ApiContext, record) -> bool:
-    """True if the caller's scope covers any domain the inventory *record*
-    names (subject CN or a SAN).
+    """True if the caller's scope covers every domain the inventory *record*
+    names (subject CN and SANs).
 
     Matches CertificateList exactly: scope comes from allowed_domains and is
     fed to domain_matches_scope, so an unrestricted caller (scope None,

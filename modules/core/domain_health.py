@@ -51,6 +51,8 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from .domain_paths import certificate_dir
+from .request_fields import json_list
 from .utils import exclusive_run
 
 logger = logging.getLogger(__name__)
@@ -828,10 +830,11 @@ class DomainHealthManager:
         settings = self.settings_manager.load_settings() or {}
         return dns_lookups(nameservers=configured_nameservers(settings))
 
-    def save_config(self, config):
-        """Validate and persist. Raises ValueError on an unusable extra name."""
+    def clean_config(self, config):
+        """The config, validated and normalised, and not saved. Raises ValueError on an unusable
+        extra name (#1109)."""
         extra = []
-        for raw in config.get('extra_domains') or []:
+        for raw in json_list(config, 'extra_domains'):
             name = str(raw).strip().lower()
             if not name:
                 continue
@@ -848,6 +851,11 @@ class DomainHealthManager:
             'check_weak_tls': bool(config.get('check_weak_tls', False)),
             'extra_domains': extra,
         }
+        return clean
+
+    def save_config(self, config):
+        """Validate and persist. Raises ValueError on an unusable extra name."""
+        clean = self.clean_config(config)
         self.settings_manager.update(
             lambda s: s.__setitem__('domain_health', clean),
             'domain_health_save',
@@ -892,7 +900,7 @@ class DomainHealthManager:
         return dict(sorted(tracked.items()))
 
     def _metadata_sans(self, domain):
-        path = self.cert_dir / domain / 'metadata.json'
+        path = certificate_dir(self.cert_dir, domain) / 'metadata.json'
         try:
             data = json.loads(path.read_text(encoding='utf-8'))
         except (OSError, ValueError):

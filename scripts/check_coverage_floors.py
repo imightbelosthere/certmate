@@ -43,6 +43,8 @@ FLOORS = {
     'modules/api/models.py': 100,
     'modules/api/path_validation.py': 80,
     'modules/api/resource_context.py': 100,
+    # 100% measured (#1127); 95 leaves the point of headroom the rule above asks for.
+    'modules/api/timestamps.py': 95,
     'modules/api/resources.py': 100,
     'modules/api/resources_backup.py': 65,
     'modules/api/resources_ca.py': 85,
@@ -108,6 +110,8 @@ FLOORS = {
     # tests, so the real numbers are at or above these. Raise them as they
     # climb; never lower one to make a red build pass.
     'modules/core/__init__.py': 95,
+    # 98% measured (#395): pure functions and one file rewrite.
+    'modules/core/acme_profiles.py': 95,
     # 94.2% measured; the module is small, pure apart from one HTTP
     # method, and its transport is injected — so there is no reason
     # for it to fall far.
@@ -131,6 +135,7 @@ FLOORS = {
     'modules/core/cert_probe.py': 80,
     'modules/core/cert_service.py': 90,
     'modules/core/certificates.py': 85,
+    'modules/core/challenge_locks.py': 95,
     'modules/core/client_certificates.py': 75,
     'modules/core/constants.py': 80,
     'modules/core/crypto_report.py': 95,
@@ -196,6 +201,8 @@ FLOORS = {
     # 100% when it arrived: 32 statements of pure parsing, plus the decorator,
     # with no I/O. A boolean this refuses is one a caller sent by mistake, so
     # there is no honest reason for a branch of it to go unreached.
+    # 97% measured (#393); the rule every renewal follows, pure, no I/O.
+    'modules/core/renewal_policy.py': 95,
     'modules/core/request_fields.py': 100,
     # Measured at 90.1% when it arrived. What is left is defensive: an AIA
     # payload in PEM or PKCS#7, an Ed25519 responder, a malformed CRL body.

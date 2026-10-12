@@ -10,13 +10,14 @@ import re
 import json
 import tempfile
 import zipfile
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 import logging
 from .domain_entries import iter_domains
 
 from .utils import (utc_now, utc_now_iso, repair_certbot_lineage_symlinks,
                     repair_certbot_renewal_paths)
+from .domain_paths import certificate_dir
 
 logger = logging.getLogger(__name__)
 
@@ -884,7 +885,11 @@ class FileOperations:
                 for backup_file in sorted(unified_backup_dir.glob("backup_*.zip*")):
                     try:
                         stat = backup_file.stat()
-                        metadata = {"size": stat.st_size, "created": datetime.fromtimestamp(stat.st_mtime).isoformat()}
+                        metadata = {"size": stat.st_size,
+                                    # UTC like every other date-time (#1127); fromtimestamp()
+                                    # alone is the local time of the host.
+                                    "created": datetime.fromtimestamp(stat.st_mtime, UTC)
+                                    .replace(tzinfo=None).isoformat()}
 
                         # Try to read unified backup metadata
                         try:
@@ -910,6 +915,10 @@ class FileOperations:
                         key_files = self._archive_key_files(backup_file)
                         backups["unified"].append({
                             "filename": backup_file.name,
+                            # Declared on the entry by the OpenAPI model and sent as null
+                            # until now: both were only inside `metadata` (#1108).
+                            "size": stat.st_size,
+                            "created": metadata["created"],
                             # Whether this archive carries private keys, read
                             # from the archive itself rather than from its
                             # manifest — every backup made before v2.26.0 says
@@ -1020,7 +1029,7 @@ class FileOperations:
         """
         keyless = []
         for domain in restored_domains:
-            domain_dir = self.cert_dir / domain
+            domain_dir = certificate_dir(self.cert_dir, domain)
             if not (domain_dir / 'cert.pem').exists() or (domain_dir / 'privkey.pem').exists():
                 continue
             try:
@@ -1046,7 +1055,7 @@ class FileOperations:
         at the top of renew_certificate, and a failure is logged per domain.
         """
         for domain in restored_domains:
-            domain_dir = self.cert_dir / domain
+            domain_dir = certificate_dir(self.cert_dir, domain)
             try:
                 if repair_certbot_renewal_paths(domain_dir, domain):
                     logger.info(f"Pointed the certbot renewal config for {domain} at this install")

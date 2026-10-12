@@ -232,7 +232,14 @@ def validate_domain(domain: str) -> Tuple[bool, str]:
             return False, f"Domain label '{label}' is too long (maximum 63 characters)."
         
         is_last_label = (i == len(labels) - 1)
-        if is_last_label and (not label.isalpha() or len(label) < 2):
+        # isascii() as well as isalpha(): isalpha() is true for any Unicode
+        # letter, so 'example.c\u03bfm' (a Greek omicron) and 'example.\u00e7om'
+        # passed here while DOMAIN_RE, which every other route uses, refuses
+        # them. Create then made the directory, certbot refused the name, and
+        # the directory stayed: absent from the list and refused by DELETE,
+        # since the route that deletes it validates with DOMAIN_RE. An
+        # internationalised name is written in Punycode, which is ASCII.
+        if is_last_label and (not (label.isascii() and label.isalpha()) or len(label) < 2):
             return False, f"Invalid Top-Level Domain (TLD): '{label}'."
         if not is_last_label and not label_pattern.fullmatch(label):
              return False, f"Invalid format for domain label: '{label}'."
@@ -645,11 +652,6 @@ def create_cloudflare_config(token: str) -> Path:
     """Create Cloudflare credentials file."""
     return _create_config_file("cloudflare", f"dns_cloudflare_api_token = {token}\n")
 
-def create_route53_config(access_key_id: str, secret_access_key: str) -> Path:
-    """Create AWS Route53 credentials file."""
-    content = f"dns_route53_access_key_id = {access_key_id}\ndns_route53_secret_access_key = {secret_access_key}\n"
-    return _create_config_file("route53", content)
-
 def create_azure_config(subscription_id: str, resource_group: str, tenant_id: str, client_id: str, client_secret: str, zone_domain: Union[str, List[str]]) -> Path:
     """Write the config ``azure_dns_hook`` reads, and return its path.
 
@@ -913,6 +915,20 @@ def validate_dns_provider_account(provider: str, account_id: str, account_config
         # than making it a node in that graph.
         from .secret_refs import has_value
 
+        if provider == 'route53' and account_config.get('auth_mode') == 'iam_role':
+            from .storage_backends import _aws_storage_auth
+            try:
+                _aws_storage_auth(account_config, 'Route53 DNS')
+            except ValueError as exc:
+                return False, str(exc)
+            return True, 'Valid configuration.'
+        if provider == 'route53' and account_config.get('auth_mode') not in (None, '', 'access_keys'):
+            return False, 'Route53 DNS auth_mode must be access_keys or iam_role'
+        if provider == 'route53' and account_config.get('assume_role_arn'):
+            from .storage_backends import _valid_aws_role_arn
+            if not _valid_aws_role_arn(str(account_config['assume_role_arn']).strip()):
+                return False, 'assume_role_arn must be an IAM role ARN'
+
         required_fields = _DNS_PROVIDER_CREDENTIALS[provider]
         missing_fields = [f for f in required_fields
                           if not has_value(account_config, f)]
@@ -1107,13 +1123,17 @@ def repair_certbot_renewal_paths(domain_dir: Union[str, Path], domain: str) -> b
     precautions as :func:`repair_certbot_lineage_symlinks`, which runs next to
     it on both the restore path and the renewal path.
     """
+    # Imported here, not at the top: this module has no intra-package imports
+    # at module level (see the note under its imports), and domain_paths is
+    # the one home of the certificate layout (#1146).
+    from .domain_paths import renewal_conf
     shape_ok, _ = validate_domain(domain)
     if not shape_ok:
         return False
     domain_dir = Path(domain_dir)
     try:
         base = domain_dir.resolve()
-        conf = (base / 'renewal' / f'{domain}.conf').resolve()
+        conf = renewal_conf(base, domain).resolve()
         conf.relative_to(base)
     except (OSError, ValueError):
         return False
@@ -1163,6 +1183,10 @@ def repair_certbot_lineage_symlinks(domain_dir: Union[str, Path], domain: str) -
     Only the *newest* archive generation is linked, which is what certbot's
     own ``live`` symlinks mean.
     """
+    # Imported here, not at the top: this module has no intra-package imports
+    # at module level (see the note under its imports), and domain_paths is
+    # the one home of the certificate layout (#1146).
+    from .domain_paths import lineage_archive_dir, lineage_live_dir, renewal_conf
     # `domain` reaches the restore caller from ZIP entry names, so treat it as
     # untrusted here rather than relying on the caller: validate its shape,
     # then confirm every path we touch resolves inside domain_dir. The
@@ -1191,9 +1215,9 @@ def repair_certbot_lineage_symlinks(domain_dir: Union[str, Path], domain: str) -
             return None
         return base / path
 
-    live_dir = _inside(Path('live') / domain)
-    archive_dir = _inside(Path('archive') / domain)
-    conf = _inside(Path('renewal') / f'{domain}.conf')
+    live_dir = _inside(lineage_live_dir(Path(), domain))
+    archive_dir = _inside(lineage_archive_dir(Path(), domain))
+    conf = _inside(renewal_conf(Path(), domain))
     if live_dir is None or archive_dir is None or conf is None:
         return False
 

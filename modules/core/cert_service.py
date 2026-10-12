@@ -19,10 +19,12 @@ import logging
 import time
 
 from .structured_logging import scrub_log_value
+from . import acme_profiles
 from .cert_labels import normalize_notes, normalize_tags
 from .constants import PROBE_PROTOCOLS
 from .csr_issuance import CSRError, csr_domains, read_csr
 from .utils import validate_domain, validate_key_options
+from .domain_paths import certificate_dir
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +48,18 @@ MAX_CSR_BYTES = 64 * 1024
 # name, but the implementation now lives once, in the logging module.
 _scrub_log = scrub_log_value
 
+
+
+def _checked_profile(value):
+    """An ACME profile from a request (#395): None when not given (the account's default, or
+    the certificate's own on a reissue), '' when the caller asked for the CA's default, the
+    normalized name otherwise. A malformed one is a ValueError, a 400, before anything runs."""
+    if value is None or value == '':
+        return value
+    ok, profile = acme_profiles.validate_profile(value)
+    if not ok:
+        raise ValueError(profile)
+    return profile
 
 class DomainOutOfScope(PermissionError):
     """Raised when a scoped API key's ``allowed_domains`` does not cover the
@@ -101,6 +115,28 @@ class CertificateService:
         user = user or {}
         if self._auth.user_can_access_domain(user, domain):
             return
+        self._deny_scope(domain, operation, user, ip_address)
+
+    def _enforce_certificate_scope(self, domain, operation, user, ip_address):
+        """`_enforce_scope` for the certificate that exists as *domain*.
+
+        Renewing or reissuing it acts on every name it covers, so each must be
+        in scope (see `CertificateManager.names_covered`). The refusal and the
+        audit entry name *domain* only; the certificate's names are on record
+        for whoever administers it.
+        """
+        self._enforce_scope(domain, operation, user, ip_address)
+        user = user or {}
+        if user.get('allowed_domains') is None:
+            return
+        if not self._certs.every_name_matches(
+                domain, lambda name: self._auth.user_can_access_domain(user, name)):
+            self._deny_scope(
+                domain, operation, user, ip_address,
+                reason='certificate covers a name outside scoped key allowed_domains, or its names could not be read')
+
+    def _deny_scope(self, domain, operation, user, ip_address,
+                    reason='domain outside scoped key allowed_domains'):
         logger.warning(
             "Scope denial: user=%s op=%s domain=%s scope=%s",
             _scrub_log(user.get('username')), operation,
@@ -111,7 +147,7 @@ class CertificateService:
                 operation=operation,
                 resource_type='certificate',
                 resource_id=domain,
-                reason='domain outside scoped key allowed_domains',
+                reason=reason,
                 user=user.get('username'),
                 ip_address=ip_address,
             )
@@ -149,7 +185,7 @@ class CertificateService:
                account_id=None, ca_provider=None, ca_account_id=None, challenge_type=None,
                domain_alias=None, alias_dns_provider=None, key_type=None,
                key_size=None, elliptic_curve=None, user=None, ip_address=None,
-               audit_ctx=None, csr_pem=None):
+               audit_ctx=None, csr_pem=None, acme_profile=None):
         """Validate, scope-check, resolve defaults, issue, and persist a new
         certificate; returns the ``CertificateManager.create_certificate``
         result dict. Raises ``ValueError`` (bad input / missing config),
@@ -173,7 +209,7 @@ class CertificateService:
             alias_dns_provider=alias_dns_provider,
             key_type=key_type, key_size=key_size, elliptic_curve=elliptic_curve,
             user=user, ip_address=ip_address, audit_ctx=audit_ctx,
-            csr_pem=csr_pem,
+            csr_pem=csr_pem, acme_profile=acme_profile,
         ))
 
     def prepare_create(self, *, domain, san_domains=None, dns_provider=None,
@@ -181,7 +217,7 @@ class CertificateService:
                         domain_alias=None, alias_dns_provider=None,
                         key_type=None, key_size=None,
                         elliptic_curve=None, user=None, ip_address=None,
-                        audit_ctx=None, csr_pem=None):
+                        audit_ctx=None, csr_pem=None, acme_profile=None):
         """Validate, authorize and resolve a create request WITHOUT side
         effects, returning the resolved kwargs for :meth:`issue_create`. Raises
         ``ValueError`` / :class:`DomainOutOfScope`. Cheap (no certbot, no disk
@@ -264,6 +300,7 @@ class CertificateService:
             ok, key_err = validate_key_options(key_type, key_size, elliptic_curve)
             if not ok:
                 raise ValueError(key_err)
+        acme_profile = _checked_profile(acme_profile)
 
         settings = self._settings.load_settings()
         email = settings.get('email')
@@ -297,6 +334,7 @@ class CertificateService:
             'key_type': key_type,
             'key_size': key_size,
             'elliptic_curve': elliptic_curve,
+            'acme_profile': acme_profile,
             'csr_pem': csr_pem,
             # Fallback used only to label the persisted domain entry.
             '_settings_dns_provider': settings.get('dns_provider'),
@@ -341,6 +379,7 @@ class CertificateService:
                 key_size=prepared['key_size'],
                 elliptic_curve=prepared['elliptic_curve'],
                 csr_pem=prepared.get('csr_pem'),
+                acme_profile=prepared.get('acme_profile'),
             )
 
             # Append the new domain under the settings manager's lock so two
@@ -666,6 +705,9 @@ class CertificateService:
             domain = domain_dir.name
             if not self._auth.domain_matches_scope(domain, scope):
                 continue
+            if scope is not None and not self._certs.every_name_matches(
+                    domain, lambda name: self._auth.domain_matches_scope(name, scope)):
+                continue
             if CertificateManager._lineage_lost_its_key(domain_dir, domain):
                 found.append(domain)
         return sorted(found)
@@ -675,7 +717,7 @@ class CertificateService:
                         domain_alias=None, alias_dns_provider=None,
                         key_type=None, key_size=None,
                         elliptic_curve=None, user=None, ip_address=None,
-                        audit_ctx=None, csr_pem=None):
+                        audit_ctx=None, csr_pem=None, acme_profile=None):
         """Validate and resolve an edit-and-reissue request (#267) without
         side effects, returning kwargs for :meth:`issue_reissue`.
 
@@ -702,7 +744,12 @@ class CertificateService:
             raise ValueError(f'Invalid domain: {normalized}')
         domain = normalized
 
-        cert_file = self._certs.cert_dir / domain / 'cert.pem'
+        # Before looking for the certificate: a caller whose scope does not
+        # cover the name is told that, whether or not a certificate exists
+        # for it.
+        self._enforce_scope(domain, 'reissue', user, ip_address)
+
+        cert_file = certificate_dir(self._certs.cert_dir, domain) / 'cert.pem'
         if not cert_file.exists():
             raise FileNotFoundError(
                 f'No certificate found for {domain}. Use create instead.'
@@ -751,8 +798,10 @@ class CertificateService:
 
         # Scope covers the primary and the FINAL SAN set (kept + added):
         # a scoped key must not be able to keep another tenant's SAN alive
-        # through inheritance any more than it could add it explicitly.
-        self._enforce_scope(domain, 'reissue', user, ip_address)
+        # through inheritance any more than it could add it explicitly. And
+        # every name the certificate covers today: a reissue replaces it for
+        # all of them, so naming a smaller set must not drop another tenant's.
+        self._enforce_certificate_scope(domain, 'reissue', user, ip_address)
         for san in san_domains:
             san_clean = san.strip() if isinstance(san, str) else ''
             if san_clean:
@@ -774,6 +823,7 @@ class CertificateService:
             ok, key_err = validate_key_options(key_type, key_size, elliptic_curve)
             if not ok:
                 raise ValueError(key_err)
+        acme_profile = _checked_profile(acme_profile)
 
         settings = self._settings.load_settings()
         email = settings.get('email')
@@ -809,6 +859,7 @@ class CertificateService:
             'key_type': key_type,
             'key_size': key_size,
             'elliptic_curve': elliptic_curve,
+            'acme_profile': acme_profile,
             'csr_pem': csr_pem,
             '_settings_dns_provider': settings.get('dns_provider'),
             '_audit_ctx': audit_ctx,
@@ -839,6 +890,7 @@ class CertificateService:
                 key_size=prepared['key_size'],
                 elliptic_curve=prepared['elliptic_curve'],
                 csr_pem=prepared.get('csr_pem'),
+                acme_profile=prepared.get('acme_profile'),
                 replace=True,
             )
 
@@ -892,7 +944,7 @@ class CertificateService:
         Raises :class:`DomainOutOfScope`. Returns the resolved kwargs for
         :meth:`issue_renew`.
         """
-        self._enforce_scope(domain, 'renew', user, ip_address)
+        self._enforce_certificate_scope(domain, 'renew', user, ip_address)
         return {'domain': domain, '_audit_ctx': audit_ctx}
 
     def issue_renew(self, prepared, *, force=False):
@@ -929,6 +981,9 @@ class CertificateService:
         if bool(result.get('renewed', True)):
             self._publish('certificate_renewed', {'domain': domain})
             self._record_renewal(domain, True, started)
+        # The renew answer has always carried `duration`, and create's has a value for it; only
+        # renew's was null (#1108). The same clock `_record_renewal` reads.
+        result.setdefault('duration', time.monotonic() - started)
         return result
 
     def _record_renewal(self, domain, success, started, error=None):

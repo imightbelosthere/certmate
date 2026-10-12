@@ -22,6 +22,11 @@ class MaskedString(fields.String):
         return SECRET_MASK_SENTINEL
 
 
+# The description every field that nothing fills starts with (#1108, #1114). A test reads it.
+_NEVER_FILLED = ('DEPRECATED. Always null: nothing computes it. Removed in API contract 3.0 '
+                 '(#1114). ')
+
+
 def create_api_models(api):
     """Create and register all API models with the Flask-RESTX API instance"""
 
@@ -33,7 +38,10 @@ def create_api_models(api):
     route53_model = api.model('Route53Config', {
         'access_key_id': fields.String(description='AWS Access Key ID'),
         'secret_access_key': MaskedString(description='AWS Secret Access Key'),
-        'region': fields.String(description='AWS Region', default='us-east-1')
+        'region': fields.String(description='AWS Region', default='us-east-1'),
+        'auth_mode': fields.String(description='access_keys (default) or iam_role',
+                                   enum=['access_keys', 'iam_role']),
+        'assume_role_arn': fields.String(description='Optional AWS role ARN to assume via STS')
     })
 
     azure_model = api.model('AzureConfig', {
@@ -186,7 +194,19 @@ def create_api_models(api):
     certificate_model = api.model('Certificate', {
         'domain': fields.String(required=True, description='Domain name'),
         'exists': fields.Boolean(description='Whether certificate exists'),
-        'expiry_date': fields.String(description='Certificate expiry date'),
+        'expiry_date': fields.String(
+            description=(
+                "Certificate expiry, 'YYYY-MM-DD HH:MM:SS' in UTC. Deprecated "
+                "since API contract 2.42 and removed in 3.0 (#1114): read "
+                "expires_at, the same instant in the form every other date-time "
+                "has."
+            )),
+        'expires_at': fields.String(
+            description=(
+                'Certificate expiry, ISO 8601 UTC with a Z, like every date-time '
+                'the API answers with since contract 2.42. Null when the '
+                'certificate could not be parsed.'
+            )),
         'days_left': fields.Integer(description='Days until expiry'),
         'days_until_expiry': fields.Integer(description='Days until expiry (alias for days_left)'),
         'expired': fields.Boolean(
@@ -206,7 +226,34 @@ def create_api_models(api):
                 'one that lapsed hours ago. Null when the certificate could '
                 'not be parsed. Added in API contract 2.2.'
             )),
-        'needs_renewal': fields.Boolean(description='Whether certificate needs renewal'),
+        'needs_renewal': fields.Boolean(
+            description=(
+                'Whether the certificate needs renewing: true from renews_at '
+                'on, or now when its private key is missing or does not match. '
+                'Since API contract 2.40 decided by the same rule the renewal '
+                'sweep acts on.'
+            )),
+        'acme_profile': fields.String(
+            description=(
+                "The ACME profile the certificate was issued with (#395): "
+                "'classic', 'tlsserver', 'shortlived' on Let's Encrypt. Null "
+                "for the CA's default. Added in API contract 2.41."
+            )),
+        'acme_profile_withdrawn_at': fields.String(
+            description=(
+                'When a renewal found that the CA no longer offers acme_profile '
+                'and the CA issued its default profile instead, UTC; null '
+                'otherwise. Added in API contract 2.41.'
+            )),
+        'renews_at': fields.String(
+            description=(
+                'The instant the renewal sweep renews this certificate at, UTC '
+                'with a Z: the threshold where it is at most half the lifetime, '
+                'otherwise a third of the lifetime (half under 10 days), or the '
+                "CA's recorded ARI window, never with less than a sixth of the "
+                'lifetime left. Null when the certificate could not be parsed. '
+                'Added in API contract 2.40.'
+            )),
         'usable': fields.Boolean(
             description=(
                 'Whether this certificate can actually serve TLS: it exists AND '
@@ -272,12 +319,23 @@ def create_api_models(api):
                 "What the CA's ARI endpoint said at the last renewal sweep. "
                 'Null when no sweep has asked about this certificate yet, '
                 'including right after a renewal. Since API contract 2.23.')),
-        'total_issued': fields.Integer(description='Total certificates issued'),
-        'total_active': fields.Integer(description='Total active certificates'),
-        'total_revoked': fields.Integer(description='Total revoked certificates'),
-        'total_expired': fields.Integer(description='Total expired certificates'),
-        'latest_issuance': fields.String(description='Latest issuance timestamp'),
-        'oldest_active_issuance': fields.String(description='Oldest active issuance timestamp'),
+        # The six fields below have been null in every answer since they were added (v2.2.0):
+        # nothing computes them. Deprecated, and removed by the next MAJOR of the API contract
+        # (#1114); they are sent, as null, until then. `latest_issuance` is `created_at` or
+        # `renewed_at`; the rest have no counterpart, because CertMate keeps no ledger of issuances.
+        'total_issued': fields.Integer(
+            description=_NEVER_FILLED + 'Was meant to be the total of certificates issued.'),
+        'total_active': fields.Integer(
+            description=_NEVER_FILLED + 'Was meant to be the total of active certificates.'),
+        'total_revoked': fields.Integer(
+            description=_NEVER_FILLED + 'Was meant to be the total of revoked certificates.'),
+        'total_expired': fields.Integer(
+            description=_NEVER_FILLED + 'Was meant to be the total of expired certificates.'),
+        'latest_issuance': fields.String(
+            description=_NEVER_FILLED + 'Was meant to be the latest issuance timestamp: read '
+                                        '`renewed_at`, or `created_at`.'),
+        'oldest_active_issuance': fields.String(
+            description=_NEVER_FILLED + 'Was meant to be the oldest active issuance timestamp.'),
         'notes': fields.String(description=(
             'Free-text note an operator attached to the certificate, or null. '
             'Since API contract 2.33.')),
@@ -358,6 +416,14 @@ def create_api_models(api):
             description=('DNS provider that hosts the alias zone, when it is '
                          'not the one hosting the primary. Ignored without '
                          'domain_alias.')),
+        'acme_profile': fields.String(
+            description=(
+                "ACME profile to ask the CA for (#395), such as 'tlsserver' "
+                "(45 days) or 'shortlived' (160 hours) on Let's Encrypt. Omit "
+                "to use the CA account's default; pass '' for the CA's own "
+                "default. Required at issuance: a CA that does not offer it "
+                "refuses the order. Since API contract 2.41."
+            )),
         'key_type': fields.String(
             description=(
                 "Optional override of the global default key type. Omit to "
@@ -418,6 +484,10 @@ def create_api_models(api):
                 "current certificate are replaced rather than added to. Same "
                 "field name and same rules as on create."
             )),
+        'acme_profile': fields.String(
+            description=("ACME profile (#395). Omit to keep the certificate's "
+                         "current one; pass '' for the CA's default. Since API "
+                         "contract 2.41.")),
         'key_type': fields.String(
             description='Omit to keep the existing key shape (no key flags are '
                         'sent and certbot preserves the lineage key). Set to '
@@ -462,7 +532,7 @@ def create_api_models(api):
         'domain': fields.String(description='Domain name'),
         'deployed': fields.Boolean(description='Whether the domain is serving a certificate'),
         'reachable': fields.Boolean(description='Whether the domain responds over HTTPS'),
-        'certificate_match': fields.Raw(description='Whether the served certificate matches the local certificate'),
+        'certificate_match': fields.Boolean(description='Whether the served certificate matches the local certificate'),
         'method': fields.String(description='Check method'),
         'port': fields.Integer(description='TCP port probed', default=443),
         'protocol': fields.String(description='Probe protocol (https-tls, tls, smtp-starttls)'),
