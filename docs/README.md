@@ -10,6 +10,7 @@ Welcome to the CertMate documentation. This folder contains comprehensive guides
 - **[Installation Guide](./installation.md)** — Setup, dependencies, production deployment
 - **[Docker Guide](./docker.md)** — Docker builds, multi-platform, Docker Compose
 - **[Kubernetes Notes](./kubernetes.md)** — Production resources, OOM sizing, runtime patching
+- **[Configuration](./configuration.md)** — every environment variable, its default and what it changes
 
 ### Core Features
 - **[DNS Providers](./dns-providers.md)** — supported providers, multi-account, domain alias
@@ -27,7 +28,12 @@ Welcome to the CertMate documentation. This folder contains comprehensive guides
 - **[CSR-only certificates](./csr-only-certificates.md)** — issuing and renewing when the private key stays on the device
 - **[Webhooks](./webhooks.md)** — generic webhooks: payload templates, authentication, signature verification
 - **[Compliance](./compliance.md)** — audit chain, actor attribution, NIS2/eIDAS posture
+- **[Backups and recovery](./backup.md)** — the two kinds of archive, off-site copies, restoring, lost admin password
 - **[Deployment Probes](./probes.en.md)** — verifying a renewed certificate is actually served
+- **[Single sign-on (OIDC)](./sso.md)** — OpenID Connect sign-in, role mapping, provisioning
+- **[Certificate storage](./storage.md)** — storage backends, what each needs, migrating between them
+- **[Monitoring](./monitoring.md)** — health endpoints, Prometheus metrics, logs, notification channels
+- **[Troubleshooting](./troubleshooting.md)** — common failures, debug logging, reporting a bug
 
 ---
 
@@ -159,8 +165,10 @@ docs/
   THEME_MIGRATION.md      one-off theme migration record
   api.md                  complete REST API reference
   architecture.md         system architecture
+  backup.md               backups and recovery
   ca-providers.md         certificate authorities
   compliance.md           audit chain, attribution, NIS2/eIDAS
+  configuration.md        environment variables
   csr-only-certificates.md  issuing when the key stays on the device
   deploy-hooks.md         post-issuance deploy hooks
   webhooks.md             generic webhooks: payload templates, auth, signature
@@ -173,8 +181,12 @@ docs/
   installation.md         installation and setup
   kubernetes.md           Kubernetes production notes and Helm chart
   mcp.md                  MCP server for AI agents
+  monitoring.md           health endpoints, metrics, logs, notifications
   probes.en.md            deployment probes
+  sso.md                  OpenID Connect sign-in
+  storage.md              storage backends and migration
   testing.md              test framework and CI/CD
+  troubleshooting.md      common failures, debug logging, bug reports
 ```
 
 ---
@@ -257,7 +269,7 @@ CertMate is licensed under the MIT License. See LICENSE file in the repository.
 
 ---
 
-**Current Version**: 2.48.5
+**Current Version**: 2.50.1
 
 <div align="center">
 

@@ -2,7 +2,7 @@
 
 <!-- CERTMATE-TRANSLATED-FROM 13de52d0ee4b09b1 -->
 <!-- CERTMATE-STALE-TRANSLATION -->
-> **Esta traducción no está actualizada.** La versión en inglés ([`docs/api.md`](../api.md)) se ha modificado desde entonces y es la de referencia. En caso de discrepancia, prevalece el documento en inglés.
+> **Esta traducción no se corresponde con la versión en inglés** ([`docs/api.md`](../api.md)), que es la de referencia. En caso de discrepancia, prevalece el documento en inglés.
 
 ## Descripción general
 
@@ -117,6 +117,8 @@ Crea un nuevo certificado de cliente.
     "email": "user@example.com",
     "organization": "ACME Corp",
     "organizational_unit": "Engineering",
+    "country": "CH",
+    "state": "Switzerland",
     "cert_usage": "api-mtls",
     "key_usage": [
       "digitalSignature",
@@ -181,6 +183,8 @@ Lista todos los certificados de cliente con filtrado opcional.
       "email": "user@example.com",
       "organization": "ACME Corp",
       "organizational_unit": "Engineering",
+      "country": "CH",
+      "state": "Switzerland",
       "cert_usage": "api-mtls",
       "key_usage": [
         "digitalSignature",
@@ -210,6 +214,8 @@ Lista todos los certificados de cliente con filtrado opcional.
       "email": "user@example.com",
       "organization": "ACME Corp",
       "organizational_unit": "Engineering",
+      "country": "CH",
+      "state": "Switzerland",
       "cert_usage": "api-mtls",
       "key_usage": [
         "digitalSignature",
@@ -241,6 +247,8 @@ Lista todos los certificados de cliente con filtrado opcional.
       "email": "",
       "organization": "ACME Corp",
       "organizational_unit": "IT",
+      "country": "CH",
+      "state": "Switzerland",
       "cert_usage": "vpn",
       "key_usage": [
         "digitalSignature",
@@ -305,6 +313,8 @@ Obtiene los metadatos completos de un certificado.
   "email": "user@example.com",
   "organization": "ACME Corp",
   "organizational_unit": "Engineering",
+  "country": "CH",
+  "state": "Switzerland",
   "cert_usage": "api-mtls",
   "key_usage": [
     "digitalSignature",
@@ -431,6 +441,8 @@ Renueva un certificado (mismo CN, nuevo número de serie).
     "email": "user@example.com",
     "organization": "ACME Corp",
     "organizational_unit": "Engineering",
+    "country": "CH",
+    "state": "Switzerland",
     "cert_usage": "api-mtls",
     "key_usage": [
       "digitalSignature",

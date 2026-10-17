@@ -20,7 +20,7 @@
    "headers": "the HTTP headers the delivery sends, set by the code"
   }
  },
- "contract_version": "2.44",
+ "contract_version": "2.49",
  "known_defects": {},
  "maps": {
   "GET /api/client-certs/stats": [
@@ -711,6 +711,9 @@
     "[].auto_renew": [
      "bool"
     ],
+    "[].ca_account_id": [
+     "str"
+    ],
     "[].ca_provider": [
      "str"
     ],
@@ -754,6 +757,12 @@
      "str"
     ],
     "[].expiry_date": [
+     "str"
+    ],
+    "[].external": [
+     "bool"
+    ],
+    "[].imported_at": [
      "str"
     ],
     "[].latest_issuance": [
@@ -802,6 +811,9 @@
      "str"
     ],
     "[].renews_at": [
+     "str"
+    ],
+    "[].replaced_at": [
      "str"
     ],
     "[].san_domains": [
@@ -859,6 +871,9 @@
     "auto_renew": [
      "bool"
     ],
+    "ca_account_id": [
+     "str"
+    ],
     "ca_provider": [
      "str"
     ],
@@ -904,6 +919,12 @@
     "expiry_date": [
      "str"
     ],
+    "external": [
+     "bool"
+    ],
+    "imported_at": [
+     "str"
+    ],
     "needs_renewal": [
      "bool"
     ],
@@ -944,6 +965,9 @@
      "str"
     ],
     "renews_at": [
+     "str"
+    ],
+    "replaced_at": [
      "str"
     ],
     "san_domains": [
@@ -1294,6 +1318,9 @@
     "certificates[].common_name": [
      "str"
     ],
+    "certificates[].country": [
+     "str"
+    ],
     "certificates[].created_at": [
      "str"
     ],
@@ -1354,6 +1381,9 @@
     "certificates[].serial_number": [
      "str"
     ],
+    "certificates[].state": [
+     "str"
+    ],
     "certificates[].superseded_at": [
      "str"
     ],
@@ -1380,6 +1410,9 @@
      "str"
     ],
     "common_name": [
+     "str"
+    ],
+    "country": [
      "str"
     ],
     "created_at": [
@@ -1440,6 +1473,9 @@
      "str"
     ],
     "serial_number": [
+     "str"
+    ],
+    "state": [
      "str"
     ],
     "superseded_at": [
@@ -3887,6 +3923,73 @@
     ]
    }
   },
+  "POST /api/certificates/<X>/replace": {
+   "200": {
+    ".": [
+     "dict"
+    ],
+    "domain": [
+     "str"
+    ],
+    "message": [
+     "str"
+    ],
+    "replaced_at": [
+     "str"
+    ],
+    "san_domains": [
+     "list"
+    ],
+    "storage_warning": [
+     "null"
+    ],
+    "success": [
+     "bool"
+    ]
+   },
+   "400": {
+    ".": [
+     "dict"
+    ],
+    "errors": [
+     "dict"
+    ],
+    "errors.certificate": [
+     "str"
+    ],
+    "errors.chain": [
+     "str"
+    ],
+    "errors.private_key": [
+     "str"
+    ],
+    "message": [
+     "str"
+    ]
+   },
+   "404": {
+    ".": [
+     "dict"
+    ],
+    "code": [
+     "str"
+    ],
+    "error": [
+     "str"
+    ]
+   },
+   "409": {
+    ".": [
+     "dict"
+    ],
+    "code": [
+     "str"
+    ],
+    "error": [
+     "str"
+    ]
+   }
+  },
   "POST /api/certificates/check-caa": {
    "200": {
     ".": [
@@ -4121,6 +4224,62 @@
     ]
    }
   },
+  "POST /api/certificates/import": {
+   "201": {
+    ".": [
+     "dict"
+    ],
+    "domain": [
+     "str"
+    ],
+    "external": [
+     "bool"
+    ],
+    "message": [
+     "str"
+    ],
+    "san_domains": [
+     "list"
+    ],
+    "storage_warning": [
+     "null"
+    ],
+    "success": [
+     "bool"
+    ]
+   },
+   "400": {
+    ".": [
+     "dict"
+    ],
+    "errors": [
+     "dict"
+    ],
+    "errors.certificate": [
+     "str"
+    ],
+    "errors.chain": [
+     "str"
+    ],
+    "errors.private_key": [
+     "str"
+    ],
+    "message": [
+     "str"
+    ]
+   },
+   "409": {
+    ".": [
+     "dict"
+    ],
+    "code": [
+     "str"
+    ],
+    "error": [
+     "str"
+    ]
+   }
+  },
   "POST /api/certificates/reissue-keyless": {
    "202": {
     ".": [
@@ -4218,6 +4377,9 @@
     "metadata.common_name": [
      "str"
     ],
+    "metadata.country": [
+     "str"
+    ],
     "metadata.created_at": [
      "str"
     ],
@@ -4276,6 +4438,9 @@
      "null"
     ],
     "metadata.serial_number": [
+     "str"
+    ],
+    "metadata.state": [
      "str"
     ],
     "metadata.type": [
@@ -4452,6 +4617,9 @@
     "metadata.common_name": [
      "str"
     ],
+    "metadata.country": [
+     "str"
+    ],
     "metadata.created_at": [
      "str"
     ],
@@ -4510,6 +4678,9 @@
      "null"
     ],
     "metadata.serial_number": [
+     "str"
+    ],
+    "metadata.state": [
      "str"
     ],
     "metadata.type": [
@@ -5656,6 +5827,9 @@
   "POST /api/backups/restore/<X>": [
    "reissue_required"
   ],
+  "POST /api/certificates/<X>/replace": [
+   "san_domains"
+  ],
   "POST /api/certificates/check-caa": [
    "domains[].records"
   ],
@@ -5664,6 +5838,9 @@
   ],
   "POST /api/certificates/deployment-status/browser": [
    "skipped"
+  ],
+  "POST /api/certificates/import": [
+   "san_domains"
   ],
   "POST /api/certificates/reissue-keyless": [
    "refused"

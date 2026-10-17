@@ -1,6 +1,6 @@
 # Documentazione CertMate
 
-<!-- CERTMATE-TRANSLATED-FROM 1dbe99f624ded264 -->
+<!-- CERTMATE-TRANSLATED-FROM bc6b854a04bbb77b -->
 
 Benvenuto nella documentazione di CertMate. Questa cartella contiene guide complete per tutte le funzionalità.
 
@@ -12,10 +12,11 @@ Benvenuto nella documentazione di CertMate. Questa cartella contiene guide compl
 - **[Guida all'installazione](./installation.md)** — Configurazione, dipendenze, deployment in produzione
 - **[Guida Docker](./docker.md)** — Build Docker, multi-piattaforma, Docker Compose
 - **[Note Kubernetes](./kubernetes.md)** — Risorse di produzione, dimensionamento OOM, patching runtime
+- **[Configurazione](../configuration.md)** — ogni variabile d'ambiente, il suo valore predefinito e cosa cambia *(in inglese)*
 
 ### Funzionalità principali
-- **[Provider DNS](./dns-providers.md)** — Provider supportati, multi-account, alias di dominio
-- **[Script DNS personalizzato](../custom-dns-script.md)** — qualsiasi provider senza plugin, guidato dai tuoi script *(in inglese)*
+- **[Provider DNS](./dns-providers.md)** — provider supportati, multi-account, alias di dominio
+- **[Script DNS personalizzato](../custom-dns-script.md)** — qualsiasi provider senza plugin, guidato dai tuoi hook *(in inglese)*
 - **[Provider CA](./ca-providers.md)** — Let's Encrypt, DigiCert, CA privata
 - **[Certificati client](./guide.md)** — Ciclo di vita dei certificati client, dashboard web, operazioni batch
 - **[Server MCP (Model Context Protocol)](./mcp.md)** — Server Node.js standalone per l'integrazione con agenti IA
@@ -24,12 +25,17 @@ Benvenuto nella documentazione di CertMate. Questa cartella contiene guide compl
 - **[Riferimento API](./api.md)** — Documentazione completa dell'API REST
 - **[Architettura](./architecture.md)** — Progettazione del sistema, componenti, flusso dei dati
 - **[Guida ai test](./testing.md)** — Framework di test, CI/CD, copertura
-- **[Discovery e inventario](../discovery-inventory.md)** — Discovery via probe/CT-log, inventario, adopt, crypto readiness *(in inglese)*
-- **[Certificati da CSR](../csr-only-certificates.md)** — Emissione a partire da una CSR, con la chiave privata che resta sul dispositivo *(in inglese)*
-- **[Webhook generici](../webhooks.md)** — Notifiche HTTP sugli eventi del ciclo di vita: payload, firma, ritentativi *(in inglese)*
-- **[Deploy hook](./deploy-hooks.md)** — Hook post-emissione: configurazione, test, redazione dell'output
-- **[Conformità](./compliance.md)** — Catena di audit, attribuzione delle azioni, postura NIS2/eIDAS
-- **[Sonde di deployment](./probes.md)** — Verificare che il certificato rinnovato sia davvero servito
+- **[Discovery e inventario dei certificati](../discovery-inventory.md)** — discovery via probe/CT-log, inventario, adopt, crypto readiness *(in inglese)*
+- **[Deploy hook](./deploy-hooks.md)** — hook post-emissione: configurazione, test, redazione dell'output, finestre di manutenzione
+- **[Certificati solo CSR](../csr-only-certificates.md)** — emissione e rinnovo quando la chiave privata resta sul dispositivo *(in inglese)*
+- **[Webhook](../webhooks.md)** — webhook generici: template del payload, autenticazione, verifica della firma *(in inglese)*
+- **[Conformità](./compliance.md)** — catena di audit, attribuzione delle azioni, postura NIS2/eIDAS
+- **[Backup e ripristino](../backup.md)** — i due tipi di archivio, copie fuori dall'host, ripristino, password di amministratore persa *(in inglese)*
+- **[Sonde di deployment](./probes.md)** — verificare che il certificato rinnovato sia davvero servito
+- **[Single sign-on (OIDC)](../sso.md)** — accesso con OpenID Connect, mappatura dei ruoli, provisioning *(in inglese)*
+- **[Storage dei certificati](../storage.md)** — backend di storage, cosa serve a ciascuno, migrazione tra di essi *(in inglese)*
+- **[Monitoraggio](../monitoring.md)** — endpoint di salute, metriche Prometheus, log, canali di notifica *(in inglese)*
+- **[Risoluzione dei problemi](../troubleshooting.md)** — errori comuni, log di debug, come segnalare un bug *(in inglese)*
 
 ---
 
@@ -44,29 +50,29 @@ Benvenuto nella documentazione di CertMate. Questa cartella contiene guide compl
 ### Per gli sviluppatori
 
 1. **[Riferimento API](./api.md)** — Tutti gli endpoint con esempi
-2. **[Architettura](./architecture.md)** — Funzionamento interno e progettazione
+2. **[Architettura](./architecture.md)** — Funzionamento interno e progettazione del sistema
 3. **[Guida ai test](./testing.md)** — Come scrivere ed eseguire i test
 
 ### Per gli amministratori
 
 1. **[Deployment Docker](./docker.md)** — Configurazione Docker per la produzione
-2. **[Note Kubernetes](./kubernetes.md)** — Dimensionamento dei pod e patching operativo
+2. **[Note Kubernetes](./kubernetes.md)** — Dimensionamento dei pod in produzione e patching operativo
 3. **[Provider CA](./ca-providers.md)** — Configurare le autorità di certificazione
-4. **[Provider DNS](./dns-providers.md#multi-account-support)** — Configurazione multi-account aziendale
+4. **[Provider DNS](./dns-providers.md#supporto-multi-account)** — Configurazione multi-account aziendale
 
 ---
 
 ## Panoramica delle funzionalità
 
 ### Certificati server
-- **Tutti i provider DNS supportati** per le sfide Let's Encrypt DNS-01 (vedere [Provider DNS](./dns-providers.md) per l'elenco completo)
+- **Tutti i provider DNS supportati** per le challenge DNS-01 di Let's Encrypt (vedere [Provider DNS](./dns-providers.md) per l'elenco completo)
 - **Più provider CA**: Let's Encrypt, DigiCert, CA privata
 - **Supporto multi-account** per provider DNS
 - **Storage backend intercambiabili**: locale, Azure Key Vault, AWS Secrets Manager, HashiCorp Vault, Infisical, S3-compatible
 - **Rinnovo automatico** con soglie configurabili
 - **Supporto Docker** con build multi-piattaforma (ARM64 + AMD64)
 - **Log Sanitizer** — Oscura automaticamente token API, chiavi private e credenziali sensibili dai log di CertMate
-- **Zombie Certificate Scanner** — Sonda multi-thread che chiede se i nomi dei certificati gestiti risolvono ancora e rispondono
+- **Zombie Certificate Scanner** — Sonda multi-thread che verifica se i nomi dei certificati gestiti risolvono ancora e rispondono
 - **Server MCP (Model Context Protocol)** — Server Node.js standalone per l'integrazione con assistenti IA agentici
 
 ### Certificati client
@@ -74,7 +80,7 @@ Benvenuto nella documentazione di CertMate. Questa cartella contiene guide compl
 - **Gestione completa del ciclo di vita** — creazione, rinnovo, revoca, monitoraggio
 - **OCSP & CRL** — stato in tempo reale e liste di revoca
 - **Dashboard web** su `/client-certificates`
-- **Operazioni batch** — importazione via CSV, massimo 100 righe per richiesta
+- **Operazioni batch** — importazione in blocco di certificati client via CSV (fino a 100 righe per richiesta)
 - **Audit logging** e **rate limiting**
 
 ---
@@ -94,7 +100,7 @@ Benvenuto nella documentazione di CertMate. Questa cartella contiene guide compl
 | GET    | `/api/ocsp/status/<serial>`              | Stato OCSP                    |
 | GET    | `/api/crl/download/<format>`             | Scarica la CRL                |
 
-Vedere il [Riferimento API](./api.md#endpoints) per la documentazione completa.
+Vedere il [Riferimento API](./api.md#endpoint) per la documentazione completa.
 
 ---
 
@@ -104,8 +110,8 @@ Tutte le funzionalità sono testate in modo approfondito:
 
 ```bash
 # Esegui i test
-# La suite UI pilota Playwright contro un server vivo e non puo condividere
-# il processo con le altre; e2e richiede un'istanza in esecuzione. E la
+# La suite UI pilota Playwright contro un server vivo e non può condividere
+# il processo con le altre; e2e richiede un'istanza in esecuzione. È la
 # stessa selezione usata da `make test` e scripts/release.sh.
 pytest -v --tb=short -m "not ui and not e2e"
 ```
@@ -138,6 +144,15 @@ La copertura dei test include:
 - Query **multi-filtro** efficienti
 - Pianificazione del **rinnovo automatico**
 - **Operazioni batch** con tracciamento degli errori
+
+---
+
+## Serve aiuto?
+
+1. **Problemi di installazione?** → Vedere la [sezione Installazione](./guide.md#installazione)
+2. **Domande sull'API?** → Vedere il [Riferimento API](./api.md)
+3. **Domande sull'architettura?** → Vedere il [documento di architettura](./architecture.md)
+4. **Altro?** → Aprire una [issue](https://github.com/fabriziosalmi/certmate/issues)
 
 ---
 
@@ -189,9 +204,9 @@ docs/it/
 
 ## Stato dei test
 
-Qui non c'e una tabella dei test mantenuta a mano. Un conteggio di test e gia vecchio il giorno dopo che lo si scrive: questo diceva `27/27` mentre la suite aveva superato i duemila.
+Qui non c'è un prospetto dei test mantenuto a mano. Una tabella con il conteggio dei test è già vecchia il giorno dopo che la si scrive: questa diceva `27/27` mentre la suite aveva superato i duemila test.
 
-Il segnale autorevole e la CI su `main`: i badge in cima al [README del progetto](../../README.md) e la soglia di copertura imposta in [`.github/workflows/ci.yml`](../../.github/workflows/ci.yml).
+Il segnale autorevole è la CI su `main`: i badge in cima al [README del progetto](../../README.md) e la soglia di copertura imposta in [`.github/workflows/ci.yml`](../../.github/workflows/ci.yml).
 
 ---
 
@@ -246,10 +261,10 @@ CertMate è distribuito sotto licenza MIT. Vedere il file LICENSE nel repository
 
 ---
 
-**Versione corrente**: 2.48.5
+**Versione corrente**: 2.50.1
 
 <div align="center">
 
-[Home](../README.md) • [Documentation](./) • [GitHub](https://github.com/fabriziosalmi/certmate)
+[Home](../../README.md) • [Documentazione](./) • [GitHub](https://github.com/fabriziosalmi/certmate)
 
 </div>

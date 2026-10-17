@@ -15,7 +15,9 @@ from .utils import utc_now
 from typing import Optional, List, Dict, Any, Tuple
 from uuid import uuid4
 
+from cryptography import x509
 from cryptography.hazmat.primitives import serialization
+from cryptography.x509.oid import NameOID
 
 from .private_ca import PrivateCAGenerator
 from .csr_handler import CSRHandler
@@ -31,6 +33,48 @@ logger = logging.getLogger(__name__)
 # per-DN authorization rule that the old cohort matches.
 DEFAULT_COUNTRY = "CH"
 DEFAULT_STATE = "Switzerland"
+
+
+# The same two defaults, as this deployment declares them. Read on every call
+# rather than once at import, so the value in force is the one in the process
+# environment now — which is also what lets a test set it. The constants above
+# stay the answer when nothing is declared, for the allowlist reason given
+# there: an instance that sets nothing issues exactly what it always issued.
+#
+# These apply to every certificate issued without an explicit country or
+# state: the create endpoint when the request leaves them out, CSV batches,
+# and renewals, which re-issue from metadata that does not record either.
+
+
+def default_client_country() -> str:
+    """CERTMATE_CLIENT_CERT_DEFAULT_COUNTRY, upper-cased, or DEFAULT_COUNTRY."""
+    declared = (os.environ.get('CERTMATE_CLIENT_CERT_DEFAULT_COUNTRY') or '').strip()
+    return declared.upper() if declared else DEFAULT_COUNTRY
+
+
+def default_client_state() -> str:
+    """CERTMATE_CLIENT_CERT_DEFAULT_STATE, or DEFAULT_STATE."""
+    declared = (os.environ.get('CERTMATE_CLIENT_CERT_DEFAULT_STATE') or '').strip()
+    return declared or DEFAULT_STATE
+
+
+def check_client_certificate_defaults() -> None:
+    """Refuse a declared default that no certificate could carry.
+
+    Called once at startup. Left to the first issuance instead, a mistyped
+    `CERTMATE_CLIENT_CERT_DEFAULT_COUNTRY=Spain` would surface as a 400 to
+    whoever happened to create the next client certificate — or, for a
+    renewal, as a scheduled job failing at night — with nothing pointing at
+    the environment. X.509 `C` is an ISO 3166-1 alpha-2 code.
+    """
+    country = default_client_country()
+    if len(country) != 2 or not country.isalpha():
+        raise ValueError(
+            f"CERTMATE_CLIENT_CERT_DEFAULT_COUNTRY must be a two-letter ISO "
+            f"country code (for example 'ES', 'IT', 'US'), got {country!r}")
+    if len(default_client_state()) > 128:
+        raise ValueError(
+            "CERTMATE_CLIENT_CERT_DEFAULT_STATE must be 128 characters or less")
 
 
 # Characters allowed verbatim in the on-disk identifier slug. Anything else
@@ -176,8 +220,8 @@ class ClientCertificateManager:
         days_valid: int = 365,
         generate_key: bool = True,
         csr_pem: Optional[bytes] = None,
-        country: str = DEFAULT_COUNTRY,
-        state: str = DEFAULT_STATE,
+        country: str = "",
+        state: str = "",
         notes: str = ""
     ) -> Tuple[bool, Optional[str], Optional[Dict[str, Any]]]:
         """
@@ -235,14 +279,17 @@ class ClientCertificateManager:
                 # issued, for every operator anywhere, claimed to be Swiss.
                 # The defaults keep those values so no existing mTLS rule
                 # that matches on the subject stops matching after an
-                # upgrade — but they are now the caller's to set.
+                # upgrade — but they are now the caller's to set. Empty means
+                # "the deployment's default", resolved here rather than in
+                # the signature: a default argument is evaluated once, at
+                # import, and would never see CERTMATE_CLIENT_CERT_DEFAULT_*.
                 csr_pem, key_pem, error = CSRHandler.create_csr(
                     common_name=common_name,
                     organization=organization,
                     organizational_unit=organizational_unit,
                     email=email,
-                    country=country or DEFAULT_COUNTRY,
-                    state=state or DEFAULT_STATE
+                    country=country or default_client_country(),
+                    state=state or default_client_state()
                 )
 
                 if error:
@@ -299,6 +346,7 @@ class ClientCertificateManager:
             cert_path = cert_subdir / f"{identifier}.crt"
             with open(cert_path, 'wb') as f:
                 f.write(signed_cert.public_bytes(serialization.Encoding.PEM))
+            issued_country, issued_state = self._subject_country_and_state(signed_cert)
 
             # Create metadata
             metadata = {
@@ -308,6 +356,15 @@ class ClientCertificateManager:
                 "email": email,
                 "organization": organization,
                 "organizational_unit": organizational_unit,
+                # The C and ST the certificate carries, read off it rather than
+                # from the arguments, so a CSR's subject is recorded too. A
+                # renewal re-issues from this metadata, and without these two
+                # it took the default: an identity issued as C=IT, ST=Lazio
+                # renewed as C=CH, ST=Switzerland, and an mTLS rule matching on
+                # the subject stopped matching after a renewal nobody chose
+                # (#1256).
+                "country": issued_country,
+                "state": issued_state,
                 "cert_usage": cert_usage,
                 "key_usage": ["digitalSignature", "keyEncipherment"],
                 "extended_key_usage": ["clientAuth"],
@@ -569,6 +626,35 @@ class ClientCertificateManager:
         return max(1, min(configured, headroom))
 
     @staticmethod
+    def _subject_country_and_state(cert) -> tuple[str | None, str | None]:
+        """The C and ST in a certificate's subject, each None when absent."""
+        def first(oid):
+            found = cert.subject.get_attributes_for_oid(oid)
+            return str(found[0].value) if found else None
+        return first(NameOID.COUNTRY_NAME), first(NameOID.STATE_OR_PROVINCE_NAME)
+
+    def _issued_country_and_state(self, identifier: str,
+                                  metadata: dict[str, Any]) -> tuple[str, str]:
+        """The C and ST a renewal keeps, '' for a field the certificate never had.
+
+        From the metadata when it records them; for a certificate issued before
+        it did (#1256), from the certificate itself, which is the identity a
+        relying party matches on. '' lets the issuance fall back to the
+        deployment's default, which is only right when nothing says otherwise.
+        """
+        if 'country' in metadata or 'state' in metadata:
+            return metadata.get('country') or '', metadata.get('state') or ''
+        for cert_dir in self.client_certs_dir.glob(f"*/{identifier}"):
+            crt_path = cert_dir / f"{identifier}.crt"
+            try:
+                cert = x509.load_pem_x509_certificate(crt_path.read_bytes())
+            except (OSError, ValueError):
+                continue
+            country, state = self._subject_country_and_state(cert)
+            return country or '', state or ''
+        return '', ''
+
+    @staticmethod
     def _inherited_days_valid(old_metadata: Dict[str, Any], default: int = 365) -> int:
         """The validity a renewal should reuse (#422).
 
@@ -626,6 +712,8 @@ class ClientCertificateManager:
                     None,
                 )
 
+            country, state = self._issued_country_and_state(identifier, old_metadata)
+
             # Create new certificate with same parameters, INCLUDING the
             # validity the operator chose (#422): renewal used to fall back to
             # the 365-day default, so a 730-day certificate quietly halved its
@@ -638,6 +726,9 @@ class ClientCertificateManager:
                 cert_usage=old_metadata.get("cert_usage", "api-mtls"),
                 days_valid=self._inherited_days_valid(old_metadata),
                 generate_key=True,  # Always generate new key on renewal
+                # The subject it was issued with, not the default (#1256).
+                country=country,
+                state=state,
                 notes=f"Renewal of {identifier}"
             )
 

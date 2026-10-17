@@ -1,6 +1,6 @@
 # DNS-Anbieter
 
-<!-- CERTMATE-TRANSLATED-FROM ec6ce2fc0c36db8b -->
+<!-- CERTMATE-TRANSLATED-FROM f2105fc570be338c -->
 
 CertMate unterstützt eine breite Palette von DNS-Anbietern für Let's Encrypt DNS-01-Challenges über individuelle certbot-Plugins. Die vollständige Liste befindet sich in der nachstehenden Tabelle.
 
@@ -8,36 +8,67 @@ CertMate unterstützt eine breite Palette von DNS-Anbietern für Let's Encrypt D
 
 ## Unterstützte Anbieter
 
-| Anbieter | Plugin | Erforderliche Zugangsdaten | Kategorie |
-|---|---|---|---|
-| **Cloudflare** | `certbot-dns-cloudflare` | API-Token | Großer Cloud-Anbieter |
-| **AWS Route53** | `certbot-dns-route53` | Access Keys oder AWS-Anmeldekette / IAM-Rolle | Großer Cloud-Anbieter |
-| **Azure DNS** | Eigener CertMate-Hook (`azure-mgmt-dns`) | Service Principal | Großer Cloud-Anbieter |
-| **Google Cloud DNS** | `certbot-dns-google` | Service Account JSON | Großer Cloud-Anbieter |
-| **PowerDNS** | `certbot-dns-powerdns` | API-URL, API-Schlüssel | Enterprise |
-| **DNS Made Easy** | `certbot-dns-dnsmadeeasy` | API-Schlüssel, Secret Key | Enterprise |
-| **NS1** | `certbot-dns-nsone` | API-Schlüssel | Enterprise |
-| **DigitalOcean** | `certbot-dns-digitalocean` | API-Token | Cloud |
-| **Linode (Akamai Connected Cloud)** | `certbot-dns-linode` | API-Schlüssel | Cloud |
-| **Akamai Edge DNS** | `certbot-plugin-edgedns` | EdgeGrid `.edgerc` (client_token, client_secret, access_token, host) | Enterprise |
-| **Vultr** | `certbot-dns-vultr` | API-Schlüssel | Cloud |
-| **Hetzner (DNS legacy)** | `certbot-dns-hetzner` | API-Token | Cloud |
-| **Hetzner Cloud** | `certbot-dns-hetzner-cloud` | API-Token | Cloud |
-| **Gandi** | `certbot-dns-gandi` | API-Token | Registrar |
-| **Namecheap** | `certbot-dns-namecheap` | Benutzername, API-Schlüssel | Registrar |
-| **Porkbun** | `certbot-dns-porkbun` | API-Schlüssel, Secret Key | Registrar |
-| **GoDaddy** | `certbot-dns-godaddy` | API-Schlüssel, Secret | Registrar |
-| **OVH** | `certbot-dns-ovh` | API-Zugangsdaten | Regional |
-| **Infomaniak** | `certbot-dns-infomaniak` | API-Token | Regional |
-| **ArvanCloud** | `certbot-dns-arvancloud` | API-Schlüssel | Regional |
-| **RFC2136** | `certbot-dns-rfc2136` | Nameserver, TSIG-Schlüssel | Standardprotokoll |
-| **ACME-DNS** | _integriert_ (kein Plugin) | API-URL, Benutzername, Passwort, Subdomain | Spezialisiert |
-| **Hurricane Electric** | `certbot-dns-he-ddns` | Benutzername, Passwort | Kostenloses DNS |
-| **Dynu** | `certbot-dns-dynudns` | API-Token | Dynamisches DNS |
-| **DuckDNS** | `certbot-dns-duckdns` | Konto-Token | Kostenloses DDNS (ohne eigene Domain) |
-| **deSEC** | `certbot-dns-desec` | API-Token | Kostenlos, EU (DE), DNSSEC — NS an `ns1.desec.io` / `ns2.desec.org` delegieren |
-| **Scaleway** | `certbot-dns-scaleway` | Geheimer API-Schlüssel | Souveräne EU-Cloud (FR) — Community-Plugin (Alpha), separat installieren: `pip install certbot-dns-scaleway` |
-| **Custom Script** | keines (certbot `--manual`) | Pfad zum Auth-Hook-Skript (+ optionaler Cleanup-Hook) | Eigene Lösung |
+| Anbieter | Plugin | Erforderliche Zugangsdaten | Kategorie | Verfügbarkeit |
+|---|---|---|---|---|
+| **Cloudflare** | `certbot-dns-cloudflare` | API-Token | Großer Cloud-Anbieter | **Stabil** |
+| **AWS Route53** | `certbot-dns-route53` | Access Keys oder AWS-Anmeldekette / IAM-Rolle | Großer Cloud-Anbieter | **Stabil** |
+| **Azure DNS** | Eigener CertMate-Hook (`azure-mgmt-dns`) | Service Principal | Großer Cloud-Anbieter | **Stabil** |
+| **Google Cloud DNS** | `certbot-dns-google` | Service Account JSON | Großer Cloud-Anbieter | **Stabil** |
+| **PowerDNS** | `certbot-dns-powerdns` | API-URL, API-Schlüssel | Enterprise | **Separate Installation** |
+| **EfficientIP SOLIDserver** | eigenes REST-API-Skript | Host, API-Zugangsdaten | Enterprise | **Stabil** |
+| **DNS Made Easy** | `certbot-dns-dnsmadeeasy` | API-Schlüssel, Secret Key | Enterprise | **Stabil** |
+| **NS1** | `certbot-dns-nsone` | API-Schlüssel | Enterprise | **Stabil** |
+| **DigitalOcean** | `certbot-dns-digitalocean` | API-Token | Cloud | **Stabil** |
+| **Linode** (Akamai Connected Cloud) | `certbot-dns-linode` | API-Schlüssel | Cloud | **Stabil** |
+| **Akamai Edge DNS** | `certbot-plugin-edgedns` | EdgeGrid `.edgerc` (client_token, client_secret, access_token, host) | Enterprise | **Stabil** |
+| **Vultr** | `certbot-dns-vultr` | API-Schlüssel | Cloud | **Stabil** |
+| **Hetzner (Legacy-DNS)** | `certbot-dns-hetzner` | API-Token | Cloud | **Stabil** |
+| **Hetzner Cloud** | `certbot-dns-hetzner-cloud` | API-Token | Cloud | **Stabil** |
+| **Gandi** | `certbot-dns-gandi` | API-Token | Registrar | **Stabil** |
+| **Namecheap** | `certbot-dns-namecheap` | Benutzername, API-Schlüssel | Registrar | **Nicht verfügbar** |
+| **Porkbun** | `certbot-dns-porkbun` | API-Schlüssel, Secret Key | Registrar | **Stabil** |
+| **GoDaddy** | `certbot-dns-godaddy` | API-Schlüssel, Secret | Registrar | **Stabil** |
+| **OVH** | `certbot-dns-ovh` | API-Zugangsdaten | Regional | **Stabil** |
+| **Infomaniak** | `certbot-dns-infomaniak` | API-Token | Regional | **Stabil** |
+| **ArvanCloud** | `certbot-dns-arvancloud` | API-Schlüssel | Regional | **Stabil** |
+| **RFC2136** | `certbot-dns-rfc2136` | Nameserver, TSIG-Schlüssel | Standardprotokoll | **Stabil** |
+| **ACME-DNS** | _integriert_ (kein Plugin) | API-URL, Benutzername, Passwort, Subdomain | Spezialisiert | **Stabil** |
+| **Hurricane Electric** | `certbot-dns-he-ddns` | Benutzername, Passwort | Kostenloses DNS | **Erweitertes Image** |
+| **Dynu** | `certbot-dns-dynudns` | API-Token | Dynamisches DNS | **Erweitertes Image** |
+| **DuckDNS** | `certbot-dns-duckdns` | Konto-Token | Kostenloses DDNS (ohne eigene Domain) | **Stabil** |
+| **deSEC** | `certbot-dns-desec` | API-Token | Kostenlos, EU (DE), DNSSEC — NS an `ns1.desec.io` / `ns2.desec.org` delegieren | **Stabil** |
+| **Scaleway** | `certbot-dns-scaleway` | Geheimer API-Schlüssel | Souveräne EU-Cloud (FR) — Community-Plugin (Alpha), in keinem Image: siehe [Verfügbarkeit](#verfügbarkeit) | **Separate Installation** |
+| **Custom Script** | keines (certbot-Core `--manual`) | Pfad zum Auth-Hook-Skript (+ optionaler Cleanup-Hook) | Eigene Lösung | **Stabil** |
+
+### Verfügbarkeit
+
+Die letzte Spalte sagt, ob das Docker-Image den Anbieter so nutzen kann, wie es ist:
+
+| Wert | Bedeutung |
+| --- | --- |
+| **Stabil** | Das Plugin ist in `requirements.txt` fixiert und damit im Standard-Image. |
+| **Erweitertes Image** | Fixiert in `requirements-extended.txt`. Mit `--build-arg EXTRA_REQUIREMENTS=requirements-extended.txt` bauen. |
+| **Separate Installation** | In keinem Image. Ein abgeleitetes Image bauen, das es installiert (unten), wo angegeben in einer eigenen Umgebung. |
+| **Nicht verfügbar** | Für den unterstützten Stack gibt es kein nutzbares Plugin. CertMate lässt sich dafür konfigurieren, aber die Ausstellung schlägt fehl. |
+
+`Namecheap` ist der nicht verfügbare: Die einzige Version von `certbot-dns-namecheap` auf PyPI ist 1.0.0, eine Alpha für Python 2.7-3.8, die mit certbot 2 auf Python 3.12 nicht funktioniert. Für Namecheap-Domains ACME-DNS oder das eigene Skript verwenden.
+
+`Scaleway` ist eine Alpha (0.0.7, die Python 2.7 als unterstützt angibt), und `PowerDNS` braucht `dns-lexicon<=3.5.6`, das mit dem Rest des erweiterten Sets kollidiert, daher seine eigene Umgebung.
+
+Das Image hat kein pip. Ein separat installiertes Plugin kommt daher in ein abgeleitetes Image, das pip nur für seinen eigenen Build zurückholt:
+
+```dockerfile
+FROM fabriziosalmi/certmate:latest
+USER root
+RUN /opt/venv/bin/python -m ensurepip && \
+    /opt/venv/bin/python -m pip install --no-cache-dir certbot-dns-scaleway==0.0.7 && \
+    /opt/venv/bin/python -m pip uninstall -y pip
+USER certmate
+```
+
+In diesem Image listet `certbot plugins` dann `dns-scaleway`.
+
+Jeder Anbieter kann mehrere Konten haben, pro Zertifikat ausgewählt; siehe [Multi-Konto-Unterstützung](#multi-konto-unterstützung).
 
 ---
 
@@ -155,6 +186,24 @@ Azure DNS wird nicht über ein certbot-Plugin beantwortet: CertMate schreibt den
 }
 ```
 
+### EfficientIP SOLIDserver
+
+```json
+{
+  "dns_provider": "solidserver",
+  "dns_providers": {
+    "solidserver": {
+      "host": "your-solidserver.example.com",
+      "username": "user",
+      "password": "password",
+      "dns_name": "dns_name",
+      "dnsview_name": "optional",
+      "propagation_seconds": 120
+    }
+  }
+}
+```
+
 ### Vultr
 
 ```json
@@ -215,9 +264,9 @@ Für BIND oder andere RFC2136-kompatible DNS-Server (einschließlich **Technitiu
 
 > **Technitium DNS**: Aktivieren Sie Dynamic Updates in den Zone-Optionen, legen Sie einen TSIG-Schlüssel an (z. B. `certmate-key` mit HMAC-SHA512) und verwenden Sie das generierte Secret in der obigen Konfiguration.
 
-### Hetzner (legacy DNS API)
+### Hetzner (Legacy-DNS-API)
 
-> **Abkündigungshinweis:** Die Hetzner-DNS-Konsolen-API wird im Mai 2025 abgeschaltet. Neue Nutzer sollten den **Hetzner Cloud**-Anbieter weiter unten verwenden. Bestehende Nutzer müssen vor dem Abschalttermin zu `hetzner-cloud` migrieren. Einzelheiten finden Sie auf der [Hetzner-Statusseite](https://status.hetzner.com/incident/c2146c42-6dd2-4454-916a-19f07e0e5a44).
+> **Abkündigungshinweis:** Hetzner hat die Abschaltung seiner DNS-Konsolen-API für Mai 2025 angekündigt. Neue Nutzer sollten den **Hetzner Cloud**-Anbieter weiter unten verwenden, und bestehende `hetzner`-Konfigurationen sollten zu `hetzner-cloud` migrieren. Einzelheiten finden Sie auf der [Hetzner-Statusseite](https://status.hetzner.com/incident/c2146c42-6dd2-4454-916a-19f07e0e5a44).
 
 ```json
 {
@@ -384,11 +433,11 @@ DuckDNS stellt kostenlose `<name>.duckdns.org`-Subdomains bereit — der einfach
 
 Wildcards wie `*.mybox.duckdns.org` werden mit demselben Token unterstützt. Da DuckDNS pro Domain jeweils nur einen TXT-Eintrag speichert, ist pro DuckDNS-Subdomain genau ein certbot-Lauf erforderlich — SAN-Zertifikate, die mehrere DuckDNS-Subdomains umfassen, werden nicht unterstützt.
 
-### Custom Script (eigene Lösung)
+### Custom Script (eigenen Anbieter anbinden)
 
-Für DNS-Anbieter ohne certbot-Plugin — Oracle Cloud (OCI), Total Uptime, Netriplex, unternehmensinternes DNS, Appliance-APIs — verweisen Sie CertMate auf Ihre eigenen Skripte; CertMate steuert diese dann über certbots `--manual`-Modus. Eine Plugin-Installation ist nicht erforderlich.
+Für DNS-Anbieter ohne certbot-Plugin — Oracle Cloud (OCI), Total Uptime, Netriplex, unternehmensinternes DNS, Appliance-APIs — verweisen Sie CertMate auf Ihre eigenen Skripte; CertMate steuert diese dann über den Core-Modus `--manual` von certbot. Eine Plugin-Installation ist nicht erforderlich.
 
-**[Eigenes DNS-Skript](../custom-dns-script.md)** ist die vollständige Anleitung: die Pfadregeln und warum sie streng sind, die genaue Umgebung, mit der Ihr Skript aufgerufen wird, der Fall Wildcard plus Apex, was die Erneuerung verwendet, und ein durchgearbeitetes Beispiel. *(auf Englisch)*
+**[Eigenes DNS-Skript](../custom-dns-script.md)** ist die vollständige Anleitung: die Pfadregeln und warum sie streng sind, die genaue Umgebung, mit der Ihr Skript aufgerufen wird, der Fall Wildcard plus Apex, was die Erneuerung verwendet, und ein durchgearbeitetes Beispiel.
 
 ```json
 {
@@ -446,7 +495,7 @@ Voraussetzungen und Vertrauensmodell:
 - Pfade müssen **absolut** sein, die Dateien müssen vorhanden und **ausführbar** sein, dürfen weder world- **noch gruppenschreibbar** sein (`chmod 755` oder strenger) und dürfen keine Leerzeichen oder Shell-Metazeichen enthalten (certbot führt Hooks über die Shell aus). Ein Hook mit `chmod 775` — ein üblicher Modus für ein Skript, das einer Deploy-Gruppe gehört — wird abgelehnt: jedes Mitglied dieser Gruppe könnte umschreiben, was CertMate gleich ausführt. Die Prüfung erfolgt bei der Ausstellung und über den Test-Provider-API-Endpoint (`POST /api/web/certificates/test-provider`)
 - Skripte laufen mit den Berechtigungen von CertMate — dasselbe Vertrauensmodell wie bei deploy hooks: nur Administratoren können sie konfigurieren; behandeln Sie sie als Teil Ihres Deployments
 - Die anbieterspezifische Einstellung `dns_propagation_seconds` wird den Skripten als `CERTMATE_DNS_PROPAGATION_SECONDS` exportiert (ein `propagation_seconds`-Feld auf Kontoebene überschreibt diesen Wert)
-- Verlängerungen verwenden die aktuell konfigurierten Hook-Pfade, genau wie die Ausstellung: Verschieben Sie ein Skript, aktualisieren Sie den Pfad in den Einstellungen, und die nächste Verlängerung verwendet ihn
+- Erneuerungen verwenden die aktuell konfigurierten Hook-Pfade, genau wie die Ausstellung: Verschieben Sie ein Skript, aktualisieren Sie den Pfad in den Einstellungen, und die nächste Erneuerung verwendet ihn
 - Wildcard-Zertifikate funktionieren (der Hook erhält jeden Validierungseintrag)
 
 ---
@@ -634,7 +683,7 @@ Die DNS-Alias-Validierung funktioniert über CNAME-Delegation. Let's Encrypt fol
 - Keine Synchronisation zwischen Anbietern erforderlich
 - Funktioniert mit Anbietern, die von CertMate nicht nativ unterstützt werden (deSEC, gcore)
 - DNS-API-Zugangsdaten sind auf die Validierungsdomain beschränkt
-- Implementiert für CertMate's erstklassige DNS-Anbieter; generische Fallback-Anbieter werden abgelehnt, bis dedizierte Alias-Adapter vorhanden sind
+- Implementiert für die erstklassigen DNS-Anbieter von CertMate; generische Fallback-Anbieter werden abgelehnt, bis dedizierte Alias-Adapter vorhanden sind
 
 ### Anbieterbeispiele
 
@@ -648,7 +697,17 @@ Cloudflare, PowerDNS und Route53 verwenden alle dieselbe Anfragestruktur:
 }
 ```
 
-Bei ACME-DNS muss `domain_alias` exakt mit der konfigurierten ACME-DNS-`subdomain`/Fulldomain übereinstimmen. CertMate aktualisiert diesen ACME-DNS-Eintrag direkt und versucht keine Bereinigung, da ACME-DNS immer den letzten Validierungswert speichert.
+Bei ACME-DNS muss `domain_alias` exakt mit der konfigurierten ACME-DNS-`subdomain`/Fulldomain übereinstimmen. CertMate aktualisiert diesen ACME-DNS-Eintrag direkt und versucht keine Bereinigung, da ACME-DNS den letzten Validierungswert speichert.
+
+Für **RFC2136** (BIND, Technitium und andere Server mit dynamischen Updates) schreibt `domain_alias` den TXT-Eintrag `_acme-challenge.<alias>` per TSIG-signiertem dynamischem Update in die Alias-Zone und verwendet dabei dieselben Werte `nameserver` / `tsig_key` / `tsig_secret` (und optional `tsig_algorithm`, standardmäßig HMAC-SHA512) wie die normale Ausstellung. CertMate ermittelt die zuständige Zone aus dem SOA des Servers, sodass ein TSIG-Schlüssel mehrere Zonen bedienen kann — einschließlich extern verwalteter Domains, deren Inhaber nur den delegierenden CNAME hinzugefügt haben:
+
+```json
+{
+  "domain": "external.example.com",
+  "dns_provider": "rfc2136",
+  "domain_alias": "internal.example.net"
+}
+```
 
 ### Wildcard-Zertifikate mit Domain-Alias
 

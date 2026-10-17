@@ -7,13 +7,13 @@ priority class of issue in this project.
 ## Supported versions
 
 Only the latest minor release line receives security fixes. Operators running
-older lines should upgrade to the latest patch on `2.48.x` before reporting —
+older lines should upgrade to the latest patch on `2.50.x` before reporting —
 fixes for retired lines are out of scope.
 
 | Version   | Supported           |
 | --------- | ------------------- |
-| `2.48.x`  | Yes                 |
-| `< 2.48`  | No (please upgrade) |
+| `2.50.x`  | Yes                 |
+| `< 2.50`  | No (please upgrade) |
 
 The supported line moves forward with each `2.x.0` release; everything below
 it is retired at that moment. This file is updated by the release tooling, so
@@ -149,6 +149,54 @@ Details worth knowing before relying on it:
 This does not encrypt anything and is not a substitute for protecting the data
 volume. What it does is let the highest-value secrets live wherever the
 deployment already keeps secrets, instead of in the file that travels.
+
+### Settings that have their own endpoint
+
+`POST /api/settings` accepts the documented configuration keys only. These
+cannot be written through it, because each is a privilege or an execution
+surface, and each has an endpoint of its own with its own validation and audit:
+
+| Key | Where it is changed |
+| --- | --- |
+| `users` | `POST /api/users` |
+| `api_keys` | `POST /api/keys` |
+| `deploy_hooks` | `POST /api/deploy/config` |
+| `local_auth_enabled` | `POST /api/auth/config` (admin) |
+| `oidc` | `POST /api/auth/oidc/settings` (admin) |
+| `api_bearer_token`, `api_bearer_token_hash` | `API_BEARER_TOKEN` or `API_BEARER_TOKEN_FILE`, read at startup |
+
+A refused key is answered `400`, with a `hint` naming the endpoint.
+
+### API tokens are stored as HMAC digests
+
+The bearer token and API keys are stored as HMAC-SHA256 digests keyed by
+`SECRET_KEY`, so `settings.json` on its own does not give them away. When
+`SECRET_KEY` is not set, CertMate generates the key into `data/.secret_key`,
+beside `settings.json`, and a copy of the whole `data/` directory then holds
+both. Set `SECRET_KEY` (or `SECRET_KEY_FILE`) outside the data volume to keep
+them apart.
+
+### The audit log
+
+Every change to settings, users, API keys, deploy hooks and the local-auth
+switch is recorded with the operator and the source IP, and so are
+authorization denials. The readable log is `logs/audit/certificate_audit.log`,
+one entry per line: a timestamp, the logger and the level, then the entry as a
+JSON object. The tamper-evident record is the hash chain under `data/audit/`;
+see [Compliance](docs/compliance.md) and
+[Audit Logging](docs/api.md#audit-logging) in the API reference.
+
+### The setup window
+
+Until the first operator credential exists (a local admin with local auth
+enabled, `API_BEARER_TOKEN`, or OIDC), every request is served as admin to
+anyone who can reach the instance. So during setup CertMate only
+**bootstraps**: it creates the first admin and turns login on. API keys and
+further users are refused with `409 SETUP_BOOTSTRAP_ONLY` until setup is
+complete, because anything created in that window would be created by whoever
+was there and would outlive it. API keys that an older version let be created
+during setup stay valid, but are flagged in Settings > API Keys and in the
+startup log until an operator confirms or revokes each one.
 
 ## Known dependency constraint
 
